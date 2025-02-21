@@ -1,4 +1,5 @@
 load("@com_github_google_flatbuffers//:typescript.bzl", "flatbuffer_ts_library")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
 load("//aos:config.bzl", "aos_config")
 load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
 
@@ -214,6 +215,20 @@ static_flatbuffer(
     srcs = ["starter_rpc.fbs"],
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
+)
+
+pkg_tar(
+    name = "ping_pong_demo",
+    srcs = [
+        ":aos_starter",
+        ":starterd",
+        "//aos:aos_dump",
+        "//aos/events:aos_timing_report_streamer",
+        "//aos/events:ping",
+        "//aos/events:pingpong_config",
+        "//aos/events:pong",
+        "//aos/events/logging:logger_main",
+    ],
 )
 
 py_binary(

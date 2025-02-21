@@ -72,3 +72,89 @@ If you're running ping and pong at the same time, you should be able to watch th
 
 ## EXERCISE:
    1. Modify code in ping and pong to see a difference in their behavior, e.g., increment the counter by 2's instead of 1
+
+## Using starterd
+
+We have a python script which spins up a copy of starter with ping, pong, and the other CLI tools ready for use.  To use it, run it from Bazel:
+
+```
+$ bazel run -c opt //aos/starter:starter_demo
+INFO: Analyzed target //aos/starter:starter_demo (41 packages loaded, 1059 targets configured).
+INFO: Found 1 target...
+Target //aos/starter:starter_demo up-to-date:
+  bazel-bin/aos/starter/starter_demo
+INFO: Elapsed time: 3.441s, Critical Path: 0.09s
+INFO: 1 process: 1 internal.
+INFO: Build completed successfully, 1 total action
+INFO: Running command line: bazel-bin/aos/starter/starter_demo aos/starter/starterd 'aos/events/pingpong_config.bfbs aos/events/pingpong_config.stripped.json' aos/events/ping aos/events/pong aos/starter/aos_starter aos/aos_dump aos/events/logging/logger_main aos/events/aos_timing_report_streamer
+Running starter from /tmp/tmp69_sqrct
+
+
+To run aos_starter, do:
+cd /tmp/tmp69_sqrct
+./aos_starter
+
+
+I0220 19:05:06.062071 3885753 starterd_lib.cc:132] Starting to initialize shared memory.
+```
+
+You can then cd to that directory and play with it.
+
+If you want to instead build a .tar of the applications to run somewhere else, you can build a package with the binaries.
+
+```
+$ bazel build -c opt //aos/starter:ping_pong_demo
+INFO: Analyzed target //aos/starter:ping_pong_demo (16 packages loaded, 33761 targets configured).
+INFO: Found 1 target...
+Target //aos/starter:ping_pong_demo up-to-date:
+  bazel-bin/aos/starter/ping_pong_demo.tar
+INFO: Elapsed time: 7.248s, Critical Path: 4.46s
+INFO: 44 processes: 29 disk cache hit, 2 internal, 13 linux-sandbox.
+INFO: Build completed successfully, 44 total actions
+```
+
+To run everything by hand, just run `./starterd` after extracting, and everything will start up automatically.
+
+
+## Benchmarking
+
+`ping` and `pong` serve as a good pair of latency benchmarking applications for doing initial checking of the performance of a system.
+By default, they run with a RT priority of 5, and they can also be configured to forward across the network with a custom `aos_config.bfbs`.
+
+`aos_timing_report_streamer` prints out timing reports in a nice, human parsable format.
+`Control-C` stops it and prints overall aggregated statistics.
+The max wakeup (and handler) latency can be used to measure the jitter of your system.
+For example, on a `12th Gen Intel(R) Core(TM) i7-12700K`, for 1 second of execution time, I get:
+
+```
+$ ./aos_timing_report_streamer --application ping
+ping[3885755] () version: "ping_version" (634527.158294370sec,2025-02-20_19-12-14.089194802):
+  Watchers (1):
+    Channel Name |              Type | Count |                                       Wakeup Latency |                                  Handler Time
+           /test | aos.examples.Pong |   100 | 3.67391e-05 [5.397e-06, 0.000102438] std 2.65956e-05 | 7.9988e-07 [1.28e-07, 1.6e-06] std 3.5626e-07
+  Senders (3):
+    Channel Name |                      Type | Count |                   Size | Errors
+           /test |         aos.examples.Ping |   100 |      32 [32, 32] std 0 |   0, 0
+            /aos |         aos.timing.Report |     1 |   632 [632, 632] std 0 |   0, 0
+            /aos | aos.logging.LogMessageFbs |     0 | nan [nan, nan] std nan |   0, 0
+  Timers (2):
+              Name | Count |                                       Wakeup Latency |                                      Handler Time
+              ping |   100 | 2.66082e-05 [4.693e-06, 0.000100601] std 2.49382e-05 | 1.15897e-05 [2.809e-06, 2.626e-05] std 5.1843e-06
+    timing_reports |     1 |            2.5341e-05 [2.5341e-05, 2.5341e-05] std 0 |            5.515e-06 [5.515e-06, 5.515e-06] std 0
+^C
+Accumulated timing reports :
+
+ping[3885755] () version: "ping_version" (-9223372036.854775808sec,(unrepresentable realtime -9223372036854775808)):
+  Watchers (1):
+    Channel Name |              Type | Count |                                       Wakeup Latency |                                  Handler Time
+           /test | aos.examples.Pong |   100 | 3.67391e-05 [5.397e-06, 0.000102438] std 2.65956e-05 | 7.9988e-07 [1.28e-07, 1.6e-06] std 3.5626e-07
+  Senders (3):
+    Channel Name |                      Type | Count |                   Size | Errors
+           /test |         aos.examples.Ping |   100 |      32 [32, 32] std 0 |   0, 0
+            /aos |         aos.timing.Report |     1 |   632 [632, 632] std 0 |   0, 0
+            /aos | aos.logging.LogMessageFbs |     0 | nan [nan, nan] std nan |   0, 0
+  Timers (2):
+              Name | Count |                                       Wakeup Latency |                                      Handler Time
+              ping |   100 | 2.66082e-05 [4.693e-06, 0.000100601] std 2.49382e-05 | 1.15897e-05 [2.809e-06, 2.626e-05] std 5.1843e-06
+    timing_reports |     1 |            2.5341e-05 [2.5341e-05, 2.5341e-05] std 0 |            5.515e-06 [5.515e-06, 5.515e-06] std 0
+```
