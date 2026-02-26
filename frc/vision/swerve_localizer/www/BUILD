@@ -8,15 +8,15 @@ filegroup(
         "**/*.html",
         "**/*.css",
         "**/*.png",
-    ]) + ["2025.png"],
+    ]) + ["2026.png"],
     visibility = ["//visibility:public"],
 )
 
 genrule(
-    name = "2025_field_png",
-    srcs = ["//third_party/y2025/field:pictures"],
-    outs = ["2025.png"],
-    cmd = "cp third_party/y2025/field/2025.png $@",
+    name = "2026_field_png",
+    srcs = ["//third_party/y2026/field:pictures"],
+    outs = ["2026.png"],
+    cmd = "cp third_party/y2026/field/2026.png $@",
 )
 
 ts_project(
