@@ -281,8 +281,7 @@ void Localizer::RejectImage(int camera_index, RejectionReason reason,
 // (in the past) for ignoring april tags that tend to produce problematic
 // readings.
 bool Localizer::UseAprilTag(uint64_t target_id) {
-  if (target_poses_.count(target_id) == 0 || target_id == 4 || target_id == 5 ||
-      target_id == 14 || target_id == 15 || target_id == 3 || target_id == 16) {
+  if (target_poses_.count(target_id) == 0) {
     return false;
   }
   return true;
@@ -290,18 +289,22 @@ bool Localizer::UseAprilTag(uint64_t target_id) {
 
 bool Localizer::DeweightAprilTag(uint64_t target_id) {
   switch (target_id) {
-    case 6:
-    case 7:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
     case 8:
     case 9:
     case 10:
     case 11:
-    case 17:
     case 18:
     case 19:
     case 20:
     case 21:
-    case 22:
+    case 24:
+    case 25:
+    case 26:
+    case 27:
       return false;
     default:
       return true;
