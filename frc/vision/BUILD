@@ -639,7 +639,7 @@ robot_downloader(
         ":aos_config",
         ":constants.json",
         "//frc/orin:orin_irq_config.json",
-        "@frc2025_field_map_welded//file:frc2025r2.fmap",
+        "@frc2026_field_map_welded//file:frc2026.fmap",
     ],
     # Deploy the raw intrinsics files so that it is easy to run intrinsics
     # without needing to manually scp around intrinsics JSON's.

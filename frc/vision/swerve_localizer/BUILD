@@ -195,7 +195,7 @@ cc_library(
     srcs = ["field_map_constants_sender_lib.cc"],
     hdrs = ["field_map_constants_sender_lib.h"],
     data = [
-        "@frc2025_field_map_welded//file:frc2025r2.fmap",
+        "@frc2026_field_map_welded//file:frc2026.fmap",
     ],
     deps = [
         "//aos:json_to_flatbuffer",

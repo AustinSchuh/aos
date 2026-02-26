@@ -23,7 +23,7 @@
 
 ABSL_FLAG(std::string, config, "aos_config.json",
           "File path of aos configuration");
-ABSL_FLAG(std::string, field_map, "frc2025r2.fmap",
+ABSL_FLAG(std::string, field_map, "frc2026.fmap",
           "File path of the field map to use");
 ABSL_FLAG(double, max_distance, 4.0, "Max distance to accept targets.");
 

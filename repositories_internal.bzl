@@ -8,12 +8,12 @@ def com_github_foxglove_mcap_mcap_repo():
         urls = ["https://github.com/foxglove/mcap/releases/download/releases%2Fmcap-cli%2Fv0.0.51/mcap-linux-amd64"],
     )
 
-def frc2025_field_map_welded_repo():
+def frc2026_field_map_welded_repo():
     http_file(
-        name = "frc2025_field_map_welded",
-        downloaded_file_path = "frc2025r2.fmap",
-        sha256 = "20b7621bf988a6e378a252576d43d2bfbd17d4f38ea2cbb2e7f2cfc82a17732a",
-        urls = ["https://downloads.limelightvision.io/models/frc2025r2.fmap"],
+        name = "frc2026_field_map_welded",
+        downloaded_file_path = "frc2026.fmap",
+        sha256 = "5a2b0ce9069cf0e52602939121aa1f0bf3cdc5bc9adf8744eeebaf67350effbe",
+        urls = ["https://downloads.limelightvision.io/models/FRC2026_WELDED.fmap"],
     )
 
 def intrinsic_calibration_test_images_repo():

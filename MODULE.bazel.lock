@@ -726,7 +726,7 @@
               ]
             }
           },
-          "frc2025_field_map_welded": {
+          "frc2026_field_map_welded": {
             "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_file",
             "attributes": {
               "downloaded_file_path": "frc2025r2.fmap",

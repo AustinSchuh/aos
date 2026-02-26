@@ -11,7 +11,7 @@
 #include "frc/vision/target_map_static.h"
 
 ABSL_FLAG(std::string, config, "aos_config.json", "Path to the AOS config.");
-ABSL_FLAG(std::string, field_map_json, "frc2025r2.fmap",
+ABSL_FLAG(std::string, field_map_json, "frc2026.fmap",
           "Path to the constant file");
 
 namespace frc::vision::swerve_localizer {

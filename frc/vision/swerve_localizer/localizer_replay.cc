@@ -23,7 +23,7 @@ ABSL_FLAG(int32_t, team, 4646, "Team number to use for logfile replay.");
 ABSL_FLAG(std::string, output_folder, "/tmp/replayed",
           "Name of the folder to write replayed logs to.");
 ABSL_FLAG(std::string, field_map_path,
-          "../frc2025_field_map_welded/file/frc2025r2.fmap",
+          "../frc2026_field_map_welded/file/frc2026.fmap",
           "Path to the field map file");
 
 ABSL_FLAG(std::string, data_dir,

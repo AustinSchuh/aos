@@ -406,7 +406,7 @@ use_repo(
     "com_github_nvidia_cccl",
     "coral_image_thriftycam_2025",
     "drivetrain_replay",
-    "frc2025_field_map_welded",
+    "frc2026_field_map_welded",
     "intrinsic_calibration_test_images",
     "orin_capture_24_04",
     "orin_capture_24_04_side",

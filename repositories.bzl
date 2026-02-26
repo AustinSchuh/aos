@@ -1,5 +1,5 @@
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
-load("//:repositories_internal.bzl", "april_tag_test_image_repo", "apriltag_test_bfbs_images_repo", "arm_frc_linux_gnueabi_repo_repo", "calibrate_multi_cameras_data_repo", "com_github_foxglove_mcap_mcap_repo", "com_github_nvidia_cccl_repo", "coral_image_thriftycam_2025_repo", "drivetrain_replay_repo", "frc2025_field_map_welded_repo", "intrinsic_calibration_test_images_repo", "orin_capture_24_04_repo", "orin_capture_24_04_side_repo", "orin_image_apriltag_repo", "orin_large_image_apriltag_repo", "superstructure_replay_repo")
+load("//:repositories_internal.bzl", "april_tag_test_image_repo", "apriltag_test_bfbs_images_repo", "arm_frc_linux_gnueabi_repo_repo", "calibrate_multi_cameras_data_repo", "com_github_foxglove_mcap_mcap_repo", "com_github_nvidia_cccl_repo", "coral_image_thriftycam_2025_repo", "drivetrain_replay_repo", "frc2026_field_map_welded_repo", "intrinsic_calibration_test_images_repo", "orin_capture_24_04_repo", "orin_capture_24_04_side_repo", "orin_image_apriltag_repo", "orin_large_image_apriltag_repo", "superstructure_replay_repo")
 
 def _compat_repository_impl(ctx):
     ctx.file("BUILD", ctx.attr.build_file_content)
@@ -618,7 +618,7 @@ def frc_repositories():
         ],
     )
 
-    frc2025_field_map_welded_repo()
+    frc2026_field_map_welded_repo()
 
     intrinsic_calibration_test_images_repo()
 
