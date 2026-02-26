@@ -16,8 +16,8 @@ import {FIELD_LENGTH, FIELD_WIDTH, FT_TO_M, IN_TO_M} from './constants';
 const FIELD_SIDE_Y = FIELD_WIDTH / 2;
 const FIELD_EDGE_X = FIELD_LENGTH / 2;
 
-const ROBOT_WIDTH = 36 * IN_TO_M;
-const ROBOT_LENGTH = 35 * IN_TO_M;
+const ROBOT_WIDTH = 34 * IN_TO_M;
+const ROBOT_LENGTH = 34 * IN_TO_M;
 
 const CAMERA_COLORS = ['#ff00ff', '#ffff00', '#00ffff', '#ffa500'];
 const CAMERAS = ['/camera0/gray', '/camera1/gray', '/camera2/gray', '/camera3/gray'];
@@ -57,7 +57,7 @@ export class FieldHandler {
   constructor(private readonly connection: Connection) {
     (document.getElementById('field') as HTMLElement).appendChild(this.canvas);
 
-    this.fieldImage.src = '2025.png';
+    this.fieldImage.src = '2026.png';
 
     // Construct a table header.
     {
