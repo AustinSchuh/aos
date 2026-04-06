@@ -300,25 +300,6 @@ void TypedThreshold<IMAGE_FORMAT>::ThresholdAndDecimate(
         min_white_black_diff);
     MaybeCheckAndSynchronize();
   }
-
-  HostMemory<uint8_t> minmax_image_host((width_ / 2 / 4 * height_ / 2 / 4 * 2));
-  minmax_image_device_.MemcpyTo(&minmax_image_host);
-
-  for (size_t h = 0; h < height_ / 8; h += 1) {
-    for (size_t w = 0; w < width_ / 8; w += 2) {
-      const bool print = (w == 0 && h == 540 / 4);
-      if (print) {
-        LOG(INFO) << h << ", " << w << ": " << std::hex
-                  << static_cast<int>(*(
-                         reinterpret_cast<uint16_t *>(minmax_image_host.get()) +
-                         h * width_ / 8 + w));
-        LOG(INFO) << h << ", " << w + 1 << ": " << std::hex
-                  << static_cast<int>(*(
-                         reinterpret_cast<uint16_t *>(minmax_image_host.get()) +
-                         h * width_ / 8 + w + 1));
-      }
-    }
-  }
 }
 
 }  // namespace
