@@ -175,18 +175,6 @@ llvm_cxxopts = [
     "-std=gnu++20",
 ]
 
-llvm_opt_copts = [
-    "-DAOS_DEBUG=0",
-]
-
-llvm_fastbuild_copts = [
-    "-DAOS_DEBUG=0",
-]
-
-llvm_dbg_copts = [
-    "-DAOS_DEBUG=1",
-]
-
 llvm_toolchain(
     name = "llvm_toolchain",
     additional_target_compatible_with = {},
@@ -202,19 +190,7 @@ llvm_toolchain(
         "linux-aarch64": llvm_cxxopts,
         "linux-x86_64": llvm_cxxopts,
     },
-    dbg_copts = {
-        "linux-aarch64": llvm_dbg_copts,
-        "linux-x86_64": llvm_dbg_copts,
-    },
-    fastbuild_copts = {
-        "linux-aarch64": llvm_fastbuild_copts,
-        "linux-x86_64": llvm_fastbuild_copts,
-    },
     llvm_version = llvm_version,
-    opt_copts = {
-        "linux-aarch64": llvm_opt_copts,
-        "linux-x86_64": llvm_opt_copts,
-    },
     standard_libraries = {
         "linux-aarch64": "libstdc++-14.3.0",
         "linux-x86_64": "libstdc++-12",

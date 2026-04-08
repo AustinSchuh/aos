@@ -2,6 +2,15 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
+# This is different from the normal setting of NDEBUG because NDEBUG splits
+# dbg/fastbuild vs opt, vs this splits dbg vs fastbuild/opt.
+config_setting(
+    name = "aos_sync_debug",
+    values = {
+        "compilation_mode": "dbg",
+    },
+)
+
 cc_library(
     name = "aos_sync",
     srcs = [
@@ -10,6 +19,10 @@ cc_library(
     hdrs = [
         "aos_sync.h",
     ],
+    copts = select({
+        ":aos_sync_debug": ["-DAOS_SYNC_DEBUG=1"],
+        "//conditions:default": ["-DAOS_SYNC_DEBUG=0"],
+    }),
     linkopts = [
         "-lpthread",
     ],

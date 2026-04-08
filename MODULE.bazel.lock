@@ -533,7 +533,7 @@
     },
     "//tools/cpp:extensions.bzl%dev_toolchains_extension": {
       "general": {
-        "bzlTransitiveDigest": "V8WSNFoUwAoUbuKRV6ZGD2nRysfIxY6+yeU4CjEXMEw=",
+        "bzlTransitiveDigest": "X9VuANynmf8Fun5lYNRn/rfR/MyYU3yyOXnBVZuAAYs=",
         "usagesDigest": "lLLJpwFDW4jsRyag0p47iIByB/3D75KpYBRl4SjoPYo=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -582,7 +582,7 @@
     },
     "//tools/cpp:extensions.bzl%llvm_toolchain_extension": {
       "general": {
-        "bzlTransitiveDigest": "V8WSNFoUwAoUbuKRV6ZGD2nRysfIxY6+yeU4CjEXMEw=",
+        "bzlTransitiveDigest": "X9VuANynmf8Fun5lYNRn/rfR/MyYU3yyOXnBVZuAAYs=",
         "usagesDigest": "BbuCooWESKfKJEQTjlyiuF//9VjiRAx8bsw+K0vbzNY=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -644,31 +644,7 @@
                   "-std=gnu++20"
                 ]
               },
-              "dbg_copts": {
-                "linux-aarch64": [
-                  "-DAOS_DEBUG=1"
-                ],
-                "linux-x86_64": [
-                  "-DAOS_DEBUG=1"
-                ]
-              },
-              "fastbuild_copts": {
-                "linux-aarch64": [
-                  "-DAOS_DEBUG=0"
-                ],
-                "linux-x86_64": [
-                  "-DAOS_DEBUG=0"
-                ]
-              },
               "llvm_version": "21.1.1",
-              "opt_copts": {
-                "linux-aarch64": [
-                  "-DAOS_DEBUG=0"
-                ],
-                "linux-x86_64": [
-                  "-DAOS_DEBUG=0"
-                ]
-              },
               "standard_libraries": {
                 "linux-aarch64": "libstdc++-14.3.0",
                 "linux-x86_64": "libstdc++-12"
@@ -710,7 +686,7 @@
     },
     "//tools/frc:extensions.bzl%frc_deps_extension": {
       "general": {
-        "bzlTransitiveDigest": "+WhW5eQ9hPU9mlDPyRLdzRCDZ+NaQ+zeattKFyFpsRU=",
+        "bzlTransitiveDigest": "rhG6VmDoHd93XSyaDZBGVa0ffcBwuRWdOcbBcFOnRO0=",
         "usagesDigest": "LNojzjbeMVSfZXgWCJWiq1Cjot/rHzz5Rzf/cq8saR4=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -729,10 +705,10 @@
           "frc2026_field_map_welded": {
             "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_file",
             "attributes": {
-              "downloaded_file_path": "frc2025r2.fmap",
-              "sha256": "20b7621bf988a6e378a252576d43d2bfbd17d4f38ea2cbb2e7f2cfc82a17732a",
+              "downloaded_file_path": "frc2026.fmap",
+              "sha256": "5a2b0ce9069cf0e52602939121aa1f0bf3cdc5bc9adf8744eeebaf67350effbe",
               "urls": [
-                "https://downloads.limelightvision.io/models/frc2025r2.fmap"
+                "https://downloads.limelightvision.io/models/FRC2026_WELDED.fmap"
               ]
             }
           },

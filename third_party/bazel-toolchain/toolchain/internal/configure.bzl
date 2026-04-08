@@ -129,9 +129,6 @@ def llvm_register_toolchains():
         conlyopts_dict = rctx.attr.conlyopts,
         cxxopts_dict = rctx.attr.cxxopts,
         copts_dict = rctx.attr.copts,
-        opt_copts_dict = rctx.attr.opt_copts,
-        dbg_copts_dict = rctx.attr.dbg_copts,
-        fastbuild_copts_dict = rctx.attr.fastbuild_copts,
         linkopts_dict = rctx.attr.linkopts,
     )
     host_tools_info = dict([
@@ -281,9 +278,6 @@ def _cc_toolchain_str(
     conlyopts = toolchain_info.conlyopts_dict.get(key, [])
     cxxopts = toolchain_info.cxxopts_dict.get(key, [])
     copts = toolchain_info.copts_dict.get(key, [])
-    opt_copts = toolchain_info.opt_copts_dict.get(key, [])
-    dbg_copts = toolchain_info.dbg_copts_dict.get(key, [])
-    fastbuild_copts = toolchain_info.fastbuild_copts_dict.get(key, [])
     linkopts = toolchain_info.linkopts_dict.get(key, [])
     target_toolchain_root = toolchain_info.toolchain_root
     if key in toolchain_info.target_toolchain_roots_dict:
@@ -319,9 +313,6 @@ cc_toolchain_config(
     conlyopts = {conlyopts},
     cxxopts = {cxxopts},
     copts = {copts},
-    opt_copts = {opt_copts},
-    dbg_copts = {dbg_copts},
-    fastbuild_copts = {fastbuild_copts},
     linkopts = {linkopts},
 )
 
@@ -438,8 +429,5 @@ cc_toolchain(
         conlyopts = conlyopts,
         cxxopts = cxxopts,
         copts = copts,
-        opt_copts = opt_copts,
-        dbg_copts = dbg_copts,
-        fastbuild_copts = fastbuild_copts,
         linkopts = linkopts,
     )
