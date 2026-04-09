@@ -181,3 +181,8 @@ filegroup(
     name = "flatjs",
     srcs = ["js/flatbuffers.js"],
 )
+
+# For dependent projects, build a tarball of this vendored flatbuffers with:
+#   git archive HEAD:third_party/flatbuffers/ -o flatbuffers-24.3.25-aos-$(git rev-parse --short=8 HEAD).tgz
+# and then host it alongside your dependencies and use archive_override to
+# references it.
