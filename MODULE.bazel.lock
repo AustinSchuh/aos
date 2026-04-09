@@ -533,7 +533,7 @@
     },
     "//tools/cpp:extensions.bzl%dev_toolchains_extension": {
       "general": {
-        "bzlTransitiveDigest": "X9VuANynmf8Fun5lYNRn/rfR/MyYU3yyOXnBVZuAAYs=",
+        "bzlTransitiveDigest": "iPG4lrOnv31bcTg8+fmhQgJb4cut79aLSDNj8Vh8xLA=",
         "usagesDigest": "lLLJpwFDW4jsRyag0p47iIByB/3D75KpYBRl4SjoPYo=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -582,7 +582,7 @@
     },
     "//tools/cpp:extensions.bzl%llvm_toolchain_extension": {
       "general": {
-        "bzlTransitiveDigest": "X9VuANynmf8Fun5lYNRn/rfR/MyYU3yyOXnBVZuAAYs=",
+        "bzlTransitiveDigest": "iPG4lrOnv31bcTg8+fmhQgJb4cut79aLSDNj8Vh8xLA=",
         "usagesDigest": "BbuCooWESKfKJEQTjlyiuF//9VjiRAx8bsw+K0vbzNY=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -623,7 +623,8 @@
                   "-fmessage-length=100",
                   "-fmacro-backtrace-limit=0",
                   "-ggdb3",
-                  "-Wno-deprecated-declarations"
+                  "-Wno-deprecated-declarations",
+                  "-Wembedded-directive"
                 ],
                 "linux-x86_64": [
                   "-D__STDC_FORMAT_MACROS",
@@ -633,7 +634,8 @@
                   "-fmessage-length=100",
                   "-fmacro-backtrace-limit=0",
                   "-ggdb3",
-                  "-Wno-deprecated-declarations"
+                  "-Wno-deprecated-declarations",
+                  "-Wembedded-directive"
                 ]
               },
               "cxxopts": {

@@ -24,12 +24,12 @@
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
 #endif
 
-ABSL_FLAG(std::string, logging_folder,
 #ifdef AOS_ARCHITECTURE_arm_frc
-          "",
+#define LOGGING_FOLDER_DEFAULT ""
 #else
-          "./logs",
+#define LOGGING_FOLDER_DEFAULT "./logs"
 #endif
+ABSL_FLAG(std::string, logging_folder, LOGGING_FOLDER_DEFAULT,
           "The folder to log to.  If empty, search for the /media/sd*1/ "
           "folder and place logs there.");
 

@@ -25,7 +25,10 @@ def _llvm_toolchain_extension_impl(_ctx):
         "-fmessage-length=100",
         "-fmacro-backtrace-limit=0",
         "-ggdb3",
+        # Too many core libraries have these right now.
+        # TODO(austin): Turn this off later.
         "-Wno-deprecated-declarations",
+        "-Wembedded-directive",
     ]
     llvm_cxxopts = ["-std=gnu++20"]
 

@@ -169,6 +169,7 @@ llvm_copts = [
     # Too many core libraries have these right now.
     # TODO(austin): Turn this off later.
     "-Wno-deprecated-declarations",
+    "-Wembedded-directive",
 ]
 
 llvm_cxxopts = [

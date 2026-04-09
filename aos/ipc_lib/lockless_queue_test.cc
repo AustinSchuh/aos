@@ -39,12 +39,13 @@ ABSL_FLAG(int32_t, print_rate, 60, "Number of seconds between status prints");
 
 // The roboRIO can only handle 10 threads before exploding.  Set the default for
 // ARM to 10.
-ABSL_FLAG(int32_t, thread_count,
 #if defined(__ARM_EABI__)
-          10,
+#define DEFAULT_THREAD_COUNT 10
 #else
-          100,
+#define DEFAULT_THREAD_COUNT 100
 #endif
+
+ABSL_FLAG(int32_t, thread_count, DEFAULT_THREAD_COUNT,
           "Number of threads to race");
 
 namespace aos::ipc_lib::testing {
