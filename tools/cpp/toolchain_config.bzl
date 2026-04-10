@@ -163,19 +163,6 @@ def _impl(ctx):
     else:
         fail("Unreachable")
 
-    opt_post_feature = feature(
-        name = "opt_post",
-        flag_sets = [
-            flag_set(
-                actions = all_cpp_compile_actions + [
-                    ACTION_NAMES.preprocess_assemble,
-                    ACTION_NAMES.c_compile,
-                ],
-                flag_groups = [flag_group(flags = ["-DAOS_DEBUG=0"])],
-            ),
-        ],
-    )
-
     supports_pic_feature = feature(name = "supports_pic", enabled = True)
 
     if ctx.attr.cpu == "cortex-m4f-k22":
@@ -531,7 +518,6 @@ def _impl(ctx):
                         ACTION_NAMES.c_compile,
                     ],
                     flag_groups = [
-                        flag_group(flags = ["-DAOS_DEBUG=1"]),
                         flag_group(flags = ["-fno-omit-frame-pointer"]),
                     ],
                 ),
@@ -557,23 +543,10 @@ def _impl(ctx):
     else:
         dbg_feature = None
 
-    if ctx.attr.cpu == "roborio":
-        fastbuild_feature = feature(
-            name = "fastbuild",
-            flag_sets = [
-                flag_set(
-                    actions = all_cpp_compile_actions + [
-                        ACTION_NAMES.preprocess_assemble,
-                        ACTION_NAMES.c_compile,
-                    ],
-                    flag_groups = [flag_group(flags = ["-DAOS_DEBUG=0"])],
-                ),
-            ],
-        )
-    elif (ctx.attr.cpu == "rp2040" or
-          ctx.attr.cpu == "cortex-m4f-imu" or
-          ctx.attr.cpu == "cortex-m4f" or
-          ctx.attr.cpu == "cortex-m4f-k22"):
+    if (ctx.attr.cpu == "rp2040" or
+        ctx.attr.cpu == "cortex-m4f-imu" or
+        ctx.attr.cpu == "cortex-m4f" or
+        ctx.attr.cpu == "cortex-m4f-k22"):
         fastbuild_feature = feature(name = "fastbuild", implies = ["all_modes"])
     else:
         fastbuild_feature = None
@@ -626,7 +599,6 @@ def _impl(ctx):
                     flag_groups = [flag_group(flags = ["-Wl,--gc-sections"])],
                 ),
             ],
-            implies = ["opt_post"],
         )
     elif (ctx.attr.cpu == "rp2040" or
           ctx.attr.cpu == "cortex-m4f-imu" or
@@ -1208,9 +1180,7 @@ def _impl(ctx):
             random_seed_feature,
             pic_feature,
             include_paths_feature,
-            opt_post_feature,
             dbg_feature,
-            fastbuild_feature,
             all_modes_feature,
             pie_for_linking_feature,
             supports_dynamic_linker_feature,
