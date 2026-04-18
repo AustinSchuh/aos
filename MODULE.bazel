@@ -362,7 +362,7 @@ local_path_override(
 
 bazel_dep(name = "foxglove_schemas", version = "0.16.2", repo_name = "com_github_foxglove_schemas")
 bazel_dep(name = "symengine", version = "0.12.0")
-bazel_dep(name = "gmp", version = "6.2.0")
+bazel_dep(name = "gmp", version = "6.3.0")
 bazel_dep(name = "aspect_rules_cypress", version = "0.7.2")
 
 cypress = use_extension("@aspect_rules_cypress//cypress:extensions.bzl", "cypress")
@@ -445,3 +445,9 @@ register_toolchains(
 )
 
 # TODO(austin): Rust can't mention llvm_toolchain, otherwise wpilib needs llvm_toolchain + the sysroot.  Which is bad.
+
+single_version_override(
+    module_name = "gmp",
+    version = "6.3.0",
+    registry = "https://raw.githubusercontent.com/UebelAndre/bazel-central-registry/gmp",
+)
