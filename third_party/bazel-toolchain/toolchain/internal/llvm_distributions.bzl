@@ -349,7 +349,7 @@ _llvm_distributions_base_url = {
     "17.0.2": "https://github.com/llvm/llvm-project/releases/download/llvmorg-",
     "18.1.8": "https://github.com/llvm/llvm-project/releases/download/llvmorg-",
     "19.1.7": "https://github.com/llvm/llvm-project/releases/download/llvmorg-",
-    "21.1.1": "https://github.com/llvm/llvm-project/releases/download/llvmorg-",
+    "21.1.1": "https://mirror.spacecookies.dev/github.com/llvm/llvm-project/releases/download/llvmorg-",
     "6.0.0": "https://releases.llvm.org/",
     "6.0.1": "https://releases.llvm.org/",
     "7.0.0": "https://releases.llvm.org/",
