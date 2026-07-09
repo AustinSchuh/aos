@@ -2,8 +2,6 @@
 
 #include <errno.h>
 #include <stdlib.h>
-#include <sys/mman.h>
-#include <sys/wait.h>
 
 #include <atomic>
 #include <cstdint>
@@ -12,76 +10,76 @@
 #include "absl/log/absl_log.h"
 #include "gtest/gtest.h"
 
+#include "aos/testing/test_child.h"
+#include "aos/testing/test_shm.h"
+
 namespace aos::ipc_lib::testing {
 namespace {
 
-// A PID that can never belong to a live process.  The kernel caps
-// /proc/sys/kernel/pid_max at PID_MAX_LIMIT, and PID allocation wraps at
-// pid_max, so PID_MAX_LIMIT is never handed out no matter how pid_max is
-// tuned at runtime.  A smaller hardcoded value like 999999 is a perfectly
-// allocatable PID when pid_max is raised, and would spuriously match a live
-// process holding that PID.
-//
-// PID_MAX_LIMIT comes from the kernel's include/linux/threads.h, which isn't
-// exported to userspace, so we spell it out here.
-constexpr uint32_t kNonexistentPid = 1 << 22;
+// NoMatchingPID stores this into the futex's TID field and expects
+// OwnerIsDefinitelyAbsolutelyDead() to report the owner gone.  It must be a PID
+// that can't name a live process, so the platform's lookup of that TID fails --
+// and each platform looks the TID up differently.
+#if defined(__linux__)
+uint32_t NonexistentPid() {
+  // PID_MAX_LIMIT comes from the kernel's include/linux/threads.h, which isn't
+  // exported to userspace, so we spell it out here.
+  return 1 << 22;
+}
+#elif defined(__APPLE__)
+// Darwin caps PIDs at PID_MAX, so PID_MAX + 1 can't name a live process.
+// PID_MAX lives in the kernel-only header bsd/sys/proc_internal.h and isn't in
+// the userspace SDK, so define it to its known value if it isn't already.  (The
+// darwin check actually returns on a "futex TID != recorded owner thread id"
+// mismatch before it ever does the liveness lookup, so any value other than our
+// owner works here; PID_MAX + 1 just keeps the intent clear.)
+#ifndef PID_MAX
+#define PID_MAX 99999
+#endif
+uint32_t NonexistentPid() { return PID_MAX + 1; }
+#else  // Windows
+uint32_t NonexistentPid() {
+  // Windows looks the PID up via the process API.  999999 is never a valid
+  // Windows PID (process ids are always multiples of 4), so the lookup fails.
+  return 999999;
+}
+#endif
 
 }  // namespace
 
 // Capture RobustOwnershipTracker in shared memory so it is shared across a
-// fork.
+// fork (on Linux) or simply allocated/shared (on Windows).
+//
+// The tests never release ownership: the mutex lives in the block, and the
+// block is simply freed when this goes out of scope (munmap on Linux, which
+// makes the kernel's robust-list walk fault harmlessly; nothing walks the
+// userspace robust list on Windows).  This matches how a lockless-queue slot is
+// abandoned when its owner dies.
 class SharedRobustOwnershipTracker {
  public:
-  SharedRobustOwnershipTracker() {
-    tracker_ = static_cast<RobustOwnershipTracker *>(
-        mmap(nullptr, sizeof(RobustOwnershipTracker), PROT_READ | PROT_WRITE,
-             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-    ABSL_PCHECK(MAP_FAILED != tracker_);
-  };
-  ~SharedRobustOwnershipTracker() {
-    ABSL_PCHECK(munmap(tracker_, sizeof(RobustOwnershipTracker)) != -1);
+  SharedRobustOwnershipTracker() : block_(sizeof(RobustOwnershipTracker)) {
+    tracker_ = new (block_.get()) RobustOwnershipTracker();
   }
 
-  // Captures the tid.
   RobustOwnershipTracker &tracker() const { return *tracker_; }
 
  private:
+  aos::testing::SharedMemoryBlock block_;
   RobustOwnershipTracker *tracker_;
 };
 
 class RobustOwnershipTrackerTest : public ::testing::Test {
  public:
-  // Runs a function in a child process, and then exits afterwards.  Waits for
-  // the child to finish before resuming.
+  // Runs a function in a child (a forked process, or a thread on platforms
+  // without fork) and waits for it to finish before resuming.  The tests use
+  // this to make a *different* owner claim the tracker and then die: process
+  // death on POSIX, thread death on Windows -- each being the granularity at
+  // which that platform detects owner death.
   template <typename T>
   void RunInChildAndBlockUntilComplete(T fn) {
-    pid_t pid = fork();
-    if (pid == 0) {
-      fn();
-      ABSL_LOG(INFO) << "Child exiting normally.";
-      exit(0);
-      return;
-    }
-
-    ABSL_LOG(INFO) << "Child has pid " << pid;
-
-    while (true) {
-      ABSL_LOG(INFO) << "Waiting for child.";
-      int status;
-      const pid_t waited_on = waitpid(pid, &status, 0);
-      // Check for failure.
-      if (waited_on == -1) {
-        if (errno == EINTR) continue;
-        ABSL_PLOG(FATAL) << ": waitpid(" << pid << ", " << &status
-                         << ", 0) failed";
-      }
-      ABSL_CHECK_EQ(waited_on, pid)
-          << ": waitpid() got child " << waited_on << " instead of " << pid;
-      ABSL_CHECK(WIFEXITED(status));
-      ABSL_LOG(INFO) << "Status " << WEXITSTATUS(status);
-      ABSL_CHECK(WEXITSTATUS(status) == 0);
-      return;
-    }
+    aos::testing::TestChild child;
+    child.Start(std::move(fn));
+    child.Join();
   }
 
   // Returns the robust mutex.
@@ -89,6 +87,7 @@ class RobustOwnershipTrackerTest : public ::testing::Test {
     return tracker.mutex_;
   }
 
+#ifndef __APPLE__
   // Returns the current start time in ticks.
   uint64_t GetStartTimeTicks(RobustOwnershipTracker &tracker) {
     return tracker.start_time_ticks_.load();
@@ -98,6 +97,7 @@ class RobustOwnershipTrackerTest : public ::testing::Test {
   void SetStartTimeTicks(RobustOwnershipTracker &tracker, uint64_t start_time) {
     tracker.start_time_ticks_ = start_time;
   }
+#endif
 };
 
 // Tests that acquiring the futex doesn't erroneously report the owner (i.e.
@@ -107,7 +107,7 @@ TEST_F(RobustOwnershipTrackerTest, AcquireWorks) {
 
   EXPECT_FALSE(shared_tracker.tracker().OwnerIsDefinitelyAbsolutelyDead());
 
-  // Run acquire in the this process, and expect it should not be dead until
+  // Run acquire in this process, and expect it should not be dead until
   // after the test finishes.
   shared_tracker.tracker().Acquire();
 
@@ -141,7 +141,7 @@ TEST_F(RobustOwnershipTrackerTest, NoMatchingPID) {
   EXPECT_FALSE(shared_tracker.tracker().LoadRelaxed().OwnerIsDead());
   EXPECT_FALSE(shared_tracker.tracker().OwnerIsDefinitelyAbsolutelyDead());
   std::atomic_ref<uint32_t>(GetMutex(shared_tracker.tracker()).futex)
-      .store(kNonexistentPid, std::memory_order_relaxed);
+      .store(NonexistentPid(), std::memory_order_relaxed);
 
   // Since we're only pretending that the owner died (by changing the TID in the
   // futex), we only notice that the owner is dead when spending the time
@@ -150,6 +150,7 @@ TEST_F(RobustOwnershipTrackerTest, NoMatchingPID) {
   EXPECT_TRUE(shared_tracker.tracker().OwnerIsDefinitelyAbsolutelyDead());
 }
 
+#ifndef __APPLE__
 // Tests that a mismatched start time results in the process being marked as
 // dead.
 TEST_F(RobustOwnershipTrackerTest, NoMatchingStartTime) {
@@ -170,5 +171,6 @@ TEST_F(RobustOwnershipTrackerTest, NoMatchingStartTime) {
   EXPECT_FALSE(shared_tracker.tracker().LoadRelaxed().OwnerIsDead());
   EXPECT_TRUE(shared_tracker.tracker().OwnerIsDefinitelyAbsolutelyDead());
 }
+#endif
 
 }  // namespace aos::ipc_lib::testing
