@@ -51,9 +51,21 @@ cc_library(
         "aio_linux.cc",
     ],
     hdrs = ["aio.h"],
+    # The --aio_backend default is a property of the target platform (there
+    # is no runtime fallback), so it is compiled in rather than probed.  See
+    # //tools/platforms/io_uring.
+    local_defines = select({
+        "//tools/platforms/io_uring:has_support": [
+            "AOS_AIO_DEFAULT_BACKEND=\\\"io_uring\\\"",
+        ],
+        "//tools/platforms/io_uring:lacks_support": [
+            "AOS_AIO_DEFAULT_BACKEND=\\\"epoll\\\"",
+        ],
+    }),
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
+        ":intrusive_rb_tree",
         "//aos:realtime",
         "//aos/ipc_lib:thread_signal",
         "//aos/libc:aos_strerror",
@@ -95,6 +107,7 @@ cc_test(
         "//aos:realtime",
         "//aos/ipc_lib:thread_signal",
         "//aos/testing:googletest",
+        "//aos/testing:tmpdir",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:reflection",
         "@com_google_absl//absl/log",
