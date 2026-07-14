@@ -9,7 +9,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -25,6 +28,7 @@
 #include "aos/ipc_lib/thread_signal.h"
 #include "aos/realtime.h"
 
+ABSL_DECLARE_FLAG(std::string, aio_backend);
 ABSL_DECLARE_FLAG(uint32_t, aio_queue_depth);
 
 namespace aos::testing {
@@ -143,15 +147,22 @@ class RepeatingTimer {
   aos::monotonic_clock::duration period_{};
 };
 
-class AioTest : public ::testing::TestWithParam<bool> {
+// Parameterized by backend name, the same string --aio_backend takes, so a
+// failing test names the backend it failed on instead of an index -- and so
+// adding a backend does not mean re-teaching this a new boolean.
+class AioTest : public ::testing::TestWithParam<std::string> {
  protected:
+  // Whether the backend under test is io_uring.  Several tests below cover
+  // behavior only it has (SINGLE_ISSUER enforcement, orphaned destruction);
+  // they skip elsewhere rather than assert something epoll never promised.
+  static bool IsIoUring() { return GetParam() == "io_uring"; }
+
   void SetUp() override {
     // Pace ring creation across the whole suite, not just the
     // ring-churning tests -- see ThrottleOnKernelRingTeardown().
     ThrottleOnKernelRingTeardown();
-    // Parameterized from the start, with io_uring as the only backend so
-    // far; the epoll backend adds itself as a second value.
-    ABSL_LOG(INFO) << "Testing Aio with the io_uring backend.";
+    ::absl::SetFlag(&FLAGS_aio_backend, GetParam());
+    ABSL_LOG(INFO) << "Testing Aio with the " << GetParam() << " backend.";
   }
 
   // Restores every flag SetUp() (or the test body) touched.
@@ -163,7 +174,10 @@ class AioTest : public ::testing::TestWithParam<bool> {
 // periodically themselves.
 class AioReproTest : public ::testing::Test {
  protected:
-  void SetUp() override { ThrottleOnKernelRingTeardown(); }
+  void SetUp() override {
+    ThrottleOnKernelRingTeardown();
+    ::absl::SetFlag(&FLAGS_aio_backend, "io_uring");
+  }
 
   absl::FlagSaver flag_saver_;
 };
@@ -200,7 +214,9 @@ TEST_P(AioTest, BasicPipeReadWrite) {
     }
   }
 
-  EXPECT_EQ(count, 1);
+  // The epoll backend processes exactly one event per Poll() call.  This aligns
+  // with the behavior of epoll_linux.cc.
+  EXPECT_EQ(count, IsIoUring() ? 1 : 2);
   EXPECT_STREQ(read_buf, "Hello io_uring!");
 }
 
@@ -786,6 +802,55 @@ TEST_P(AioTest, MixedRegistrationAndInvalidHookDeathTest) {
                "SetEvents is only for fds registered using OnEvents");
 
   aio.DeleteFd(pipe.write_fd());
+
+  if (!IsIoUring()) {
+    // Under epoll, verify that mixing AsyncRead/AsyncWrite and
+    // OnReadable/OnWritable/OnEvents fails.
+    AsyncRequest req;
+    char buf[10];
+
+    // AsyncRead, then OnReadable fails.
+    aio.AsyncRead(pipe.read_fd(), buf, &req);
+    EXPECT_DEATH(aio.OnReadable(pipe.read_fd(), []() {}),
+                 "Cannot mix OnReadable and AsyncRead");
+    aio.Cancel(&req);
+    while (aio.Poll(false)) {
+    }
+
+    // OnReadable, then AsyncRead fails.
+    aio.OnReadable(pipe.read_fd(), []() {});
+    EXPECT_DEATH(aio.AsyncRead(pipe.read_fd(), buf, &req),
+                 "Cannot mix OnReadable and AsyncRead");
+    aio.DeleteFd(pipe.read_fd());
+
+    // AsyncWrite, then OnWritable fails.
+    aio.AsyncWrite(pipe.write_fd(), buf, &req);
+    EXPECT_DEATH(aio.OnWritable(pipe.write_fd(), []() {}),
+                 "Cannot mix OnWritable and AsyncWrite");
+    aio.Cancel(&req);
+    while (aio.Poll(false)) {
+    }
+
+    // OnWritable, then AsyncWrite fails.
+    aio.OnWritable(pipe.write_fd(), []() {});
+    EXPECT_DEATH(aio.AsyncWrite(pipe.write_fd(), buf, &req),
+                 "Cannot mix OnWritable and AsyncWrite");
+    aio.DeleteFd(pipe.write_fd());
+
+    // AsyncRead, then OnEvents fails.
+    aio.AsyncRead(pipe.read_fd(), buf, &req);
+    EXPECT_DEATH(aio.OnEvents(pipe.read_fd(), [](uint32_t) {}),
+                 "Cannot mix OnEvents and AsyncRead/AsyncWrite");
+    aio.Cancel(&req);
+    while (aio.Poll(false)) {
+    }
+
+    // OnEvents, then AsyncRead fails.
+    aio.OnEvents(pipe.read_fd(), [](uint32_t) {});
+    EXPECT_DEATH(aio.AsyncRead(pipe.read_fd(), buf, &req),
+                 "Cannot mix OnEvents and AsyncRead/AsyncWrite");
+    aio.DeleteFd(pipe.read_fd());
+  }
 }
 
 // Tests that a failed I/O operation (like reading from an invalid fd)
@@ -823,8 +888,191 @@ TEST_P(AioTest, FailedIoErrorTest) {
   EXPECT_GT(count, 0);
   ASSERT_TRUE(fired_status.has_value());
   EXPECT_FALSE(aos::IsOk(*fired_status));
-  EXPECT_EQ(fired_status->error().message(), "io_uring error");
+  // Each backend names itself in its operational-failure message.
+  EXPECT_EQ(fired_status->error().message(), GetParam() + " error");
   EXPECT_EQ(result_code, EBADF);
+}
+
+// Tests that async registrations recycle: every request here fully completes
+// before the next distinct fd is used, so completed requests must return
+// their slot to the pool.  Uses more simultaneously-open fds than the epoll
+// backend's default 16-slot pool (one of which the wakeup eventfd occupies),
+// which used to abort with "Async registration pool exhausted" on the 16th
+// distinct fd.
+TEST_P(AioTest, AsyncRegistrationPoolRecycleTest) {
+  Aio aio;
+
+  std::array<Pipe, 20> pipes;
+  char buf[8];
+  for (auto &pipe : pipes) {
+    AsyncRequest req;
+    bool fired = false;
+    req.callback = [](Completion completion, void *ctx) {
+      EXPECT_TRUE(aos::IsOk(completion.status));
+      *static_cast<bool *>(ctx) = true;
+    };
+    req.context = &fired;
+
+    aio.AsyncRead(pipe.read_fd(), buf, &req);
+    pipe.Write("x");
+    while (!fired && aio.Poll(true)) {
+    }
+    EXPECT_TRUE(fired);
+  }
+}
+
+// Tests that a callback which deletes its own fd can keep using its captures
+// afterwards.  Deleting the fd releases the registration that owns the
+// std::function currently executing; destroying that function mid-call frees
+// the lambda's captures out from under the running code (a heap-use-after-free
+// under ASAN).  The capture is sized past any small-buffer optimization so it
+// actually lives on the heap.
+TEST_P(AioTest, DeleteOwnFdFromCallbackKeepsCapturesTest) {
+  Aio aio;
+  Pipe pipe;
+
+  bool fired = false;
+  const std::string marker(128, 'm');
+  aio.OnReadable(pipe.read_fd(), [&aio, &pipe, &fired, marker]() {
+    aio.DeleteFd(pipe.read_fd());
+    // The registration owning this lambda was just released; the captures
+    // must stay intact until dispatch is over.
+    EXPECT_EQ(marker, std::string(128, 'm'));
+    fired = true;
+  });
+  pipe.Write("x");
+
+  while (!fired && aio.Poll(true)) {
+  }
+  EXPECT_TRUE(fired);
+
+  // The retired registration is reclaimed on the next Poll(), once no
+  // dispatch is in flight.
+  aio.Poll(false);
+}
+
+// Tests AsyncRead()/AsyncWrite() on a regular file.  epoll_ctl(ADD) rejects
+// regular files with EPERM -- they have no wait queue and are simply always
+// ready -- which used to abort the epoll backend on a perfectly valid
+// mkstemp() descriptor.
+TEST_P(AioTest, RegularFileAsyncReadWriteTest) {
+  Aio aio;
+
+  const char *tmpdir = getenv("TEST_TMPDIR");
+  std::string path =
+      std::string(tmpdir != nullptr ? tmpdir : "/tmp") + "/aio_regular_XXXXXX";
+  int fd = mkstemp(path.data());
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(unlink(path.c_str()), 0);
+
+  const char data[] = "regular file data";
+
+  AsyncRequest write_req;
+  std::optional<int32_t> write_result;
+  write_req.callback = [](Completion completion, void *ctx) {
+    EXPECT_TRUE(aos::IsOk(completion.status));
+    static_cast<std::optional<int32_t> *>(ctx)->emplace(completion.result);
+  };
+  write_req.context = &write_result;
+  aio.AsyncWrite(fd, std::span<const char>(data, sizeof(data) - 1), &write_req);
+  while (!write_req.done && aio.Poll(true)) {
+  }
+  ASSERT_TRUE(write_result.has_value());
+  EXPECT_EQ(*write_result, static_cast<int32_t>(sizeof(data) - 1));
+
+  ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+
+  char buf[64] = {};
+  AsyncRequest read_req;
+  std::optional<int32_t> read_result;
+  read_req.callback = [](Completion completion, void *ctx) {
+    EXPECT_TRUE(aos::IsOk(completion.status));
+    static_cast<std::optional<int32_t> *>(ctx)->emplace(completion.result);
+  };
+  read_req.context = &read_result;
+  aio.AsyncRead(fd, buf, &read_req);
+  while (!read_req.done && aio.Poll(true)) {
+  }
+  ASSERT_TRUE(read_result.has_value());
+  EXPECT_EQ(*read_result, static_cast<int32_t>(sizeof(data) - 1));
+  EXPECT_STREQ(buf, "regular file data");
+
+  ABSL_PCHECK(close(fd) == 0);
+}
+
+// Tests that a pending AsyncRead() completes with EOF when the write end of
+// an empty pipe closes.  That hangup surfaces as EPOLLHUP with no EPOLLIN;
+// the epoll backend used to route it only to the (absent) error callback, so
+// the request stayed pending forever while the level-triggered EPOLLHUP spun
+// the loop with no progress.
+TEST_P(AioTest, AsyncReadEofOnHangupTest) {
+  Aio aio;
+  Pipe pipe;
+
+  AsyncRequest req;
+  std::optional<aos::Status> fired_status;
+  int32_t result = -1;
+  req.callback = [](Completion completion, void *ctx) {
+    auto *self_ctx =
+        static_cast<std::pair<std::optional<aos::Status> *, int32_t *> *>(ctx);
+    self_ctx->first->emplace(std::move(completion.status));
+    *self_ctx->second = completion.result;
+  };
+  std::pair<std::optional<aos::Status> *, int32_t *> ctx(&fired_status,
+                                                         &result);
+  req.context = &ctx;
+
+  char buf[8];
+  aio.AsyncRead(pipe.read_fd(), buf, &req);
+  // Make sure the read is armed and pending before hanging up.
+  aio.Poll(false);
+  pipe.close_write_fd();
+
+  // Bounded non-blocking polling: on regression this hangs (or spins), and a
+  // deadline turns that into a loud failure instead of a test timeout.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!req.done && std::chrono::steady_clock::now() < deadline) {
+    aio.Poll(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(req.done) << "AsyncRead never completed after writer hangup";
+  ASSERT_TRUE(fired_status.has_value());
+  EXPECT_TRUE(aos::IsOk(*fired_status));
+  EXPECT_EQ(result, 0);
+}
+
+// Tests that a timer destroyed by its own callback stops delivery cleanly
+// instead of touching the freed timer state.  Both backends dispatch the
+// user callback as the last thing they do with the state, specifically so
+// that this is safe; this holds them to it.
+TEST_P(AioTest, TimerDestroyedByOwnCallbackTest) {
+  Aio aio;
+
+  struct Ctx {
+    std::unique_ptr<Aio::Timer> timer;
+    size_t count = 0;
+  } ctx;
+  ctx.timer = std::make_unique<Aio::Timer>(&aio);
+
+  const auto start = aos::monotonic_clock::now();
+  ctx.timer->Schedule(
+      start + std::chrono::milliseconds(10),
+      [](Completion completion, void *raw) {
+        EXPECT_TRUE(aos::IsOk(completion.status));
+        auto *ctx = static_cast<Ctx *>(raw);
+        ++ctx->count;
+        ctx->timer.reset();
+      },
+      &ctx);
+
+  // Let the deadline pass well before servicing it, so the callback runs
+  // out of a completion the loop had already been sitting on.
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  aio.Poll(true);
+  while (aio.Poll(false)) {
+  }
+  EXPECT_EQ(ctx.count, 1u);
 }
 
 // Two timers with the same deadline both fire, so both completions are
@@ -1963,6 +2211,9 @@ TEST_P(AioTest, ReuseRequestPendingAtDestruction) {
 // timer's poll is the same silent never-fires-again failure
 // TimerPollsSurviveCqOverflow pins on the overflow-termination path.
 TEST_P(AioTest, DowngradeReArmsActiveTimers) {
+  if (!IsIoUring()) {
+    GTEST_SKIP() << "The SINGLE_ISSUER downgrade is io_uring-specific.";
+  }
   ScopedDeathTestWatchdog watchdog;
 
   auto aio = std::make_unique<Aio>();
@@ -2520,9 +2771,12 @@ TEST_P(AioTest, DuplicateEventOnCancel) {
 
 // Regression test for IoUringImpl::CheckSubmitterThread(): destroying an Aio
 // from a different thread than the one that first called Run()/Poll() on it
-// must die loudly.  IORING_SETUP_SINGLE_ISSUER is what makes this a real
-// constraint.
+// must die loudly.  io_uring-specific -- IORING_SETUP_SINGLE_ISSUER is what
+// makes this a real constraint; the epoll backend has no such thing.
 TEST_P(AioTest, DestroyFromWrongThreadDeathTest) {
+  if (!IsIoUring()) {
+    GTEST_SKIP() << "Same-thread destructor enforcement is io_uring-specific.";
+  }
   EXPECT_DEATH(
       {
         // Construct and first-Poll() on the same thread (this one) -- no
@@ -2561,6 +2815,9 @@ TEST_P(AioTest, ConstructOnOneThreadRunOnAnotherTest) {
 // from.  The downgrade must refuse loudly rather than drop the request
 // silently (it would otherwise just never complete).
 TEST_P(AioTest, DowngradeWithRawRequestInFlightDeathTest) {
+  if (!IsIoUring()) {
+    GTEST_SKIP() << "The SINGLE_ISSUER downgrade is io_uring-specific.";
+  }
   ScopedDeathTestWatchdog watchdog;
   EXPECT_DEATH(
       {
@@ -2610,6 +2867,9 @@ TEST_P(AioTest, DeleteFdFromDifferentThreadTest) {
 // wakeups.  The scoped watchdog turns a wedge into a clean failure if
 // this regresses.
 TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
+  if (!IsIoUring()) {
+    GTEST_SKIP() << "SINGLE_ISSUER downgrade is io_uring-specific.";
+  }
   ScopedDeathTestWatchdog watchdog;
 
   auto aio = std::make_unique<Aio>();
@@ -2694,6 +2954,9 @@ TEST_P(AioTest, RescheduleArmedTimerWhileRealtimeTest) {
 // sometimes-frees function under the malloc hook would be a data-dependent
 // crash -- so it CheckNotRealtime()s up front, pending state or not.
 TEST_P(AioTest, DeleteTimerWhileRealtimeDeathTest) {
+  if (!IsIoUring()) {
+    GTEST_SKIP() << "CheckNotRealtime() enforcement is io_uring-specific.";
+  }
   Aio aio;
 
   EXPECT_DEATH(
@@ -2716,7 +2979,7 @@ TEST_P(AioTest, DeleteTimerWhileRealtimeDeathTest) {
 // and recycles it; a new timer then reuses the freelist, including its
 // already-created timerfd.  ASAN checks the lifetime story end to end.
 TEST_P(AioTest, DeleteArmedTimerOrphansAndRecycles) {
-  if (!GetParam()) {
+  if (!IsIoUring()) {
     GTEST_SKIP() << "Orphaned destruction is io_uring-specific.";
   }
   Aio aio;
@@ -2765,6 +3028,24 @@ TEST_P(AioTest, AsyncCancelWhileRealtimeDoesNotDie) {
   // Reaching here without dying is the assertion.
 }
 
-INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest, ::testing::Values(true));
+// An unrecognized --aio_backend is fatal rather than a silent fallback.  The
+// whole point of naming a backend is that a deployment states which one it
+// gets -- quietly picking one after a typo would defeat that, and would do it
+// on exactly the machines least able to notice.  Linux-only: it is the only
+// platform with more than one backend to choose between, so it is the only
+// one that parses the name at all.
+#ifdef __linux__
+TEST(AioBackendFlagTest, UnknownBackendDies) {
+  absl::FlagSaver flag_saver;
+  ::absl::SetFlag(&FLAGS_aio_backend, "nonsense");
+  EXPECT_DEATH({ Aio aio; }, "Unknown --aio_backend");
+}
+#endif
+
+INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest,
+                         ::testing::Values("io_uring", "epoll"),
+                         [](const ::testing::TestParamInfo<std::string> &info) {
+                           return info.param;
+                         });
 
 }  // namespace aos::testing

@@ -68,7 +68,7 @@ struct AsyncRequest {
 
   // Internal state managed entirely by the Aio implementation.  Callers must
   // not read or modify this field.
-  alignas(8) uint8_t internal_state[32] = {0};
+  alignas(8) uint8_t internal_state[48] = {0};
 };
 
 // Aio is a cross-platform asynchronous I/O multiplexer and event loop engine.
@@ -119,6 +119,9 @@ struct AsyncRequest {
 //    lockless_queue.cc's RobustOwnershipTracker) -- which SINGLE_ISSUER's
 //    binding would forbid. See
 //    documentation/adr/0001-aio-io-uring-single-issuer.md.
+//
+//    The epoll backend deliberately enforces none of this, so
+//    --aio_backend=epoll remains an unconstrained fallback.
 // 2. Request Lifetime: The caller-supplied AsyncRequest object must remain
 //    valid and allocated in memory from the time it is submitted until its
 //    corresponding CompletionCallback is executed -- including for
@@ -369,6 +372,7 @@ class Aio {
  private:
   struct Impl;
   friend class IoUringImpl;
+  friend class EpollImpl;
 
   std::unique_ptr<Impl> impl_;
 };

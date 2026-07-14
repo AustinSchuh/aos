@@ -50,6 +50,20 @@ cc_library(
         "aio_linux.cc",
     ],
     hdrs = ["aio.h"],
+    # Which backend --aio_backend defaults to is a property of the platform,
+    # not of the machine that happens to run the build, so it is compiled in
+    # rather than probed: io_uring has no runtime fallback (a loop asked for
+    # it on a kernel that lacks it fails loudly), so the answer has to be
+    # settled by whoever declared the deployment target.  See
+    # //tools/platforms/io_uring.
+    local_defines = select({
+        "//tools/platforms/io_uring:has_support": [
+            "AOS_AIO_DEFAULT_BACKEND=\\\"io_uring\\\"",
+        ],
+        "//tools/platforms/io_uring:lacks_support": [
+            "AOS_AIO_DEFAULT_BACKEND=\\\"epoll\\\"",
+        ],
+    }),
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
