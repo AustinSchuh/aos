@@ -167,7 +167,17 @@ class Aio {
   Aio(Aio &&) = delete;
   Aio &operator=(Aio &&) = delete;
 
-  // Drives the loop continuously until Quit() is called.
+  // Drives the loop until Quit() is called, then drains: Quit() switches
+  // Run() to non-blocking Poll()s, so work already queued when it landed
+  // still runs before Run() returns.  EPoll::Run() has behaved this way
+  // since 2019, and consumers rely on it.
+  //
+  // The drain ends when a Poll() finds nothing, so a callback that calls
+  // Quit() must also retire the readiness that invoked it: read the byte,
+  // DisableWritable() (writability is never consumed by writing -- an
+  // idle fd is always writable), or DeleteFd().  Readiness nothing retires
+  // is level-triggered, so it is redelivered on every drain pass and Run()
+  // never returns.  EPoll has the same requirement.
   void Run();
 
   // Polls for and processes active completions.  Returns true if anything was
@@ -210,6 +220,12 @@ class Aio {
   // expect repeated Quit()s to keep waking it.  (EPoll::Quit() was
   // stricter still: outside Run() it did nothing at all.)
   void Quit();
+
+  // Whether the loop should keep being driven: true from construction, false
+  // once Quit() is called or Run() returns, true again on the next Run().  A
+  // Quit() before Run() is remembered; that Run() returns without entering
+  // the loop.
+  bool should_run() const;
 
   // Schedules an asynchronous read on a file descriptor.
   //

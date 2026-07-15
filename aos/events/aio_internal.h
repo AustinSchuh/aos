@@ -269,6 +269,7 @@ struct Aio::Impl {
   }
 
   virtual void Run() = 0;
+  virtual bool should_run() const = 0;
   virtual bool Poll(bool block) = 0;
   virtual void Quit() = 0;
 
