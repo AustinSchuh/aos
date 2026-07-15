@@ -2682,8 +2682,8 @@ TEST_P(AioTest, QuitInBeforeWait) {
 // It does NOT reliably reach the narrowest interleaving, where Quit() lands
 // between Run() reading quit_requested_ and Run() storing to run_ -- that
 // window is a couple of instructions wide and did not reproduce here even with
-// a barrier and 2000 attempts.  Run()'s loop consults quit_requested_ as well
-// as run_ precisely so that interleaving stays harmless: the store would
+// a barrier and 2000 attempts.  Run()'s loop consults should_run() rather than
+// run_ alone precisely so that interleaving stays harmless: the store would
 // clobber Quit()'s `run_ = false`, leaving quit_requested_ as the only record
 // that a shutdown was asked for.  A regression there would hang rather than
 // fail an assertion.
@@ -2715,6 +2715,7 @@ TEST_P(AioTest, QuitRacingWithRunStartup) {
     go.store(true, std::memory_order_release);
     aio.Run();
     quitter.join();
+    EXPECT_FALSE(aio.should_run());
   }
 }
 
@@ -2859,6 +2860,81 @@ TEST_P(AioTest, ForkOperationBeforePollDeathTest) {
       ::testing::ExitedWithCode(42), "");
 }
 #endif  // !_WIN32
+
+TEST_P(AioTest, ShouldRunTest) {
+  Aio aio;
+  // should_run() starts true (matching the original EPoll's run_{true}), before
+  // any Run() or Quit() has happened.
+  EXPECT_TRUE(aio.should_run());
+
+  // Set a timer to check should_run() while running and then quit.
+  Aio::Timer timer(&aio);
+  struct Context {
+    Aio *aio;
+    bool checked_running;
+  };
+  Context context{&aio, false};
+
+  timer.Schedule(
+      aos::monotonic_clock::now(),
+      [](Completion, void *ctx) {
+        auto *c = static_cast<Context *>(ctx);
+        EXPECT_TRUE(c->aio->should_run());
+        c->checked_running = true;
+        c->aio->Quit();
+        EXPECT_FALSE(c->aio->should_run());
+      },
+      &context);
+
+  aio.Run();
+  EXPECT_FALSE(aio.should_run());
+  EXPECT_TRUE(context.checked_running);
+}
+
+// Quit() before Run() is remembered: Run() returns without entering the loop
+// instead of blocking forever, and consumes the request rather than leaving it
+// to strand the *next* Run().
+//
+// This is the exact shape that broke EPoll when it was converted to wrap Aio:
+// it kept a run_ flag of its own, set it in Run(), never cleared it on exit,
+// and the impl's early return swallowed the quit -- so should_run() answered
+// true forever afterward.  Nothing pinned the behavior at this level, which is
+// why that went unnoticed; it is pinned here now.
+TEST_P(AioTest, QuitBeforeRunTest) {
+  Aio aio;
+  EXPECT_TRUE(aio.should_run());
+
+  aio.Quit();
+  EXPECT_FALSE(aio.should_run());
+
+  // Returns rather than blocking: the loop body never executes.
+  aio.Run();
+  EXPECT_FALSE(aio.should_run());
+
+  // ...and the request was consumed, not left pending.  A stranded quit shows
+  // up here, as a second Run() that returns immediately without servicing
+  // anything.
+  Aio::Timer timer(&aio);
+  bool fired = false;
+  struct Context {
+    Aio *aio;
+    bool *fired;
+  } context{&aio, &fired};
+  timer.Schedule(
+      aos::monotonic_clock::now(),
+      [](Completion, void *ctx) {
+        auto *c = static_cast<Context *>(ctx);
+        *c->fired = true;
+        c->aio->Quit();
+      },
+      &context);
+
+  aio.Run();
+  EXPECT_TRUE(fired)
+      << "The second Run() returned without servicing the loop; the earlier "
+         "Quit() was never consumed.";
+  EXPECT_FALSE(aio.should_run());
+}
 
 // Regression test for a kernel quirk in IORING_SETUP_DEFER_TASKRUN rings
 // (see global_parent_fork_count's comment in aio_linux.cc): a repeating

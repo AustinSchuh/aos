@@ -204,6 +204,21 @@ class Aio {
   // stricter still: outside Run() it did nothing at all.)
   void Quit();
 
+  // Whether the loop should keep being driven: true from construction until
+  // either Quit() is called or Run() returns.
+  //
+  // Deliberately true *before* the first Run(), matching the EPoll this
+  // replaced (whose run_ started true).  Consumers poll this to decide
+  // whether to keep driving the loop, so a freshly-built one answering "no"
+  // would stop them before they ever started.  It is therefore not the same
+  // question as "is Run() on the stack right now".
+  //
+  // Quit() makes it false immediately, including a Quit() that lands before
+  // Run() -- that request is remembered, so the Run() it precedes returns
+  // without entering the loop rather than blocking forever.  Run() leaves it
+  // false on return, and a later Run() sets it true again.
+  bool should_run() const;
+
   // Schedules an asynchronous read on a file descriptor.
   void AsyncRead(FileDescriptor fd, std::span<char> buffer,
                  AsyncRequest *request);

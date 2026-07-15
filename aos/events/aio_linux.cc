@@ -596,6 +596,7 @@ class IoUringImpl : public Aio::Impl {
   void DestroyTimerState(std::unique_ptr<Aio::TimerState> state) override;
 
   void Run() override;
+  bool should_run() const override;
 
   bool Poll(bool block) override;
   void Quit() override;
@@ -877,7 +878,10 @@ class IoUringImpl : public Aio::Impl {
   // them silently.
   int raw_requests_in_flight_ = 0;
 
-  std::atomic<bool> run{false};
+  // Starts true so should_run() reports "running" before the first Run(), which
+  // is how the original EPoll (run_{true}) behaved.  Run() clears it on exit
+  // and Quit() clears it on shutdown.
+  std::atomic<bool> run{true};
   std::atomic<bool> quit_requested{false};
 
   std::vector<std::function<void()>> before_wait_functions;
@@ -1553,6 +1557,8 @@ void IoUringImpl::Run() {
   run = false;
   quit_requested = false;
 }
+
+bool IoUringImpl::should_run() const { return run && !quit_requested; }
 
 struct io_uring_sqe *IoUringImpl::GetSqeForRingReconstruction() {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -2808,6 +2814,7 @@ class EpollImpl : public Aio::Impl {
   std::unique_ptr<Aio::TimerState> MakeTimerState() override;
 
   void Run() override;
+  bool should_run() const override;
 
   bool Poll(bool block) override;
   void Quit() override;
@@ -2908,9 +2915,9 @@ class EpollImpl : public Aio::Impl {
   bool in_before_wait_ = false;
 
   // Quit() writes these from outside the polling thread, which reads them in
-  // the run_ check.  As plain bools that is a data race, and the shutdown
-  // request can be missed outright: Quit()'s Wakeup() breaks Poll() out of its
-  // wait, the check reads a stale value, and the loop goes right back to sleep.
+  // should_run().  As plain bools that is a data race, and the shutdown request
+  // can be missed outright: Quit()'s Wakeup() breaks Poll() out of its wait,
+  // should_run() reads a stale value, and the loop goes right back to sleep.
   //
   // Quit() also has to work from a signal handler -- ShmEventLoop's SIGINT,
   // SIGHUP and SIGTERM handler calls Exit() on every registered loop, which
@@ -2920,7 +2927,10 @@ class EpollImpl : public Aio::Impl {
   static_assert(std::atomic<bool>::is_always_lock_free,
                 "Quit() runs in a signal handler, so these have to be usable "
                 "from one");
-  std::atomic<bool> run_ = false;
+  // Starts true so should_run() reports "running" before the first Run(), which
+  // is how the original EPoll (run_{true}) behaved.  Run() clears it on exit
+  // and Quit() clears it on shutdown.
+  std::atomic<bool> run_ = true;
   std::atomic<bool> quit_requested_ = false;
 
   size_t last_fork_count_ = 0;
@@ -3149,6 +3159,8 @@ void EpollImpl::Run() {
   run_ = false;
   quit_requested_ = false;
 }
+
+bool EpollImpl::should_run() const { return run_ && !quit_requested_; }
 
 void EpollImpl::HandleFork() {
   // Shared rule; see Aio::Impl::CheckNoRawRequestsInFlightOnFork().  Here
