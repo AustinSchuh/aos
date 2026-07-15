@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -810,12 +811,16 @@ TEST_P(AioTest, MixedRegistrationAndInvalidHookDeathTest) {
     char buf[10];
 
     // AsyncRead, then OnReadable fails.
-    aio.AsyncRead(pipe.read_fd(), buf, &req);
-    EXPECT_DEATH(aio.OnReadable(pipe.read_fd(), []() {}),
-                 "Cannot mix OnReadable and AsyncRead");
-    aio.Cancel(&req);
-    while (aio.Poll(false)) {
-    }
+    // The raw request has to be submitted inside the death test: forking
+    // with one in flight is itself fatal now (ForkWithPendingAsyncWriteDies),
+    // and EXPECT_DEATH forks.  The child does both halves and dies on the
+    // second, which is what this is checking either way.
+    EXPECT_DEATH(
+        {
+          aio.AsyncRead(pipe.read_fd(), buf, &req);
+          aio.OnReadable(pipe.read_fd(), []() {});
+        },
+        "Cannot mix OnReadable and AsyncRead");
 
     // OnReadable, then AsyncRead fails.
     aio.OnReadable(pipe.read_fd(), []() {});
@@ -823,13 +828,13 @@ TEST_P(AioTest, MixedRegistrationAndInvalidHookDeathTest) {
                  "Cannot mix OnReadable and AsyncRead");
     aio.DeleteFd(pipe.read_fd());
 
-    // AsyncWrite, then OnWritable fails.
-    aio.AsyncWrite(pipe.write_fd(), buf, &req);
-    EXPECT_DEATH(aio.OnWritable(pipe.write_fd(), []() {}),
-                 "Cannot mix OnWritable and AsyncWrite");
-    aio.Cancel(&req);
-    while (aio.Poll(false)) {
-    }
+    // AsyncWrite, then OnWritable fails.  Submitted inside, as above.
+    EXPECT_DEATH(
+        {
+          aio.AsyncWrite(pipe.write_fd(), buf, &req);
+          aio.OnWritable(pipe.write_fd(), []() {});
+        },
+        "Cannot mix OnWritable and AsyncWrite");
 
     // OnWritable, then AsyncWrite fails.
     aio.OnWritable(pipe.write_fd(), []() {});
@@ -837,13 +842,13 @@ TEST_P(AioTest, MixedRegistrationAndInvalidHookDeathTest) {
                  "Cannot mix OnWritable and AsyncWrite");
     aio.DeleteFd(pipe.write_fd());
 
-    // AsyncRead, then OnEvents fails.
-    aio.AsyncRead(pipe.read_fd(), buf, &req);
-    EXPECT_DEATH(aio.OnEvents(pipe.read_fd(), [](uint32_t) {}),
-                 "Cannot mix OnEvents and AsyncRead/AsyncWrite");
-    aio.Cancel(&req);
-    while (aio.Poll(false)) {
-    }
+    // AsyncRead, then OnEvents fails.  Submitted inside, as above.
+    EXPECT_DEATH(
+        {
+          aio.AsyncRead(pipe.read_fd(), buf, &req);
+          aio.OnEvents(pipe.read_fd(), [](uint32_t) {});
+        },
+        "Cannot mix OnEvents and AsyncRead/AsyncWrite");
 
     // OnEvents, then AsyncRead fails.
     aio.OnEvents(pipe.read_fd(), [](uint32_t) {});
@@ -2769,6 +2774,140 @@ TEST_P(AioTest, DuplicateEventOnCancel) {
   aio.DeleteFd(pipe.write_fd());
 }
 
+TEST_P(AioTest, ForkDeathTest) {
+  // Test that an Aio instance constructed in the parent process remains
+  // fully functional inside a forked child process by successfully detecting
+  // the fork and recreating the io_uring ring.  We register both a standard
+  // file descriptor event and a SignalFd to exercise all re-registration loops
+  // in HandleFork.
+  //
+  // On Windows there is no fork: the death-test child re-executes the binary
+  // and rebuilds all of this state from scratch.  That exercises less (no
+  // inherited state to recover), but it is exactly what every death test in the
+  // tree relies on, so run it there too to pin down that death tests work with
+  // a live event loop.
+  Aio aio;
+  Pipe pipe;
+  aos::ipc_lib::ThreadSignalReceiver sfd;
+
+  int signal_count = 0;
+  int fd_count = 0;
+
+  aio.RegisterThreadSignalReceiver(&sfd, [&]() { ++signal_count; });
+
+  aio.OnEvents(pipe.write_fd(), [&](uint32_t events) {
+    EXPECT_TRUE(events & EPOLLOUT);
+    ++fd_count;
+  });
+
+  aio.SetEvents(pipe.write_fd(), EPOLLOUT);
+
+  EXPECT_EXIT(
+      {
+        pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+        while ((signal_count == 0 || fd_count == 0) && aio.Poll(true)) {
+        }
+        if (signal_count == 1 && fd_count == 1) {
+          exit(42);
+        }
+        exit(1);
+      },
+      ::testing::ExitedWithCode(42), "");
+
+  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.DeleteFd(pipe.write_fd());
+}
+
+// Regression test for detecting a fork too late.  Fork detection used to run
+// only inside Poll(): an operation issued by a forked child *before* its first
+// Poll() went into the stale inherited ring/epoll and was silently discarded
+// when Poll() finally rebuilt the backend, so the request never completed and
+// Poll() blocked forever.
+//
+// This one really is about inherited state, which only exists where death tests
+// fork -- on Windows the death-test child starts from a fresh process, so there
+// is nothing stale to detect (and no alarm() to watchdog the hang with).
+#ifndef _WIN32
+//
+// The child here issues an AsyncRead and makes data available -- all before the
+// first Poll() -- and the read must complete.  If the backend isn't rebuilt
+// eagerly the read is lost and Poll() hangs; the alarm() then kills us so the
+// ExitedWithCode(42) check fails loudly instead of wedging the whole suite.
+TEST_P(AioTest, ForkOperationBeforePollDeathTest) {
+  Aio aio;
+  Pipe pipe;
+
+  EXPECT_EXIT(
+      {
+        alarm(30);
+
+        AsyncRequest read_req;
+        read_req.callback = [](Completion completion, void *) {
+          EXPECT_TRUE(aos::IsOk(completion.status));
+        };
+
+        char read_buf[8] = {0};
+        aio.AsyncRead(pipe.read_fd(), read_buf, &read_req);
+
+        const char msg = 'x';
+        PCHECK(write(pipe.write_fd(), &msg, 1) == 1);
+
+        while (!read_req.done && aio.Poll(true)) {
+        }
+        exit(read_req.done ? 42 : 1);
+      },
+      ::testing::ExitedWithCode(42), "");
+}
+#endif  // !_WIN32
+
+// Regression test for a kernel quirk in IORING_SETUP_DEFER_TASKRUN rings
+// (see global_parent_fork_count's comment in aio_linux.cc): a repeating
+// timer outstanding in the parent becomes uncancelable after any fork() the
+// parent was party to.  The kernel's cancel/remove lookup returns -ENOENT
+// for it, even though the op is demonstrably still alive and firing.  This
+// happens even when the child never touches this Aio, or this process, at
+// all -- a plain fork()+exec() (starterd's normal child-spawning pattern)
+// is enough.  CheckForParentFork() is the fix: a single
+// io_uring_get_events() resync, lazily triggered on the next entry point
+// touched after a fork, keeps the parent's own still-outstanding ops
+// cancelable.
+TEST_P(AioTest, ForkChildNeverTouchesAioTest) {
+  // Bounds worst-case runtime if this ever regresses: the reap loop's own
+  // kMaxReapAttempts bound would otherwise take on the order of a minute to
+  // trip (10000 iterations at this timer's 10ms period) before crashing
+  // with an actionable message -- this just gets there faster.
+  ScopedDeathTestWatchdog watchdog;
+
+  Aio aio;
+
+  int fire_count = 0;
+  RepeatingTimer timer(&aio, [&fire_count](Completion completion) {
+    if (aos::IsOk(completion.status)) {
+      ++fire_count;
+    }
+  });
+  timer.Start(aos::monotonic_clock::now() + std::chrono::milliseconds(10),
+              std::chrono::milliseconds(10));
+
+  while (fire_count < 3 && aio.Poll(true)) {
+  }
+  ASSERT_GE(fire_count, 3);
+
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    // Deliberately never touches `aio` (or anything io_uring-related) --
+    // just enough elapsed time for a few more periods to have passed, to
+    // match the shape that reproduced the bug.
+    usleep(40000);
+    _exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(pid, &status, 0), pid);
+
+  // Canceling this (via ~Timer() below) must not hang.
+}
+
 // Regression test for IoUringImpl::CheckSubmitterThread(): destroying an Aio
 // from a different thread than the one that first called Run()/Poll() on it
 // must die loudly.  io_uring-specific -- IORING_SETUP_SINGLE_ISSUER is what
@@ -2895,6 +3034,63 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
   }
   EXPECT_EQ(count, 1);
   aio->UnregisterThreadSignalReceiver(&sfd);
+}
+
+// Regression test: HandleFork() re-arms every active timer in a single pass.
+// With a shallow ring (--aio_queue_depth below the number of live timers) that
+// pass queues more submission entries than the ring is deep; without draining
+// the queue mid-pass, io_uring_get_sqe() returns null and the child aborts with
+// "Out of SQEs".  Schedule more timers than the depth, fork, and require the
+// child to rebuild and fire them all.
+//
+TEST_P(AioTest, ForkWithManyTimersDeathTest) {
+  absl::FlagSaver flag_saver;
+
+  // kNumTimers plus the wakeup read exceeds the kQueueDepth-entry submission
+  // queue, so HandleFork()'s single reconstruction pass has to drain as it
+  // fills.
+  constexpr int kQueueDepth = 4;
+  constexpr int kNumTimers = 6;
+  static_assert(kNumTimers + 1 > kQueueDepth, "must overflow the submit queue");
+
+  absl::SetFlag(&FLAGS_aio_queue_depth, kQueueDepth);
+
+  Aio aio;
+  std::vector<std::unique_ptr<Aio::Timer>> timers;
+  for (int i = 0; i < kNumTimers; ++i) {
+    timers.push_back(std::make_unique<Aio::Timer>(&aio));
+    // Far-future so every timer is still pending at the fork, giving
+    // HandleFork() all kNumTimers to re-arm.  Poll() flushes each submission so
+    // the parent's own scheduling never overflows the queue -- only the
+    // single-pass reconstruction does.
+    timers.back()->Schedule(
+        aos::monotonic_clock::now() + std::chrono::hours(1),
+        [](Completion, void *) {}, nullptr);
+    aio.Poll(false);
+  }
+
+  EXPECT_EXIT(
+      {
+        ScopedDeathTestWatchdog watchdog;
+        // This Poll() rebuilds the ring and re-arms every pending request in a
+        // single pass -- more submission entries than the ring is deep.
+        // Surviving that pass, rather than aborting with "Out of SQEs", is the
+        // assertion.
+        aio.Poll(false);
+        exit(42);
+      },
+      ::testing::ExitedWithCode(42), "");
+
+  // Tear the timers down one at a time, draining between each.  Cancelling
+  // costs two completions (the cancel itself, plus the timeout's -ECANCELED)
+  // and the reap path deliberately doesn't advance the completion queue, so
+  // destroying all kNumTimers back-to-back would overflow a queue this shallow.
+  // That teardown limit is a separate concern from the reconstruction under
+  // test, so keep it out of the way rather than tuning kNumTimers around it.
+  for (auto &timer : timers) {
+    timer.reset();
+    aio.Poll(false);
+  }
 }
 
 // Regression test for rescheduling an already-armed timer from an RT
@@ -3039,6 +3235,48 @@ TEST(AioBackendFlagTest, UnknownBackendDies) {
   absl::FlagSaver flag_saver;
   ::absl::SetFlag(&FLAGS_aio_backend, "nonsense");
   EXPECT_DEATH({ Aio aio; }, "Unknown --aio_backend");
+}
+#endif
+
+// A forked child that touches an Aio which had a caller-submitted AsyncWrite
+// in flight at the fork dies, rather than continuing into a shape with no
+// correct answer: io_uring's child could never complete the write (the ring
+// it was submitted to died with the fork, and there is no registry to re-arm
+// raw requests from), while epoll's and kqueue's registrations survive, so
+// the child would re-arm and send the same bytes the parent is also still
+// sending.
+//
+// Deliberately checked where the child rebuilds, not in a pthread_atfork
+// handler: fork() itself is fine, and fork()+exec() -- which is most of what
+// forking is for around here -- must stay fine.  Only a child that goes on to
+// use the loop has a problem.
+//
+// EXPECT_DEATH's own fork() is the fork under test.  The write is aimed at a
+// pipe nobody drains, which is what keeps it outstanding.
+#ifndef _WIN32
+TEST_P(AioTest, ForkedChildWithPendingAsyncWriteDies) {
+  Aio aio;
+  Pipe pipe;
+
+  std::vector<char> filler(1 << 16, 'x');
+  while (write(pipe.write_fd(), filler.data(), filler.size()) > 0) {
+  }
+
+  AsyncRequest request;
+  request.callback = [](Completion, void *) {};
+  std::vector<char> payload(64, 'y');
+  aio.AsyncWrite(pipe.write_fd(), std::span<const char>(payload), &request);
+  aio.Poll(false);
+  ASSERT_FALSE(request.done) << "The write completed; nothing is pending.";
+
+  EXPECT_DEATH({ aio.Poll(false); }, "in flight at the fork");
+
+  // Drain the parent's own copy, which is unaffected by the fork.  No
+  // DeleteFd(): a raw AsyncWrite never creates a legacy registration on the
+  // io_uring backend, so there would be nothing to delete.
+  aio.Cancel(&request);
+  while (!request.done && aio.Poll(false)) {
+  }
 }
 #endif
 

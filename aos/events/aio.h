@@ -148,6 +148,10 @@ struct AsyncRequest {
 class Aio {
  public:
   struct TimerState;
+  // Defined in aio_internal.h.  Forward-declared here rather than kept
+  // private so aio.cc can define the parts of the backend contract that are
+  // shared across backends; the definition stays internal either way.
+  struct Impl;
 
   Aio();
   ~Aio();
@@ -370,7 +374,6 @@ class Aio {
   void ConsumeThreadSignalReceiver(ipc_lib::ThreadSignalReceiver *receiver);
 
  private:
-  struct Impl;
   friend class IoUringImpl;
   friend class EpollImpl;
 

@@ -184,6 +184,36 @@ struct Aio::TimerState {
 struct Aio::Impl {
   virtual ~Impl() = default;
 
+  // --- fork() contract -------------------------------------------------
+  //
+  // Every backend has to reconstruct its kernel-side state in a forked
+  // child: an io_uring ring, an epoll instance, and a kqueue are all
+  // invalid there.  The *mechanism* is per-backend and lives in each one's
+  // reconstruction path.  What lives here is the part they must not get
+  // subtly different from each other.
+  //
+  // Whether a caller-submitted AsyncRead/AsyncWrite is outstanding.  A
+  // backend's own internal reads do not count -- the wakeup eventfd read is
+  // submitted through the public AsyncRead() on three of the four backends,
+  // and it is reconstructed rather than lost, so counting it would refuse
+  // every fork.
+  virtual bool HasRawRequestsInFlight() const = 0;
+
+  // Dies if this loop has raw I/O in flight.  Called by each backend at the
+  // top of its reconstruction, before it has torn anything down.
+  //
+  // There is no answer that is not a bug, which is why this refuses to pick
+  // one rather than choosing a behavior: io_uring's child cannot complete
+  // the request (the ring it was submitted to is the inherited one, and
+  // there is no registry to re-arm raw requests from), while epoll's and
+  // kqueue's registrations survive the fork, so reconstruction would re-arm
+  // them and repeat a read or write the parent is also still doing.
+  //
+  // Shared rather than copied per backend so that the rule, and the message
+  // it dies with, cannot drift apart -- and so a new backend inherits both
+  // by implementing one predicate.
+  void CheckNoRawRequestsInFlightOnFork() const;
+
   virtual std::unique_ptr<Aio::TimerState> MakeTimerState() = 0;
 
   // Disposes of a timer's state on Timer destruction.  The default --

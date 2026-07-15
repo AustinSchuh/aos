@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <liburing.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -27,6 +29,7 @@
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 
+#include "aos/events/aio.h"
 #include "aos/events/aio_internal.h"
 #include "aos/ipc_lib/thread_signal.h"
 #include "aos/libc/aos_strerror.h"
@@ -61,11 +64,30 @@ ABSL_FLAG(size_t, aio_epoll_pool_size, 16,
 namespace aos {
 namespace {
 
+// Incremented by the pthread_atfork child handler.  Checked in Poll()
+// instead of getpid(): a relaxed atomic load never syscalls.
+//
+// size_t: this only detects "did a fork happen since I last checked," so
+// any width works.  size_t stays single-instruction lock-free everywhere
+// (a fixed 64-bit type would drag 32-bit ARM through libatomic locks;
+// unsigned int wouldn't grow on 64-bit targets).
+std::atomic<size_t> global_fork_count{0};
+
+// Incremented by the pthread_atfork parent handler (the process that
+// forked, not the child -- compare global_fork_count).  Kernel quirk: on
+// DEFER_TASKRUN rings a multishot op outstanding in the parent becomes
+// uncancelable after any fork() until a resync -- see CheckForParentFork()
+// and the ADR.  size_t as above.
+std::atomic<size_t> global_parent_fork_count{0};
+std::once_flag atfork_once;
+
 // The calling thread's id, cached: aos::GetThreadId() is an uncached
 // syscall(SYS_gettid), and the submitter-thread check runs on every entry
 // point -- Poll(), AsyncRead/AsyncWrite, Cancel, timer Schedule()/Cancel()
 // -- where an extra kernel round trip per call is real cost and would
-// falsify Schedule()'s documented one-syscall claim.
+// falsify Schedule()'s documented one-syscall claim.  The thread_local is
+// invalidated on fork (a child's sole thread has a new tid): the atfork
+// child handler calls ResetCachedThreadId().
 thread_local pid_t cached_tid = 0;
 
 pid_t CachedThreadId() {
@@ -73,6 +95,24 @@ pid_t CachedThreadId() {
     cached_tid = aos::GetThreadId();
   }
   return cached_tid;
+}
+
+void ResetCachedThreadId() { cached_tid = 0; }
+
+void RegisterAtFork() {
+  std::call_once(atfork_once, []() {
+    pthread_atfork(
+        nullptr,
+        []() {
+          global_parent_fork_count.fetch_add(1, std::memory_order_relaxed);
+        },
+        []() {
+          // The child's one surviving thread has a fresh tid; every cached
+          // copy is the parent's.
+          ResetCachedThreadId();
+          global_fork_count.fetch_add(1, std::memory_order_relaxed);
+        });
+  });
 }
 
 // Attempts io_uring_queue_init_params with the given flags, once -- no
@@ -132,8 +172,9 @@ void RequireMinimumKernelVersion() {
 
 // Initializes (or reinitializes) the io_uring instance at *ring on the
 // SINGLE_ISSUER tier -- the only tier this file creates directly.  Called
-// from the constructor; the one exception, DowngradeFromSingleIssuer(),
-// builds its unconstrained ring inline at that single call site.
+// from the constructor and HandleFork()'s post-fork reconstruction; the
+// one exception, DowngradeFromSingleIssuer(), builds its unconstrained
+// ring inline at that single call site.
 //
 // See documentation/adr/0001-aio-io-uring-single-issuer.md for the full
 // design rationale.  Short version: IORING_SETUP_SINGLE_ISSUER |
@@ -532,6 +573,16 @@ struct IoUringTimerState : public Aio::TimerState {
 // embedded epoll instance, watched by a single-shot POLL_ADD that is
 // re-armed on every firing (SubmitLegacyEpollPoll()).
 //
+// Fork.  Saying no to fork() isn't an option: starterd forks every
+// application it manages while its own event loop is live, and death
+// tests fork the test process.  But io_urings don't work across forks:
+// the SQ/CQ mmaps are shared with the parent, not copied, so a child
+// using the inherited ring races the parent for the same queues -- and
+// the parent needs a resync of its own after any fork (see
+// global_parent_fork_count).  Global atfork counters trigger a full
+// rebuild and re-arm on the next entry point (HandleFork(),
+// CheckForParentFork()).
+//
 // History and rejected alternatives:
 // documentation/adr/0001-aio-io-uring-single-issuer.md.
 class IoUringImpl : public Aio::Impl {
@@ -608,27 +659,35 @@ class IoUringImpl : public Aio::Impl {
   void UnlinkPendingDispatch(AsyncRequest *req);
   void CancelRequest(AsyncRequest *request);
   void SubmitWakeupRead();
+  void HandleFork();
   // Returns a submission queue entry for use inside
   // ReArmPersistentRegistrations() only, flushing the queue to the kernel
   // (an io_uring_submit() syscall) and retrying once if it is currently
   // full.  ReArmPersistentRegistrations() re-arms every persistent request
   // (wakeup read, the legacy-fd epoll poll, receivers, and every active
   // timer) in a single pass, which can queue more entries than the ring is
-  // deep -- e.g. several active timers with a shallow --aio_queue_depth.  A
-  // plain io_uring_get_sqe() would return null and abort; draining the
+  // deep -- e.g. several active timers with a shallow --aio_queue_depth.
+  // A plain io_uring_get_sqe() would return null and abort; draining the
   // queue frees the entries so reconstruction can continue.
   //
   // Deliberately NOT used by the steady-state submission paths (AsyncRead,
   // SubmitLegacyEpollPoll, ThreadSignalReceiverState::Submit): those call
   // ArmSqe() and CHECK-fail immediately on exhaustion.  Ring
-  // reconstruction already has unbounded latency (it tears down and rebuilds
-  // the whole ring; nothing about it is real-time), so paying for a syscall
-  // there is fine.  On the steady-state path, exhaustion is a
-  // real-time-affecting config error (--aio_queue_depth too small for the
-  // app's actual concurrent registrations) and should crash immediately and
-  // deterministically rather than silently absorb an unbounded-latency
-  // syscall on an RT thread.
+  // reconstruction already has unbounded latency (a fork or downgrade just
+  // happened; it tears down and rebuilds the whole ring, and nothing about
+  // that is real-time), so paying for a syscall there is fine.  On the
+  // steady-state path, exhaustion is a real-time-affecting config error
+  // (--aio_queue_depth too small for the app's actual concurrent
+  // registrations) and should crash immediately and deterministically
+  // rather than silently absorb an unbounded-latency syscall on an RT
+  // thread.
   struct io_uring_sqe *GetSqeForRingReconstruction();
+  // Rebuilds the ring if the process forked since we last looked.  Called at
+  // the top of every public entry point that touches the ring, so a forked
+  // child that submits work before its first Poll() operates on the live ring
+  // rather than the stale inherited one.  Also enforces CheckSubmitterThread()
+  // -- see there.
+  void CheckForFork();
 
   // Acquires an SQE for arming one kernel op -- every steady-state arm site
   // goes through here -- and does the queue-capacity accounting that makes
@@ -691,9 +750,9 @@ class IoUringImpl : public Aio::Impl {
   // with it.
   void DowngradeFromSingleIssuer();
   // Re-submits the wakeup read, fd registrations, thread-signal receivers,
-  // and active timers to the current ring.  Used by
-  // DowngradeFromSingleIssuer(): it replaces the ring with a fresh one and
-  // needs to restore everything that was registered on the old one.
+  // and active timers to the current ring.  Shared by HandleFork() and
+  // DowngradeFromSingleIssuer(): both replace the ring with a fresh one and
+  // need to restore everything that was registered on the old one.
   void ReArmPersistentRegistrations();
   // ABSL_CHECKs that the calling thread is submitter_tid_.  Two cases where
   // this is a no-op: before the first EnsureBound() call (submitter_tid_
@@ -707,11 +766,23 @@ class IoUringImpl : public Aio::Impl {
   // never touches the ring (just writes to an eventfd) and is documented as
   // callable from any thread.
   void CheckSubmitterThread() const;
+  // Resyncs with the kernel once after this process was the parent in a
+  // fork() -- the opposite of CheckForFork(), which handles this process
+  // being the child.  See global_parent_fork_count's comment for why this
+  // is needed.  No-op except for the first call after each such fork().
+  void CheckForParentFork();
+  bool HasRawRequestsInFlight() const override {
+    return raw_requests_in_flight_ != 0;
+  }
+
+  size_t last_fork_count_ = 0;
+  size_t last_parent_fork_count_ = 0;
 
   // True once the ring can accept submissions.  Set by EnsureBound() the
-  // first time io_uring_enable_rings() succeeds.  Always true when
-  // !single_issuer_: that tier has no enable step and is live immediately.
-  // Gates MaybeSubmit().
+  // first time io_uring_enable_rings() succeeds.  Reset to false by
+  // HandleFork(), since the reconstructed ring is disabled again too.
+  // Always true when !single_issuer_: that tier has no enable step and is
+  // live immediately.  Gates MaybeSubmit().
   bool ring_enabled_ = false;
   // Whether the current ring uses the SINGLE_ISSUER tier -- see
   // InitSingleIssuerRing() comment.  Goes false, permanently, after
@@ -720,7 +791,8 @@ class IoUringImpl : public Aio::Impl {
   // gate submitter_tid_ tracking itself -- both tiers still use that for
   // EnsureBound()'s idempotency check.
   bool single_issuer_ = false;
-  // The thread that constructed this IoUringImpl.  EnsureBound() compares
+  // The thread that constructed this IoUringImpl, or, after a fork, the
+  // thread running HandleFork()'s reconstruction.  EnsureBound() compares
   // this against the first caller's thread to detect the mismatch
   // DowngradeFromSingleIssuer() exists to handle.  Unlike submitter_tid_,
   // this is set once and never cleared.
@@ -869,7 +941,7 @@ class IoUringImpl : public Aio::Impl {
   AsyncRequest legacy_epoll_request_;
   // (Re-)arms legacy_epoll_request_.  Called at construction, again every
   // time it fires (from its own completion callback), and again any time
-  // the ring is rebuilt (DowngradeFromSingleIssuer(), via
+  // the ring is rebuilt (HandleFork(), DowngradeFromSingleIssuer(), via
   // ReArmPersistentRegistrations()).
   void SubmitLegacyEpollPoll();
   // Adds/updates/removes state's epoll_ctl registration on legacy_epoll_fd_
@@ -1296,7 +1368,7 @@ void IoUringImpl::DestroyTimerState(std::unique_ptr<Aio::TimerState> state) {
   // a timer from an RT thread.
   aos::CheckNotRealtime();
   auto *tstate = static_cast<IoUringTimerState *>(state.get());
-  CheckSubmitterThread();
+  CheckForFork();
   // Disarm before anything else.  A recycled state must reach the freelist
   // with a quiet timerfd -- Reset() keeps the fd rather than recreating it,
   // so a still-armed timer would otherwise make its next owner's poll fire
@@ -1348,8 +1420,10 @@ void IoUringImpl::RecycleDrainedOrphans() {
 std::unique_ptr<Aio::TimerState> IoUringImpl::MakeTimerState() {
   // Timer construction is a mutating entry point like every other:
   // Initialize() links the timer and arms its poll, so it gets the same
-  // thread enforcement as Schedule()/Cancel()/destruction.
-  CheckSubmitterThread();
+  // fork/thread enforcement as Schedule()/Cancel()/destruction -- and it
+  // can be a forked child's first Aio interaction, so the fork resync must
+  // run before the submitter-thread comparison.
+  CheckForFork();
   // Deterministically illegal under RT, like DestroyTimerState(): the
   // freelist miss below allocates, and a function that only sometimes
   // allocates would only sometimes trip the malloc hook.
@@ -1367,6 +1441,10 @@ std::unique_ptr<Aio::TimerState> IoUringImpl::MakeTimerState() {
 
 IoUringImpl::IoUringImpl() {
   RequireMinimumKernelVersion();
+  RegisterAtFork();
+  last_fork_count_ = global_fork_count.load(std::memory_order_relaxed);
+  last_parent_fork_count_ =
+      global_parent_fork_count.load(std::memory_order_relaxed);
   construction_tid_ = CachedThreadId();
   uint32_t depth = ::absl::GetFlag(FLAGS_aio_queue_depth);
   InitSingleIssuerRing(&ring, depth);
@@ -1397,10 +1475,10 @@ IoUringImpl::IoUringImpl() {
 
 IoUringImpl::~IoUringImpl() {
   // Enforces "destroy an Aio on the same thread that called Run()/Poll() on
-  // it".  Nothing else in this destructor calls CheckSubmitterThread(), so
-  // without this the check would only fire indirectly -- and only if there
-  // happened to be something left to Cancel() below, surfacing as a cryptic
-  // kernel -EEXIST rather than this clear message.  No-op if Run()/Poll() was
+  // it".  Nothing else in this destructor calls CheckForFork(), so without
+  // this the check would only fire indirectly -- and only if there happened
+  // to be something left to Cancel() below, surfacing as a cryptic kernel
+  // -EEXIST rather than this clear message.  No-op if Run()/Poll() was
   // never called (submitter_tid_ unset): nothing bound yet to violate.
   CheckSubmitterThread();
 
@@ -1483,8 +1561,9 @@ struct io_uring_sqe *IoUringImpl::GetSqeForRingReconstruction() {
     // which frees the entries, then get one from the now-drained queue.
     // A plain io_uring_submit() (not MaybeSubmit()) is correct here: this is
     // reachable only from within ReArmPersistentRegistrations(), whose
-    // caller (DowngradeFromSingleIssuer()) enables the fresh ring before
-    // doing any of the reconstruction work that calls this -- see there.
+    // callers (HandleFork() and DowngradeFromSingleIssuer()) both enable
+    // the fresh ring before doing any of the reconstruction work that
+    // calls this -- see there.
     int ret = io_uring_submit(&ring);
     ABSL_PCHECK(ret >= 0) << "io_uring_submit failed: " << aos_strerror(-ret);
     sqe = io_uring_get_sqe(&ring);
@@ -1602,15 +1681,87 @@ void IoUringImpl::CheckSubmitterThread() const {
   }
 }
 
+// Detects when the process has forked and recreates the io_uring ring.
+//
+// File descriptors created by io_uring_queue_init are inherited across fork,
+// but the kernel-shared ring buffers are mapped to the parent's memory
+// space.  Any attempt to read/write/submit requests on the inherited ring
+// inside the child process will block indefinitely or fail.  We must close
+// the parent's ring fd, initialize a new ring in the child, and re-submit
+// all active registrations to the new ring.
+void IoUringImpl::HandleFork() {
+  // Before touching anything: the rule and its message are shared with
+  // every other backend -- see Aio::Impl::CheckNoRawRequestsInFlightOnFork().
+  // Reached only when a child actually uses this loop, which is what keeps
+  // fork()+exec() -- starterd's whole job -- unaffected.
+  CheckNoRawRequestsInFlightOnFork();
+
+  // Tear the inherited ring down completely before reinitializing.  Just
+  // close()ing ring_fd leaks the parent's SQ/CQ/SQE mmap regions: the reinit
+  // below overwrites the mapping pointers in `ring` without unmapping them
+  // (strace shows the close and a fresh io_uring_setup with no munmap).
+  // io_uring_queue_exit() munmaps those regions and then closes the fd -- the
+  // child's inherited copies of the mappings are valid to unmap.
+  if (ring.ring_fd >= 0) {
+    io_uring_queue_exit(&ring);
+  }
+
+  // A forked child has exactly one surviving thread: the one running this
+  // function, via CheckForFork().  So it's always correct to treat that
+  // thread as both the construction thread and the bound thread, giving
+  // this ring a fresh chance at the SINGLE_ISSUER tier even if the pre-fork
+  // ring had been downgraded away from it.  CachedThreadId() is safe: the
+  // atfork child handler reset the cache, so this reads the child's fresh
+  // tid.
+  construction_tid_ = CachedThreadId();
+  uint32_t depth = ::absl::GetFlag(FLAGS_aio_queue_depth);
+  InitSingleIssuerRing(&ring, depth);
+  sq_capacity_ = ring.sq.ring_entries;
+  single_issuer_ = true;
+  // Not enabled until EnsureBound() -- see IORING_SETUP_R_DISABLED above.
+  ring_enabled_ = false;
+  // Rebind immediately rather than deferring to the next Poll().  If left
+  // stale, submitter_tid_ would point at a thread that no longer exists in
+  // this process, which would make EnsureBound() below a no-op -- and
+  // ReArmPersistentRegistrations() needs the ring already enabled, since it
+  // submits.
+  submitter_tid_ = std::nullopt;
+  EnsureBound();
+
+  // The embedded epoll instance is a plain fd, not one of io_uring's
+  // mmap'd-ring-buffer objects, so it does not have the ring's specific
+  // post-fork corruption problem -- but it still isn't safe to keep sharing
+  // with the parent: both processes calling epoll_wait()/epoll_ctl() on the
+  // SAME inherited instance would race for events on their own, now-
+  // independent copies of each fd, each potentially stealing an event meant
+  // for the other process.  EpollImpl::HandleFork() has the identical
+  // requirement for its own epoll_fd_ and does the identical thing.
+  if (legacy_epoll_fd_ >= 0) {
+    close(legacy_epoll_fd_);
+  }
+  legacy_epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+  ABSL_PCHECK(legacy_epoll_fd_ >= 0)
+      << "Failed to recreate embedded epoll instance";
+  for (auto &pair : legacy_states) {
+    pair.second->epoll_registered = false;
+    UpdateLegacyEpoll(pair.second.get());
+  }
+
+  ReArmPersistentRegistrations();
+}
+
 // Re-submits everything that was registered on the old ring to the current
 // one: the wakeup read, the legacy-fd epoll poll, the thread-signal
-// receivers, and every active timer.  Called from
-// DowngradeFromSingleIssuer(), which replaces the ring with a fresh one and
-// needs to restore what was on the old one.
+// receivers, and every active timer.  Shared by HandleFork() and
+// DowngradeFromSingleIssuer() -- both replace the ring with a fresh one and
+// need to restore what was on the old one.
 //
 // Legacy fds themselves (legacy_states, and their epoll_ctl registrations on
-// legacy_epoll_fd_) need no re-arming here: DowngradeFromSingleIssuer()
-// doesn't touch legacy_epoll_fd_ at all (it isn't part of the ring).
+// legacy_epoll_fd_) need no re-arming here regardless of which caller this
+// is: DowngradeFromSingleIssuer() doesn't touch legacy_epoll_fd_ at all (it
+// isn't part of the ring), and HandleFork() already re-registered them
+// itself, before calling here, as part of recreating legacy_epoll_fd_ (see
+// there for why that recreation -- unlike this function -- is fork-only).
 //
 // In-flight AsyncRead/AsyncWrite requests cannot be re-submitted: there's
 // no registry tracking them, and re-issuing a write in particular could
@@ -1685,6 +1836,47 @@ void IoUringImpl::ReArmPersistentRegistrations() {
   }
 }
 
+void IoUringImpl::CheckForFork() {
+  size_t current_fork_count = global_fork_count.load(std::memory_order_relaxed);
+  if (last_fork_count_ != current_fork_count) {
+    // Record the new count *before* HandleFork(): it re-submits work through
+    // the same public entry points (e.g. the wakeup read via AsyncRead), which
+    // call CheckForFork() again -- if the count weren't updated first, that
+    // re-entrant call would fire HandleFork() once more and recurse forever.
+    last_fork_count_ = current_fork_count;
+    HandleFork();
+  }
+  CheckForParentFork();
+  // If HandleFork() just ran, submitter_tid_ is already rebound to this
+  // thread, so this trivially passes.  Otherwise, this is what gives
+  // CheckSubmitterThread() its free, comprehensive coverage: every public
+  // entry point that touches the ring calls CheckForFork() first.
+  CheckSubmitterThread();
+}
+
+void IoUringImpl::CheckForParentFork() {
+  size_t current = global_parent_fork_count.load(std::memory_order_relaxed);
+  if (last_parent_fork_count_ != current) {
+    last_parent_fork_count_ = current;
+    if (ring_enabled_) {
+      // Resyncs the kernel's cancel/remove lookup for any op that was
+      // already outstanding before a child forked off of this process --
+      // see global_parent_fork_count's comment.
+      //
+      // Uses io_uring_submit_and_get_events() rather than a bare
+      // io_uring_get_events(), matching what a normal Poll(false) call
+      // does: the resync needs a submission alongside the GETEVENTS flag
+      // to reliably take effect (see the ADR).  There's nothing new to
+      // submit here, but that's harmless -- any entries MaybeSubmit()
+      // deferred before this ring was enabled ride along for free.
+      int ret = io_uring_submit_and_get_events(&ring);
+      ABSL_PCHECK(ret >= 0)
+          << "io_uring_submit_and_get_events failed: " << aos_strerror(-ret);
+      DrainCompletions();
+    }
+  }
+}
+
 bool IoUringImpl::Poll(bool block) {
   // Not reentrant: a nested Poll() can never dispatch (the outer loop owns
   // delivery), so reentry could only silently starve its caller.  Die at
@@ -1693,7 +1885,25 @@ bool IoUringImpl::Poll(bool block) {
       << "Aio::Poll() reentered from inside a completion callback or "
          "before-wait function; wait by returning to the event loop instead";
 
-  CheckSubmitterThread();
+  // CheckForFork() must run before EnsureBound(), not after.
+  //
+  // The ring's underlying kernel object is inherited across fork() and
+  // stays alive, shared by reference count, until HandleFork() replaces it
+  // with a fresh one.  If EnsureBound() ran first, it would enable that
+  // still-shared ring in whichever process -- parent or child -- happens to
+  // call Poll() first after the fork.  That permanently consumes the
+  // ring's one-shot enable for that process's task, and poisons it
+  // (io_uring_enable_rings() -> -EEXIST) for the other process's later use,
+  // even though the other process holds its own, otherwise-unaffected
+  // reference to the same object.
+  //
+  // Calling CheckForFork() first avoids this: a forked process's first
+  // Poll() call replaces the ring before EnsureBound() ever touches the
+  // shared one, and HandleFork() does its own immediate bind on the fresh
+  // ring -- so EnsureBound() below is already a no-op in that case.  In the
+  // ordinary, non-fork case this reordering has no effect: CheckForFork()
+  // is a no-op until something actually forks.
+  CheckForFork();
   EnsureBound();
 
   // Registering a new before-wait function from inside one is disallowed
@@ -1790,7 +2000,7 @@ void IoUringImpl::Wakeup() { event_fd.Write(); }
 
 void IoUringImpl::AsyncRead(FileDescriptor fd, std::span<char> buffer,
                             AsyncRequest *request) {
-  CheckSubmitterThread();
+  CheckForFork();
   struct io_uring_sqe *sqe = ArmSqe();
 
   io_uring_prep_read(sqe, fd, buffer.data(), buffer.size(), -1);
@@ -1815,7 +2025,7 @@ void IoUringImpl::AsyncRead(FileDescriptor fd, std::span<char> buffer,
 
 void IoUringImpl::AsyncWrite(FileDescriptor fd, std::span<const char> buffer,
                              AsyncRequest *request) {
-  CheckSubmitterThread();
+  CheckForFork();
   struct io_uring_sqe *sqe = ArmSqe();
 
   io_uring_prep_write(sqe, fd, buffer.data(), buffer.size(), -1);
@@ -1831,7 +2041,7 @@ void IoUringImpl::AsyncWrite(FileDescriptor fd, std::span<const char> buffer,
 }
 
 void IoUringImpl::Cancel(AsyncRequest *request) {
-  CheckSubmitterThread();
+  CheckForFork();
   // Already completed (its callback may still be queued for dispatch):
   // nothing left to cancel.  Documented on Aio::Cancel() -- the callback
   // delivers the original result, and the silent no-op is deliberate.
@@ -1859,8 +2069,8 @@ void IoUringImpl::Cancel(AsyncRequest *request) {
 void IoUringImpl::BeforeWait(std::function<void()> function) {
   // Same-thread only, like every other registration call: Poll() iterates
   // before_wait_functions, so a push_back from another thread would race
-  // it.
-  CheckSubmitterThread();
+  // it.  (CheckForFork() also enforces that -- see there.)
+  CheckForFork();
   // Not from inside a before-wait function: the push_back can reallocate
   // the vector while Poll()'s iteration is executing an element in the old
   // storage.  Deterministically illegal rather than sometimes-corrupting.
@@ -1871,7 +2081,7 @@ void IoUringImpl::BeforeWait(std::function<void()> function) {
 
 void IoUringImpl::OnReadable(FileDescriptor fd,
                              std::function<void()> callback) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto [it, inserted] = legacy_states.try_emplace(fd);
   if (inserted) {
     it->second = std::make_unique<IoUringImpl::LegacyState>();
@@ -1891,7 +2101,7 @@ void IoUringImpl::OnReadable(FileDescriptor fd,
 }
 
 void IoUringImpl::OnError(FileDescriptor fd, std::function<void()> callback) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto [it, inserted] = legacy_states.try_emplace(fd);
   if (inserted) {
     it->second = std::make_unique<IoUringImpl::LegacyState>();
@@ -1912,7 +2122,7 @@ void IoUringImpl::OnError(FileDescriptor fd, std::function<void()> callback) {
 
 void IoUringImpl::OnWritable(FileDescriptor fd,
                              std::function<void()> callback) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto [it, inserted] = legacy_states.try_emplace(fd);
   if (inserted) {
     it->second = std::make_unique<IoUringImpl::LegacyState>();
@@ -1933,7 +2143,7 @@ void IoUringImpl::OnWritable(FileDescriptor fd,
 
 void IoUringImpl::OnEvents(FileDescriptor fd,
                            std::function<void(uint32_t)> callback) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto [it, inserted] = legacy_states.try_emplace(fd);
   ABSL_CHECK(inserted) << "May not replace OnEvents handlers for fd " << fd;
 
@@ -1944,7 +2154,7 @@ void IoUringImpl::OnEvents(FileDescriptor fd,
 }
 
 void IoUringImpl::DeleteFd(FileDescriptor fd) {
-  CheckSubmitterThread();
+  CheckForFork();
   // Deterministically illegal under RT, like DestroyTimerState(): both
   // paths below end in a free -- inline here, or at the end of the
   // dispatch that parked the state -- and a function that only sometimes
@@ -1981,7 +2191,7 @@ void IoUringImpl::DeleteFd(FileDescriptor fd) {
 }
 
 void IoUringImpl::ForgetClosedFd(FileDescriptor fd) {
-  CheckSubmitterThread();
+  CheckForFork();
   // Deterministic, like DeleteFd() -- see there.
   aos::CheckNotRealtime();
   auto it = legacy_states.find(fd);
@@ -2000,7 +2210,7 @@ void IoUringImpl::ForgetClosedFd(FileDescriptor fd) {
 }
 
 void IoUringImpl::EnableWritable(FileDescriptor fd) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto it = legacy_states.find(fd);
   ABSL_CHECK(it != legacy_states.end()) << "fd " << fd << " not found";
 
@@ -2016,7 +2226,7 @@ void IoUringImpl::EnableWritable(FileDescriptor fd) {
 }
 
 void IoUringImpl::DisableWritable(FileDescriptor fd) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto it = legacy_states.find(fd);
   ABSL_CHECK(it != legacy_states.end()) << "fd " << fd << " not found";
 
@@ -2032,7 +2242,7 @@ void IoUringImpl::DisableWritable(FileDescriptor fd) {
 }
 
 void IoUringImpl::SetEvents(FileDescriptor fd, uint32_t events) {
-  CheckSubmitterThread();
+  CheckForFork();
   auto it = legacy_states.find(fd);
   ABSL_CHECK(it != legacy_states.end()) << "fd " << fd << " not found";
 
@@ -2047,7 +2257,7 @@ void IoUringImpl::SetEvents(FileDescriptor fd, uint32_t events) {
 
 void IoUringImpl::RegisterThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver, std::function<void()> callback) {
-  CheckSubmitterThread();
+  CheckForFork();
   // Deterministically illegal under RT, like MakeTimerState(): the
   // freelist miss below allocates (and the freelist hit destroys a stale
   // callback), and only-sometimes-allocating is a data-dependent crash.
@@ -2075,7 +2285,7 @@ void IoUringImpl::RegisterThreadSignalReceiver(
 
 void IoUringImpl::UnregisterThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver) {
-  CheckSubmitterThread();
+  CheckForFork();
   ABSL_CHECK(receiver_state_ != nullptr &&
              receiver_state_->receiver == receiver)
       << "ThreadSignalReceiver not found";
@@ -2139,8 +2349,9 @@ void IoUringImpl::ConsumeThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver) {
   // Same-thread only: this read()s the same signalfd the receiver's
   // multishot poll delivers through, and a cross-thread drain would race
-  // the loop thread's own dispatch of it.
-  CheckSubmitterThread();
+  // the loop thread's own dispatch of it.  (CheckForFork() also enforces
+  // that -- see there.)
+  CheckForFork();
   int fd = receiver->fd();
   struct signalfd_siginfo siginfo;
   while (true) {
@@ -2161,6 +2372,15 @@ void IoUringImpl::ConsumeThreadSignalReceiver(
 IoUringTimerState::~IoUringTimerState() = default;
 
 void IoUringTimerState::Initialize() {
+  // Unlike the old timer design, constructing a timer now touches the ring
+  // (SubmitPoll() below), so it needs the same fork check every other
+  // ring-touching entry point starts with.  Without it, a forked child that
+  // constructs a Timer before its first Poll() stages an SQE into the stale
+  // inherited ring and dies with -EEXIST from io_uring_submit() -- caught
+  // live by logger_test's LoggerDeathTest.CrashOnFallBehind, whose death
+  // test forks and then builds a Timer inside EventSchedulerScheduler::
+  // RunFor().
+  impl_->CheckForFork();
   // Recycled states arrive with their timerfd already created and already
   // disarmed by Reset() -- see MakeTimerState().
   if (timer_fd == nullptr) {
@@ -2295,7 +2515,7 @@ void IoUringTimerState::OnTimerFdReadable(Completion completion, void *ctx) {
 
 void IoUringTimerState::Schedule(aos::monotonic_clock::time_point deadline,
                                  CompletionCallback callback, void *context) {
-  impl_->CheckSubmitterThread();
+  impl_->CheckForFork();
   ABSL_CHECK_GE(deadline, aos::monotonic_clock::epoch());
 
   this->deadline = deadline;
@@ -2320,7 +2540,7 @@ void IoUringTimerState::Schedule(aos::monotonic_clock::time_point deadline,
 }
 
 void IoUringTimerState::Cancel(bool reap) {
-  impl_->CheckSubmitterThread();
+  impl_->CheckForFork();
   // `reap` is meaningless here: there is nothing asynchronous to reap.  A
   // disarm takes effect the instant the syscall returns.
   (void)reap;
@@ -2703,6 +2923,13 @@ class EpollImpl : public Aio::Impl {
   std::atomic<bool> run_ = false;
   std::atomic<bool> quit_requested_ = false;
 
+  size_t last_fork_count_ = 0;
+  void HandleFork();
+  bool HasRawRequestsInFlight() const override;
+  // See IoUringImpl::CheckForFork -- same eager fork handling for the epoll
+  // backend (rebuilds epoll_fd_ before touching it outside of Poll()).
+  void CheckForFork();
+
   // Requests waiting to be resolved as Canceled / with an
   // already-determined synchronous result on the next Poll(), singly
   // linked through AioState::link.next (the .prev field stays unused --
@@ -2731,6 +2958,13 @@ std::unique_ptr<Aio::TimerState> EpollImpl::MakeTimerState() {
 }
 
 EpollImpl::EpollImpl() {
+  // Register the atfork handler here too, not just in IoUringImpl.  Otherwise
+  // an epoll-only build (io_uring unavailable/disabled) never increments
+  // global_fork_count, so Poll() never detects a fork and the child hangs.  The
+  // io_uring tests happen to hide this because they run first and register the
+  // handler process-wide.
+  RegisterAtFork();
+  last_fork_count_ = global_fork_count.load(std::memory_order_relaxed);
   epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
   ABSL_PCHECK(epoll_fd_ >= 0) << "Failed to create epoll instance";
 
@@ -2916,12 +3150,47 @@ void EpollImpl::Run() {
   quit_requested_ = false;
 }
 
+void EpollImpl::HandleFork() {
+  // Shared rule; see Aio::Impl::CheckNoRawRequestsInFlightOnFork().  Here
+  // the failure it prevents is a duplicated write: this backend's
+  // registrations survive a fork, so the re-arm below would hand the child
+  // work the parent is also still doing.
+  CheckNoRawRequestsInFlightOnFork();
+
+  if (epoll_fd_ >= 0) {
+    close(epoll_fd_);
+  }
+  epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+  ABSL_PCHECK(epoll_fd_ >= 0) << "Failed to recreate epoll instance";
+
+  for (const auto &reg : registrations_) {
+    if (reg->registered) {
+      reg->registered = false;
+      UpdateEpoll(reg->fd);
+    }
+  }
+}
+
+void EpollImpl::CheckForFork() {
+  size_t current_fork_count = global_fork_count.load(std::memory_order_relaxed);
+  if (last_fork_count_ != current_fork_count) {
+    // Record the new count *before* HandleFork(): it re-submits work through
+    // the same public entry points (e.g. the wakeup read via AsyncRead), which
+    // call CheckForFork() again -- if the count weren't updated first, that
+    // re-entrant call would fire HandleFork() once more and recurse forever.
+    last_fork_count_ = current_fork_count;
+    HandleFork();
+  }
+}
+
 bool EpollImpl::Poll(bool block) {
   // Not reentrant, matching IoUringImpl::Poll().  dispatch_depth_ covers
   // the whole body below, before-wait functions included.
   ABSL_CHECK_EQ(dispatch_depth_, 0)
       << "Aio::Poll() reentered from inside a completion callback or "
          "before-wait function; wait by returning to the event loop instead";
+
+  CheckForFork();
 
   // Reclaim registrations retired by earlier dispatches.
   // ReleaseRegistration() deliberately does not scrub or free them itself: a
@@ -3070,8 +3339,26 @@ void EpollImpl::Quit() {
 
 void EpollImpl::Wakeup() { event_fd_.Write(); }
 
+bool EpollImpl::HasRawRequestsInFlight() const {
+  for (const auto &reg : registrations_) {
+    // The loop's own wakeup read is submitted through the public AsyncRead()
+    // (SubmitWakeupRead()) and is outstanding for the loop's whole life, so
+    // counting it would refuse every fork.  It re-arms itself across one --
+    // that is what HandleFork() is for -- so it is not a caller's request to
+    // lose.  IoUringImpl draws the same line, at raw_requests_in_flight_.
+    if (reg->read_req != nullptr && reg->read_req != &event_fd_.wakeup_req) {
+      return true;
+    }
+    if (reg->write_req != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void EpollImpl::AsyncRead(FileDescriptor fd, std::span<char> buffer,
                           AsyncRequest *request) {
+  CheckForFork();
   request->done = false;
   if (fd < 0) {
     State(request).link.result = -EBADF;
@@ -3157,6 +3444,7 @@ void EpollImpl::AsyncRead(FileDescriptor fd, std::span<char> buffer,
 
 void EpollImpl::AsyncWrite(FileDescriptor fd, std::span<const char> buffer,
                            AsyncRequest *request) {
+  CheckForFork();
   request->done = false;
   if (fd < 0) {
     State(request).link.result = -EBADF;
@@ -3227,7 +3515,10 @@ void EpollImpl::AsyncWrite(FileDescriptor fd, std::span<const char> buffer,
   }
 }
 
-void EpollImpl::Cancel(AsyncRequest *request) { CancelRequest(request); }
+void EpollImpl::Cancel(AsyncRequest *request) {
+  CheckForFork();
+  CancelRequest(request);
+}
 
 void EpollImpl::BeforeWait(std::function<void()> function) {
   ABSL_CHECK(!in_before_wait_)
@@ -3236,6 +3527,7 @@ void EpollImpl::BeforeWait(std::function<void()> function) {
 }
 
 void EpollImpl::OnReadable(FileDescriptor fd, std::function<void()> callback) {
+  CheckForFork();
   auto &reg = GetOrCreateLegacyRegistration(fd);
   ABSL_CHECK(!reg.events_fn)
       << "Cannot mix OnEvents and OnReadable for fd " << fd;
@@ -3251,6 +3543,7 @@ void EpollImpl::OnReadable(FileDescriptor fd, std::function<void()> callback) {
 }
 
 void EpollImpl::OnError(FileDescriptor fd, std::function<void()> callback) {
+  CheckForFork();
   auto &reg = GetOrCreateLegacyRegistration(fd);
   ABSL_CHECK(!reg.events_fn) << "Cannot mix OnEvents and OnError for fd " << fd;
   if (reg.err_fn) {
@@ -3263,6 +3556,7 @@ void EpollImpl::OnError(FileDescriptor fd, std::function<void()> callback) {
 }
 
 void EpollImpl::OnWritable(FileDescriptor fd, std::function<void()> callback) {
+  CheckForFork();
   auto &reg = GetOrCreateLegacyRegistration(fd);
   ABSL_CHECK(!reg.events_fn)
       << "Cannot mix OnEvents and OnWritable for fd " << fd;
@@ -3279,6 +3573,7 @@ void EpollImpl::OnWritable(FileDescriptor fd, std::function<void()> callback) {
 
 void EpollImpl::OnEvents(FileDescriptor fd,
                          std::function<void(uint32_t)> callback) {
+  CheckForFork();
   auto &reg = GetOrCreateLegacyRegistration(fd);
   ABSL_CHECK(reg.read_req == nullptr && reg.write_req == nullptr)
       << "Cannot mix OnEvents and AsyncRead/AsyncWrite on fd " << fd;
@@ -3290,6 +3585,7 @@ void EpollImpl::OnEvents(FileDescriptor fd,
 }
 
 void EpollImpl::DeleteFd(FileDescriptor fd) {
+  CheckForFork();
   auto *reg = GetActiveRegistration(fd);
   ABSL_CHECK(reg != nullptr) << "fd " << fd << " not found";
 
@@ -3310,6 +3606,7 @@ void EpollImpl::ForgetClosedFd(FileDescriptor fd) {
 }
 
 void EpollImpl::EnableWritable(FileDescriptor fd) {
+  CheckForFork();
   auto *reg = GetActiveRegistration(fd);
   ABSL_CHECK(reg != nullptr) << "fd " << fd << " not found";
   ABSL_CHECK(!reg->events_fn)
@@ -3324,6 +3621,7 @@ void EpollImpl::EnableWritable(FileDescriptor fd) {
 }
 
 void EpollImpl::DisableWritable(FileDescriptor fd) {
+  CheckForFork();
   auto *reg = GetActiveRegistration(fd);
   ABSL_CHECK(reg != nullptr) << "fd " << fd << " not found";
   ABSL_CHECK(!reg->events_fn)
@@ -3338,6 +3636,7 @@ void EpollImpl::DisableWritable(FileDescriptor fd) {
 }
 
 void EpollImpl::SetEvents(FileDescriptor fd, uint32_t events) {
+  CheckForFork();
   auto *reg = GetActiveRegistration(fd);
   ABSL_CHECK(reg != nullptr) << "fd " << fd << " not found";
   ABSL_CHECK(reg->events_fn)
@@ -3351,6 +3650,7 @@ void EpollImpl::SetEvents(FileDescriptor fd, uint32_t events) {
 
 void EpollImpl::RegisterThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver, std::function<void()> callback) {
+  CheckForFork();
   ABSL_CHECK(receiver_ == nullptr)
       << "Duplicate ThreadSignalReceiver registration: only one receiver "
          "may be active at a time (see Aio::RegisterThreadSignalReceiver)";
@@ -3363,6 +3663,7 @@ void EpollImpl::RegisterThreadSignalReceiver(
 
 void EpollImpl::UnregisterThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver) {
+  CheckForFork();
   ABSL_CHECK(receiver_ == receiver) << "ThreadSignalReceiver not found";
   receiver_ = nullptr;
   DeleteFd(receiver->fd());
@@ -3427,6 +3728,7 @@ void EpollTimerState::Initialize() {
 
 void EpollTimerState::Schedule(aos::monotonic_clock::time_point deadline,
                                CompletionCallback callback, void *context) {
+  impl_->CheckForFork();
   ABSL_CHECK_GE(deadline, aos::monotonic_clock::epoch());
   Cancel(true);
 
@@ -3445,6 +3747,7 @@ void EpollTimerState::Schedule(aos::monotonic_clock::time_point deadline,
 }
 
 void EpollTimerState::Cancel(bool /*reap*/) {
+  impl_->CheckForFork();
   if (timer_fd) {
     struct itimerspec its;
     std::memset(&its, 0, sizeof(its));
