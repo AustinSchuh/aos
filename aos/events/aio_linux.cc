@@ -1538,22 +1538,48 @@ IoUringImpl::~IoUringImpl() {
 }
 
 void IoUringImpl::Run() {
+  if (quit_requested) {
+    quit_requested = false;
+    return;
+  }
   run = true;
-  // The loop consults quit_requested as well as run: a Quit() racing this
-  // startup can have its `run = false` store clobbered by the store above,
-  // leaving quit_requested as the only record that a shutdown was asked for
-  // (see AioTest.QuitRacingWithRunStartup).  This also covers a Quit() that
-  // landed entirely before Run(): the loop body never executes.
-  while (run && !quit_requested) {
-    Poll(true);
+  // Block while we are running; once Quit() lands, switch to non-blocking
+  // polls so whatever is already queued gets flushed before Run() returns.
+  //
+  // This is what EPoll::Run() did from 2019 (6b6dfa5a9, "This lets us flush the
+  // event queue before quitting") until it was rewritten to wrap Aio, which
+  // silently dropped it.  It survived two refactors with the comment intact,
+  // and when a repeated-Quit() hang was found in 2021 (f74daa655) it was the
+  // Quit() side that got guarded rather than the drain removed -- so the
+  // behavior is deliberate and worth keeping.
+  //
+  // should_run() rather than run alone is what makes a concurrent Quit() safe.
+  // Quit() is async-safe, so it can run in its entirety between the
+  // quit_requested check above and the `run = true` just above here.  Quit()
+  // stores run = false, and that store is then overwritten here -- so run
+  // no longer records that a shutdown was asked for.  quit_requested still
+  // does, because nothing clears it between Quit() setting it and this loop
+  // reading it.  Reading run by itself would drop the request and then block
+  // here forever: the wakeup Quit() sent has already been spent, so nothing is
+  // left to bring Poll() back.
+  //
+  // Quit()'s own store order matters for the same reason -- it sets both flags
+  // before calling Wakeup(), so a Poll() woken by that wakeup is guaranteed to
+  // see them.
+  while (true) {
+    if (!Poll(should_run())) {
+      // Poll() found nothing to do.  If a shutdown was requested, the queue is
+      // drained now and we are done; otherwise Poll() just came back early
+      // (EINTR) and we go back to waiting.
+      if (!should_run()) {
+        break;
+      }
+    }
   }
-  // Post-Quit() drain, keeping EPoll::Run()'s contract: whatever is
-  // already resolved -- queued-but-undispatched completions on
-  // pending_dispatch_, ready CQEs -- is delivered before returning rather
-  // than dropped.  ReapCompletions() depends on this when it reports
-  // progress for completions drained by an earlier Poll().
-  while (Poll(false)) {
-  }
+  // run first: should_run() must not still report "running" once Run() has
+  // returned.  A Quit() landing between these two stores is cleared along with
+  // them, which cannot hang anything -- the loop has already stopped -- it only
+  // means the next Run() won't return early.
   run = false;
   quit_requested = false;
 }
@@ -3144,18 +3170,48 @@ void EpollImpl::ScrubRetiredRegistrations() {
 }
 
 void EpollImpl::Run() {
-  run_ = true;
-  // The loop consults quit_requested_ as well as run_, same as
-  // IoUringImpl::Run() and for the same reason: a Quit() racing this
-  // startup can have its `run_ = false` store clobbered by the store
-  // above, leaving quit_requested_ as the only record that a shutdown was
-  // asked for (see AioTest.QuitRacingWithRunStartup -- reading run_ alone
-  // hangs, since the wakeup Quit() sent has already been spent by the
-  // time the loop re-enters epoll_wait).  This also covers a Quit() that
-  // landed entirely before Run(): the loop body never executes.
-  while (run_ && !quit_requested_) {
-    Poll(true);
+  if (quit_requested_) {
+    quit_requested_ = false;
+    return;
   }
+  run_ = true;
+  // Block while we are running; once Quit() lands, switch to non-blocking
+  // polls so whatever is already queued gets flushed before Run() returns.
+  //
+  // This is what EPoll::Run() did from 2019 (6b6dfa5a9, "This lets us flush the
+  // event queue before quitting") until it was rewritten to wrap Aio, which
+  // silently dropped it.  It survived two refactors with the comment intact,
+  // and when a repeated-Quit() hang was found in 2021 (f74daa655) it was the
+  // Quit() side that got guarded rather than the drain removed -- so the
+  // behavior is deliberate and worth keeping.
+  //
+  // should_run() rather than run_ alone is what makes a concurrent Quit() safe.
+  // Quit() is async-safe, so it can run in its entirety between the
+  // quit_requested_ check above and the `run_ = true` just above here.  Quit()
+  // stores run_ = false, and that store is then overwritten here -- so run_
+  // no longer records that a shutdown was asked for.  quit_requested_ still
+  // does, because nothing clears it between Quit() setting it and this loop
+  // reading it.  Reading run_ by itself would drop the request and then block
+  // here forever: the wakeup Quit() sent has already been spent, so nothing is
+  // left to bring Poll() back.
+  //
+  // Quit()'s own store order matters for the same reason -- it sets both flags
+  // before calling Wakeup(), so a Poll() woken by that wakeup is guaranteed to
+  // see them.
+  while (true) {
+    if (!Poll(should_run())) {
+      // Poll() found nothing to do.  If a shutdown was requested, the queue is
+      // drained now and we are done; otherwise Poll() just came back early
+      // (EINTR) and we go back to waiting.
+      if (!should_run()) {
+        break;
+      }
+    }
+  }
+  // run_ first: should_run() must not still report "running" once Run() has
+  // returned.  A Quit() landing between these two stores is cleared along with
+  // them, which cannot hang anything -- the loop has already stopped -- it only
+  // means the next Run() won't return early.
   run_ = false;
   quit_requested_ = false;
 }
@@ -3344,6 +3400,20 @@ bool EpollImpl::Poll(bool block) {
 }
 
 void EpollImpl::Quit() {
+  // Already asked to stop.  Bail out rather than re-arming the wakeup: once
+  // Run() is draining it polls with a zero timeout, so a Quit() called from a
+  // BeforeWait callback (or any other per-Poll path) would refill the queue
+  // every time around and the drain would never finish.  This is the 2021
+  // EPoll::Quit() guard -- f74daa655, "Make EPoll actually return from Run even
+  // if you call Quit repeatedly" -- which the drain has always needed.
+  //
+  // Suppressing the wakeup is safe: quit_requested_ is only cleared by Run() on
+  // its way out, so while it is set the loop has either already been woken or
+  // is in the non-blocking drain and cannot block again.
+  if (quit_requested_) {
+    return;
+  }
+
   quit_requested_ = true;
   run_ = false;
   Wakeup();

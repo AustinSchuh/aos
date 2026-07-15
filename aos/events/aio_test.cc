@@ -2671,6 +2671,46 @@ TEST_P(AioTest, QuitInBeforeWait) {
   aio.Run();
 }
 
+// Tests that Run() flushes what is already queued before returning from a
+// Quit().
+//
+// EPoll::Run() polled with a zero timeout once Quit() landed, so events already
+// sitting in the queue still ran before Run() returned ("This lets us flush the
+// event queue before quitting", 6b6dfa5a9).  Wrapping EPoll around Aio dropped
+// that, and nothing caught it because no test had ever pinned it -- so pin it.
+//
+// The ordering here is deliberate: only `trigger` is readable when Run()
+// starts, so its callback is guaranteed to run first, and it is that callback
+// which both makes `target` readable and asks to quit.  A non-draining Run()
+// leaves target_count at 0.
+TEST_P(AioTest, RunDrainsQueuedEventsAfterQuit) {
+  Aio aio;
+  Pipe trigger;
+  Pipe target;
+
+  int target_count = 0;
+  aio.OnReadable(trigger.read_fd(), [&aio, &trigger, &target]() {
+    EXPECT_EQ(trigger.Read(1), "x");
+    // Queue up work and ask to stop in the same breath.
+    target.Write("x");
+    aio.Quit();
+  });
+  aio.OnReadable(target.read_fd(), [&target, &target_count]() {
+    EXPECT_EQ(target.Read(1), "x");
+    ++target_count;
+  });
+
+  trigger.Write("x");
+  aio.Run();
+
+  EXPECT_EQ(target_count, 1)
+      << "Run() returned without draining the event queue; work that was "
+         "already pending when Quit() was called got dropped.";
+
+  aio.DeleteFd(trigger.read_fd());
+  aio.DeleteFd(target.read_fd());
+}
+
 // Tests that a Quit() concurrent with Run() startup always stops the loop, and
 // that the loop is left stopped afterwards.
 //
