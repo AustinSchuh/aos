@@ -198,7 +198,6 @@ cc_library(
     ] + select({
         "@platforms//os:linux": ["epoll_linux.cc"],
         "@platforms//os:macos": ["epoll_darwin.cc"],
-        "@platforms//os:windows": ["epoll_windows.cc"],
     }),
     hdrs = ["epoll.h"],
     # EPoll's API is in terms of integer file descriptors, which don't map onto
@@ -211,6 +210,7 @@ cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = [
+        ":aio",
         "//aos/mutex",
         "//aos/time",
         "@com_google_absl//absl/log:absl_check",
