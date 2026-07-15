@@ -2976,6 +2976,98 @@ TEST_P(AioTest, QuitBeforeRunTest) {
   EXPECT_FALSE(aio.should_run());
 }
 
+TEST_P(AioTest, TimerForkTest) {
+  // Test that an active timer scheduled in the parent process remains fully
+  // functional and fires inside a forked child process.  This verifies that the
+  // backend correctly re-registers pending timeouts when recreating the loop.
+  Aio aio;
+  Aio::Timer timer(&aio);
+
+  int timer_count = 0;
+  timer.Schedule(
+      aos::monotonic_clock::now(),
+      [](Completion, void *context) {
+        auto *counter = static_cast<int *>(context);
+        ++(*counter);
+      },
+      &timer_count);
+
+  EXPECT_EXIT(
+      {
+        while (timer_count == 0 && aio.Poll(true)) {
+        }
+        if (timer_count == 1) {
+          exit(42);
+        }
+        exit(1);
+      },
+      ::testing::ExitedWithCode(42), "");
+}
+
+// Regression test: constructing a Timer is the first thing a forked child
+// does in some real call paths (EventSchedulerScheduler::RunFor(), reached
+// under gtest death tests), and Timer construction arms a poll -- so
+// Initialize() has to run the same fork check every other ring-touching
+// entry point does.  Without it the child stages an SQE into the stale
+// inherited ring and dies with -EEXIST out of io_uring_submit().  Found via
+// logger_test's LoggerDeathTest.CrashOnFallBehind, whose failure named
+// MaybeSubmit() under Aio::Timer::Timer() rather than anything timer-shaped.
+TEST_P(AioTest, ConstructTimerInForkedChildTest) {
+  Aio aio;
+  // Drive the loop once in the parent, so the ring is bound and enabled
+  // before the fork -- an unenabled ring would decline the submission on
+  // its own and hide the bug.
+  aio.Poll(false);
+
+  EXPECT_EXIT(
+      {
+        // The child's very first Aio interaction is building a timer.
+        Aio::Timer timer(&aio);
+        int fired = 0;
+        timer.Schedule(
+            aos::monotonic_clock::now(),
+            [](Completion, void *ctx) { ++*static_cast<int *>(ctx); }, &fired);
+        while (fired == 0 && aio.Poll(true)) {
+        }
+        exit(fired == 1 ? 42 : 1);
+      },
+      ::testing::ExitedWithCode(42), "");
+}
+
+// Regression test: a repeating timer armed before a fork must keep
+// repeating correctly in the child afterward, not silently revert to firing
+// once and stopping.
+TEST_P(AioTest, ForkDuringRepeatingTimerDeathTest) {
+  Aio aio;
+
+  int fire_count = 0;
+  RepeatingTimer timer(&aio, [&fire_count](Completion completion) {
+    if (aos::IsOk(completion.status)) {
+      ++fire_count;
+    }
+  });
+  timer.Start(aos::monotonic_clock::now() + std::chrono::milliseconds(10),
+              std::chrono::milliseconds(10));
+
+  // Let it fire a few times before forking.
+  while (fire_count < 3 && aio.Poll(true)) {
+  }
+  ASSERT_GE(fire_count, 3);
+  const int fires_before_fork = fire_count;
+
+  EXPECT_EXIT(
+      {
+        ScopedDeathTestWatchdog watchdog;
+        // If HandleFork() silently demoted this timer back to single-shot
+        // (or dropped it entirely), fire_count would stall right where the
+        // parent left it instead of continuing to climb.
+        while (fire_count < fires_before_fork + 3 && aio.Poll(true)) {
+        }
+        exit(fire_count >= fires_before_fork + 3 ? 42 : 1);
+      },
+      ::testing::ExitedWithCode(42), "");
+}
+
 // Regression test for a kernel quirk in IORING_SETUP_DEFER_TASKRUN rings
 // (see global_parent_fork_count's comment in aio_linux.cc): a repeating
 // timer outstanding in the parent becomes uncancelable after any fork() the
@@ -3150,6 +3242,50 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
   }
   EXPECT_EQ(count, 1);
   aio->UnregisterThreadSignalReceiver(&sfd);
+}
+
+// Regression test: a timer canceled asynchronously (via Timer::Cancel()) whose
+// completion has not been reaped yet must not be left pending across a fork.
+//
+// With the io_uring backend Timer::Cancel() is asynchronous -- it submits a
+// cancel and reaps the -ECANCELED later, inside Poll().  If HandleFork()
+// doesn't resolve that in-flight cancellation, request.done stays false in the
+// child (its completion died with the old ring) and the next reap-cancel -- the
+// re-Schedule() below, or the Timer destructor -- waits forever for a
+// completion that will never arrive.
+//
+// On Windows the death-test child re-execs from scratch rather than inheriting
+// state, so there is nothing stale to recover; the code should still work, so
+// we run it there too.  alarm() (the watchdog that turns a hang into a loud
+// failure instead of wedging the suite) is the only POSIX-only piece.
+TEST_P(AioTest, CancelTimerBeforeForkDeathTest) {
+  Aio aio;
+  Aio::Timer timer(&aio);
+
+  bool fired = false;
+  timer.Schedule(
+      aos::monotonic_clock::now() + std::chrono::seconds(10),
+      [](Completion, void *ctx) { *static_cast<bool *>(ctx) = true; }, &fired);
+
+  // Cancel asynchronously and deliberately do NOT Poll, so the cancellation is
+  // still in flight when we fork.
+  timer.Cancel();
+
+  EXPECT_EXIT(
+      {
+        ScopedDeathTestWatchdog watchdog;
+        // Re-Schedule in the child.  This triggers HandleFork() and then the
+        // internal reap-cancel that would hang if the canceled timer weren't
+        // resolved across the fork.  The fresh timer must then fire.
+        timer.Schedule(
+            aos::monotonic_clock::now(),
+            [](Completion, void *ctx) { *static_cast<bool *>(ctx) = true; },
+            &fired);
+        while (!fired && aio.Poll(true)) {
+        }
+        exit(fired ? 42 : 1);
+      },
+      ::testing::ExitedWithCode(42), "");
 }
 
 // Regression test: HandleFork() re-arms every active timer in a single pass.
