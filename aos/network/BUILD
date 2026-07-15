@@ -277,7 +277,7 @@ cc_test(
         ":sctp_client",
         ":sctp_lib",
         ":sctp_server",
-        "//aos/events:epoll",
+        "//aos/events:aio",
         "//aos/testing:googletest",
         "//aos/util:file",
     ],

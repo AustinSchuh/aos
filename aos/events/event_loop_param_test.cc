@@ -804,6 +804,32 @@ TEST_P(AbstractEventLoopTest, CheckTimerRunInPastDisabled) {
   EXPECT_TRUE(timer2->IsDisabled());
 }
 
+// Scheduling at exactly monotonic_clock::epoch() is legal -- NegativeTimeTimer
+// pins the epoch as the first valid deadline -- and means "fire as soon as the
+// loop runs", like any other deadline in the past.
+//
+// Worth its own test, on both event loops, because the two reach it very
+// differently: in simulation the epoch is where the timeline starts, so it is
+// simply "now", while on a ShmEventLoop it is decades in the past.  That is
+// exactly the shape a divergence hides in, and one did: the Linux Aio backends
+// arm with timerfd_settime(2), which reads an all-zero it_value as "disarm"
+// rather than "expire now", so this deadline used to work in sim and silently
+// never fire on a real loop.
+TEST_P(AbstractEventLoopTest, TimerAtEpochFires) {
+  auto loop = MakePrimary("primary");
+
+  int fires = 0;
+  auto timer = loop->AddTimer([this, &fires]() {
+    ++fires;
+    Exit();
+  });
+
+  loop->OnRun([timer]() { timer->Schedule(monotonic_clock::epoch()); });
+
+  Run();
+  EXPECT_EQ(fires, 1);
+}
+
 // Tests that timer handler is not disabled even after calling Exit on the event
 // loop within the timer
 TEST_P(AbstractEventLoopTest, CheckTimerRepeatOnCountDisabled) {
