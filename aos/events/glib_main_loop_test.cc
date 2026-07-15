@@ -40,7 +40,7 @@ class GlibMainLoopTest : public ::testing::TestWithParam<EventLoopType> {
       event_loop_ = simulated_event_loop_factory_->MakeEventLoop("test");
       event_loop_->SkipTimingReport();
       glib_main_loop_ = std::make_unique<GlibMainLoop>(
-          event_loop_.get(), simulated_event_loop_factory_->scheduler_epoll(),
+          event_loop_.get(), simulated_event_loop_factory_->scheduler_aio(),
           [this]() { simulated_event_loop_factory_->Exit(); });
 
       // Schedule a periodic event so that we actually start "realtime playback"
