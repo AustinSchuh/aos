@@ -1,8 +1,17 @@
 #include "aos/events/aio.h"
 
+#include "absl/log/absl_check.h"
+
 #include "aos/events/aio_internal.h"
 
 namespace aos {
+
+void Aio::Impl::CheckNoRawRequestsInFlightOnFork() const {
+  ABSL_CHECK(!HasRawRequestsInFlight())
+      << ": a forked child touched an Aio with caller-submitted "
+         "AsyncRead/AsyncWrite requests in flight at the fork.  Complete or "
+         "Cancel() them before forking, or keep the child away from this Aio.";
+}
 
 Aio::~Aio() = default;
 
