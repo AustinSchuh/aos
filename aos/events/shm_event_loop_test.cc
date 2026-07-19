@@ -1,5 +1,6 @@
 #include "aos/events/shm_event_loop.h"
 
+#include <filesystem>
 #include <string_view>
 #include <thread>
 
@@ -27,21 +28,9 @@ class ShmEventLoopTestFactory : public EventLoopTestFactory {
   explicit ShmEventLoopTestFactory(std::string backend = "io_uring")
       : backend_(std::move(backend)) {
     // Clean up anything left there before.
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test1/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test2/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test3/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test/too_small/aos.TestMessage.v8")
-            .c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/aos/aos.timing.Report.v8").c_str());
-    unlink((absl::GetFlag(FLAGS_shm_base) + "/aos/aos.logging.LogMessageFbs.v8")
-               .c_str());
+    std::string shm_dir = absl::GetFlag(FLAGS_shm_base);
+    std::error_code ec;
+    std::filesystem::remove_all(shm_dir, ec);
   }
 
   ~ShmEventLoopTestFactory() { absl::SetFlag(&FLAGS_override_hostname, ""); }
@@ -118,6 +107,11 @@ INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestEpoll, AbstractEventLoopTest,
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestEpoll,
                          AbstractEventLoopDeathTest, CommonParameters("epoll"));
 #endif  // AOS_IO_URING_ONLY
+#elif defined(_WIN32)
+INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestIocp, AbstractEventLoopTest,
+                         CommonParameters("iocp"));
+INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestIocp,
+                         AbstractEventLoopDeathTest, CommonParameters("iocp"));
 #else
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestKQueue, AbstractEventLoopTest,
                          CommonParameters("kqueue"));
@@ -129,11 +123,11 @@ INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestKQueue,
 }  // namespace
 
 bool IsRealtime() {
-#if defined(__linux__)
   int scheduler;
+#if defined(__linux__)
   ABSL_PCHECK((scheduler = sched_getscheduler(0)) != -1);
 #else
-  int scheduler = aos::GetCurrentThreadSchedulingPolicy();
+  scheduler = aos::GetCurrentThreadSchedulingPolicy();
 #endif
 
   {
@@ -567,6 +561,7 @@ TEST_P(ShmEventLoopDeathTest, OutOfBoundsWrite) {
   }
 }
 
+#ifndef _WIN32
 // Tests that the next message not being available prints a helpful error in the
 // normal case.
 TEST_P(ShmEventLoopDeathTest, NextMessageNotAvailable) {
@@ -590,6 +585,7 @@ TEST_P(ShmEventLoopDeathTest, NextMessageNotAvailableNoRun) {
 TEST_P(ShmEventLoopDeathTest, NextMessageNotAvailableNoRunNoTimingReports) {
   TestNextMessageNotAvailableNoRun(true);
 }
+#endif
 
 // Test that an ExitHandle outliving its EventLoop is caught.
 TEST_P(ShmEventLoopDeathTest, ExitHandleOutlivesEventLoop) {
@@ -644,14 +640,22 @@ TEST_P(ShmEventLoopTest, TimerFromAnotherThreadBeforeRun) {
 
 // TODO(austin): Test that missing a deadline with a timer recovers as expected.
 
-// The AOS_*_ONLY splits only mean something on Linux; elsewhere the epoll
-// target runs the platform's own backend, as CommonParameters() above does.
+// The trailing bool parameter selects the io_uring (true) vs epoll (false)
+// backend.  On Linux, AOS_EPOLL_ONLY / AOS_IO_URING_ONLY split the two into
+// separate test targets that run in parallel; the plain Linux build runs both.
+// Every non-Linux platform has a single backend, so instantiate with just one
+// value there instead of redundantly running the whole suite twice.  The
+// AOS_*_ONLY splits only mean something on Linux; elsewhere the epoll target
+// runs the platform's own backend, as CommonParameters() above does.
 #if defined(__linux__) && defined(AOS_EPOLL_ONLY)
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("epoll")
 #elif defined(__linux__) && defined(AOS_IO_URING_ONLY)
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("io_uring")
 #elif defined(__linux__)
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("io_uring", "epoll")
+#elif defined(_WIN32)
+// Windows has only iocp, and --aio_backend is fatal on any other name.
+#define SHM_EVENT_LOOP_BACKENDS ::testing::Values("iocp")
 #else
 // macOS has only kqueue, and --aio_backend is fatal on any other name.
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("kqueue")
