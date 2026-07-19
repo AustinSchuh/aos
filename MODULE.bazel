@@ -706,6 +706,22 @@ register_toolchains(
 dev_toolchains_ext = use_extension("//tools/cpp:extensions.bzl", "dev_toolchains_extension", dev_dependency = True)
 use_repo(dev_toolchains_ext, "arm_frc_linux_gnueabi_repo", "gcc_arm_none_eabi")
 
+# Alias bridge for the `@llvm_toolchain` repo that `//tools/lint` needs for a
+# hermetic clang-format. `@aos_llvm_toolchain` resolves both when AOS is the root
+# module and when it is consumed as a dependency (see tools/cpp/extensions.bzl).
+# The real repo is injected by whichever module is root: AOS's own dev-only
+# injection below when standalone, or the downstream root module otherwise.
+llvm_tools_ext = use_extension("//tools/cpp:extensions.bzl", "llvm_tools_extension")
+use_repo(llvm_tools_ext, "aos_llvm_toolchain")
+
+llvm_tools_ext_dev = use_extension(
+    "//tools/cpp:extensions.bzl",
+    "llvm_tools_extension",
+    dev_dependency = True,
+)
+
+inject_repo(llvm_tools_ext_dev, "llvm_toolchain")
+
 http_file(
     name = "sample_logfile",
     downloaded_file_path = "log.fbs",

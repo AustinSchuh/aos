@@ -332,6 +332,17 @@ load("@llvm_toolchain//:toolchains.bzl", "llvm_register_toolchains")
 
 llvm_register_toolchains()
 
+# `//tools/lint` resolves clang-format through `@aos_llvm_toolchain` so the same
+# label works in both dependency modes.  Under Bzlmod this repo is created by
+# //tools/cpp:extensions.bzl%llvm_tools_extension; here we declare it directly,
+# since WORKSPACE can name `@llvm_toolchain` without any injection.
+load("//tools/cpp:llvm_tools.bzl", "llvm_tool_alias_repo")
+
+llvm_tool_alias_repo(
+    name = "aos_llvm_toolchain",
+    src_repo = "llvm_toolchain",
+)
+
 register_toolchains(
     "//tools/cpp:cc-toolchain-roborio",
     "//tools/cpp:cc-toolchain-cortex-m4f",

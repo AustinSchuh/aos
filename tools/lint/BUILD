@@ -23,11 +23,7 @@ sh_binary(
 sh_binary(
     name = "clang_format",
     srcs = ["clang_format.sh"],
-    data = select({
-        "//tools:arm64_linux": ["@llvm_aarch64//:bin"],
-        "//tools:arm64_macos": ["@llvm_darwin_aarch64//:bin"],
-        "//conditions:default": ["@llvm_k8//:bin"],
-    }),
+    data = ["@aos_llvm_toolchain//:clang-format"],
     deps = [
         "@bazel_tools//tools/bash/runfiles",
     ],
@@ -149,11 +145,7 @@ multirun(
 
 alias(
     name = "clang_format_binary",
-    actual = select({
-        "//tools:arm64_linux": "@llvm_aarch64//:bin/clang-format",
-        "//tools:arm64_macos": "@llvm_darwin_aarch64//:bin/clang-format",
-        "//conditions:default": "@llvm_k8//:bin/clang-format",
-    }),
+    actual = "@aos_llvm_toolchain//:clang-format",
 )
 
 format_multirun(

@@ -715,7 +715,7 @@
     },
     "//tools/cpp:extensions.bzl%dev_toolchains_extension": {
       "general": {
-        "bzlTransitiveDigest": "4abRk0AujrprcZRIYhd7vFfCnrrEXzWiso0au+odoOg=",
+        "bzlTransitiveDigest": "1JzkGV6K33udxGF0Tibj1spJmjMBY196YytmN5D6v6E=",
         "usagesDigest": "lLLJpwFDW4jsRyag0p47iIByB/3D75KpYBRl4SjoPYo=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -740,6 +740,30 @@
               "sha256": "6cd1bbc1d9ae57312bcd169ae283153a9572bd6a8e4eeae2fedfbc33b115fdbb",
               "strip_prefix": "arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-eabi",
               "url": "https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi.tar.xz"
+            }
+          }
+        },
+        "recordedRepoMappingEntries": [
+          [
+            "",
+            "bazel_tools",
+            "bazel_tools"
+          ]
+        ]
+      }
+    },
+    "//tools/cpp:extensions.bzl%llvm_tools_extension": {
+      "general": {
+        "bzlTransitiveDigest": "1JzkGV6K33udxGF0Tibj1spJmjMBY196YytmN5D6v6E=",
+        "usagesDigest": "tSERKsqAxc2vhOEFDwGrXhqMc0ZqU6lWXXeblB0MN5w=",
+        "recordedFileInputs": {},
+        "recordedDirentsInputs": {},
+        "envVariables": {},
+        "generatedRepoSpecs": {
+          "aos_llvm_toolchain": {
+            "repoRuleId": "@@//tools/cpp:llvm_tools.bzl%llvm_tool_alias_repo",
+            "attributes": {
+              "src_repo": "llvm_toolchain"
             }
           }
         },

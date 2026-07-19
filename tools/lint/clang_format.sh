@@ -11,11 +11,10 @@ source "${RUNFILES_DIR:-/dev/null}/$f" 2>/dev/null || \
   { echo>&2 "ERROR: cannot find $f"; exit 1; }; f=; set -e
 # --- end runfiles.bash initialization v2 ---
 
-case "$(uname -s)/$(uname -m)" in
-    Darwin/arm64) readonly CLANG_FORMAT="$(rlocation llvm_darwin_aarch64/bin/clang-format)" ;;
-    Linux/aarch64) readonly CLANG_FORMAT="$(rlocation llvm_aarch64/bin/clang-format)" ;;
-    *) readonly CLANG_FORMAT="$(rlocation llvm_k8/bin/clang-format)" ;;
-esac
+# clang-format is a host tool, so the exec-configured convenience binary from
+# the LLVM toolchain repo (@llvm_toolchain//:clang-format) is the right one for
+# whatever host we're running on.
+readonly CLANG_FORMAT="$(rlocation llvm_toolchain/clang-format)"
 
 # Run everything from the root of the tree.
 cd "${BUILD_WORKSPACE_DIRECTORY}"
