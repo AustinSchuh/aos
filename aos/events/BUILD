@@ -556,7 +556,10 @@ cc_test(
 
 cc_library(
     name = "shm_event_loop",
-    srcs = ["shm_event_loop.cc"],
+    srcs = ["shm_event_loop.cc"] + select({
+        "@platforms//os:windows": ["shm_event_loop_windows.cc"],
+        "//conditions:default": ["shm_event_loop_posix.cc"],
+    }),
     hdrs = ["shm_event_loop.h"],
     visibility = ["//visibility:public"],
     deps = [
