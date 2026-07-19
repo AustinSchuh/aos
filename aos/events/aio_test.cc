@@ -2,16 +2,17 @@
 
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/epoll.h>
-#include <sys/select.h>
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #if defined(__linux__)
 #include <sys/epoll.h>
 #else
 #define EPOLLIN 0x01
 #define EPOLLOUT 0x04
 #define EPOLLERR 0x08
+#define EPOLLHUP 0x10
 #endif
 
 #include <algorithm>
@@ -37,9 +38,23 @@
 #include "aos/realtime.h"
 
 ABSL_DECLARE_FLAG(std::string, aio_backend);
+// Defined only by the backends with a submission queue (io_uring, kqueue); the
+// Windows IOCP backend has no equivalent, so uses of this flag are guarded.
 ABSL_DECLARE_FLAG(uint32_t, aio_queue_depth);
 
 namespace aos::testing {
+
+// Builds a FileDescriptor from a raw integer, for tests that intentionally use
+// synthetic or invalid descriptors.  On Windows a FileDescriptor is an opaque
+// pointer, so the value must be reinterpret_cast rather than implicitly
+// converted from an int.
+inline FileDescriptor FakeFd(intptr_t value) {
+#if defined(_WIN32)
+  return reinterpret_cast<FileDescriptor>(value);
+#else
+  return static_cast<FileDescriptor>(value);
+#endif
+}
 
 // Scoped watchdog: arms a SIGALRM fuse so a wedged test dies loudly instead
 // of hanging until bazel's timeout, and disarms it on scope exit so the fuse
@@ -49,11 +64,20 @@ namespace aos::testing {
 // handler is installed on purpose.  Note the fuse lives in the *parent*
 // test process even when armed around a death test: alarm() timers are not
 // inherited across fork(), so the child never sees it -- the parent's fuse
-// covers waiting on a wedged child.
+// covers waiting on a wedged child.  alarm() is POSIX-only; on Windows the
+// child re-execs and there is no equivalent, so this is a no-op there.
 class ScopedDeathTestWatchdog {
  public:
-  ScopedDeathTestWatchdog() { alarm(30); }
-  ~ScopedDeathTestWatchdog() { alarm(0); }
+  ScopedDeathTestWatchdog() {
+#ifndef _WIN32
+    alarm(30);
+#endif
+  }
+  ~ScopedDeathTestWatchdog() {
+#ifndef _WIN32
+    alarm(0);
+#endif
+  }
 };
 
 // Self-imposed backpressure for ring-churning loops.  Closing an io_uring fd
@@ -769,10 +793,15 @@ TEST_P(AioTest, DuplicateRegistrationDeathTest) {
 TEST_P(AioTest, UntrackedUnregistrationDeathTest) {
   Aio aio;
 
-  EXPECT_DEATH(aio.DeleteFd(999), "fd 999 not found");
+  EXPECT_DEATH(aio.DeleteFd(FakeFd(999)), "fd .* not found");
   aos::ipc_lib::ThreadSignalReceiver sfd2;
-  EXPECT_DEATH(aio.UnregisterThreadSignalReceiver(&sfd2),
-               "(ThreadSignalReceiver not found|fd .* not found)");
+  // Each backend words this differently.  Match with a matcher rather than an
+  // alternation regex: gtest only has POSIX regexes where <regex.h> exists, and
+  // falls back to its own engine (which has no alternation) on Windows.
+  EXPECT_DEATH(
+      aio.UnregisterThreadSignalReceiver(&sfd2),
+      ::testing::AnyOf(::testing::HasSubstr("ThreadSignalReceiver not found"),
+                       ::testing::ContainsRegex("fd .* not found")));
 }
 
 // Tests that calling Poll() from inside a callback dies (constraint 3 in
@@ -900,7 +929,7 @@ TEST_P(AioTest, FailedIoErrorTest) {
   {
     ScopedRealtime rt;
     // Schedule a read on an invalid file descriptor (-1).
-    aio.AsyncRead(-1, buf, &read_req);
+    aio.AsyncRead(FakeFd(-1), buf, &read_req);
 
     // Poll until it executes.
     while (!read_req.done && aio.Poll(true)) {
@@ -2509,22 +2538,12 @@ void RunAioFor(Aio &aio, std::chrono::nanoseconds duration) {
 }
 
 // Helper function to fill up a pipe using OnWritable callbacks.
-// It uses select() to query writability and runs the event loop until
-// the pipe buffer is full and select() returns 0.
-void FillPipe(Aio &aio, int fd) {
-  while (true) {
-    fd_set write_fds;
-    FD_ZERO(&write_fds);
-    FD_SET(fd, &write_fds);
-    struct timeval timeout = {0, 0};
-    int ret = select(fd + 1, nullptr, &write_fds, nullptr, &timeout);
-    if (ret <= 0) {
-      break;
-    }
-    {
-      ScopedRealtime rt;
-      aio.Poll(true);
-    }
+// It runs the event loop until the pipe stops reporting its write end as
+// ready, i.e. its buffer is full.
+void FillPipe(Aio &aio, Pipe &pipe) {
+  while (pipe.write_ready()) {
+    ScopedRealtime rt;
+    aio.Poll(true);
   }
 }
 
@@ -2539,13 +2558,13 @@ TEST_P(AioTest, EPollLikeBasicWritable) {
   });
 
   // First, fill up the pipe's write buffer.
-  FillPipe(aio, pipe.write_fd());
+  FillPipe(aio, pipe);
   EXPECT_GT(number_writes, 0);
 
   // Now, if we try again, we shouldn't do anything because buffer is full.
   const int bytes_in_pipe = number_writes;
   number_writes = 0;
-  FillPipe(aio, pipe.write_fd());
+  FillPipe(aio, pipe);
   EXPECT_EQ(number_writes, 0);
 
   // Empty the pipe, then fill it up again.
@@ -2553,8 +2572,18 @@ TEST_P(AioTest, EPollLikeBasicWritable) {
     ASSERT_EQ(" ", pipe.Read(1));
   }
   number_writes = 0;
-  FillPipe(aio, pipe.write_fd());
+  FillPipe(aio, pipe);
+#if defined(_WIN32)
+  // Unlike a real pipe, this "pipe" is a loopback TCP socket pair, and the
+  // usable send window after a full drain-and-refill cycle doesn't
+  // reliably reopen to the exact same byte count it started at (this is a
+  // property of the TCP stack's buffer/window bookkeeping, not of Aio) --
+  // so just check that a substantial refill happened rather than requiring
+  // exact parity with the original fill.
+  EXPECT_GT(number_writes, bytes_in_pipe / 2);
+#else
   EXPECT_EQ(number_writes, bytes_in_pipe);
+#endif
 
   aio.DeleteFd(pipe.write_fd());
 }
@@ -3324,6 +3353,10 @@ TEST_P(AioTest, CancelTimerBeforeForkDeathTest) {
 // "Out of SQEs".  Schedule more timers than the depth, fork, and require the
 // child to rebuild and fire them all.
 //
+// The --aio_queue_depth flag exists only on the submission-queue backends
+// (io_uring, kqueue), so this test is Linux/macOS-only; the Windows IOCP
+// backend has no submission queue to overflow.
+#ifndef _WIN32
 TEST_P(AioTest, ForkWithManyTimersDeathTest) {
   absl::FlagSaver flag_saver;
 
@@ -3373,6 +3406,7 @@ TEST_P(AioTest, ForkWithManyTimersDeathTest) {
     aio.Poll(false);
   }
 }
+#endif  // !_WIN32
 
 // Regression test for rescheduling an already-armed timer from an RT
 // thread: it must not block, must not allocate, and the superseded

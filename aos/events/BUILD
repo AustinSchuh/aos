@@ -51,8 +51,14 @@ cc_library(
     ] + select({
         "@platforms//os:linux": ["aio_linux.cc"],
         "@platforms//os:macos": ["aio_darwin.cc"],
+        "@platforms//os:windows": ["aio_windows.cc"],
     }),
     hdrs = ["aio.h"],
+    linkopts = select({
+        # WSAStartup/WSAPoll/overlapped socket I/O live in ws2_32.
+        "@platforms//os:windows": ["-DEFAULTLIB:ws2_32.lib"],
+        "//conditions:default": [],
+    }),
     # Which backend --aio_backend defaults to is a property of the platform,
     # not of the machine that happens to run the build, so it is compiled in
     # rather than probed: io_uring has no runtime fallback (a loop asked for
@@ -70,6 +76,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//aos:realtime",
+        "//aos/containers:sized_array",
         "//aos/ipc_lib:thread_signal",
         "//aos/libc:aos_strerror",
         "//aos/time",
@@ -85,6 +92,7 @@ cc_library(
         "@platforms//os:macos": [
             "//aos/mutex",
         ],
+        "@platforms//os:windows": [],
     }),
 )
 
@@ -147,11 +155,17 @@ cc_library(
 cc_library(
     name = "pipe",
     testonly = True,
+    srcs = select({
+        "@platforms//os:windows": ["pipe_windows.cc"],
+        "//conditions:default": ["pipe_unix.cc"],
+    }),
     hdrs = [
         "pipe.h",
     ],
     deps = [
+        ":aio",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 

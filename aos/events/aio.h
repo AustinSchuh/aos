@@ -67,8 +67,16 @@ struct AsyncRequest {
   bool done = true;
 
   // Internal state managed entirely by the Aio implementation.  Callers must
-  // not read or modify this field.
+  // not read or modify this field.  The Windows IOCP backend stores a larger
+  // per-request record here (an OVERLAPPED, I/O buffers, timer-queue links,
+  // ...) than the Linux/macOS backends do, so the buffer is sized per platform
+  // -- but the field's name and type are identical everywhere, keeping this
+  // struct platform agnostic.
+#if defined(_WIN32)
+  alignas(8) uint8_t internal_state[72] = {0};
+#else
   alignas(8) uint8_t internal_state[48] = {0};
+#endif
 };
 
 // Aio is a cross-platform asynchronous I/O multiplexer and event loop engine.
@@ -392,6 +400,7 @@ class Aio {
   friend class IoUringImpl;
   friend class EpollImpl;
   friend class KqueueImpl;
+  friend class IocpImpl;
 
   std::unique_ptr<Impl> impl_;
 };

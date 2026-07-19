@@ -59,7 +59,47 @@ void ThreadSignalSender::Signal(pid_t pid, pid_t tid) {
   ABSL_PCHECK(CloseHandle(hEvent)) << "CloseHandle failed";
 }
 
-// ThreadSignalReceiver on Windows is added later, alongside the Aio (IOCP) loop
-// it registers its Event with.
+namespace {
+
+// Both halves derive the Event name from the target (pid, tid) pair, so a
+// sender in another process can find the receiver's Event without sharing a
+// handle.
+void WakeupEventName(pid_t pid, pid_t tid, char *name, size_t size) {
+  int len = snprintf(name, size, "Local\\aos-wakeup-%d-%d",
+                     static_cast<int>(pid), static_cast<int>(tid));
+  ABSL_CHECK(len > 0 && len < static_cast<int>(size));
+}
+
+}  // namespace
+
+ThreadSignalReceiver::ThreadSignalReceiver() {
+  char name[64];
+  WakeupEventName(GetCurrentProcessId(), GetCurrentThreadId(), name,
+                  sizeof(name));
+  // Auto-reset and initially unsignaled: each wait consumes exactly one wakeup,
+  // which matches the "drain one signal per notification" semantics the
+  // signalfd backends provide.  If a ThreadSignalSender for this same thread
+  // already created the Event, this returns another handle to that same object.
+  event_handle_ = CreateEventA(NULL, FALSE, FALSE, name);
+  ABSL_PCHECK(event_handle_ != NULL) << "CreateEventA(" << name << ") failed";
+}
+
+ThreadSignalReceiver::~ThreadSignalReceiver() {
+  if (event_handle_ != NULL) {
+    CloseHandle(event_handle_);
+  }
+}
+
+void ThreadSignalReceiver::ConsumeWakeup() {
+  // The Event is auto-reset, so the wait which delivered the wakeup already
+  // cleared it.  Reset again anyway to drop a wakeup that arrived after that
+  // wait but before we got here, so we don't immediately wake a second time.
+  ABSL_PCHECK(ResetEvent(event_handle_)) << "ResetEvent failed";
+}
+
+void ThreadSignalReceiver::LeaveSignalBlocked() {
+  // Nothing to do: wakeups arrive as an Event rather than a signal, so there is
+  // no process-wide disposition that could kill us after destruction.
+}
 
 }  // namespace aos::ipc_lib
