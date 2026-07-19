@@ -43,6 +43,12 @@ thread_local CpuSet thread_affinity = DefaultAffinity();
 
 bool GetIsRealtime() { return is_realtime; }
 
+// Nothing to do: there is no mlockall() to call, and the priorities this
+// platform can offer are handed out by SetCurrentThreadRealtimePriority()
+// without any process-wide limits to raise first.  A no-op rather than an
+// absent symbol so callers stay platform-agnostic.
+void InitRT() {}
+
 void SetIsRealtime(bool realtime) { is_realtime = realtime; }
 
 void UnsetCurrentThreadRealtimePriority() {

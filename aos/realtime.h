@@ -90,9 +90,13 @@ class CpuSet {
 // Locks everything into memory and sets the limits.  This plus InitNRT are
 // everything you need to do before SetCurrentThreadRealtimePriority will make
 // your thread RT.  Called as part of ShmEventLoop::Run()
-#ifndef _WIN32
+//
+// Does nothing on Windows, which has no memory to lock down and no scheduler
+// limits to raise; see realtime_windows.cc.  Declared for every platform so
+// that callers do not each need their own #ifdef around it.
 void InitRT();
 
+#ifndef _WIN32
 // Sets up this process to write core dump files.
 // This is called by Init*, but it's here for other files that want this
 // behavior without calling Init*.

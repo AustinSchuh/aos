@@ -1,5 +1,6 @@
 #include "aos/events/shm_event_loop.h"
 
+#include <filesystem>
 #include <string_view>
 
 #include "absl/flags/flag.h"
@@ -26,18 +27,9 @@ class ShmEventLoopTestFactory : public EventLoopTestFactory {
   explicit ShmEventLoopTestFactory(std::string backend = "io_uring")
       : backend_(std::move(backend)) {
     // Clean up anything left there before.
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test1/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test2/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/test2/aos.TestMessage.v8").c_str());
-    unlink(
-        (absl::GetFlag(FLAGS_shm_base) + "/aos/aos.timing.Report.v8").c_str());
-    unlink((absl::GetFlag(FLAGS_shm_base) + "/aos/aos.logging.LogMessageFbs.v8")
-               .c_str());
+    std::string shm_dir = absl::GetFlag(FLAGS_shm_base);
+    std::error_code ec;
+    std::filesystem::remove_all(shm_dir, ec);
   }
 
   ~ShmEventLoopTestFactory() { absl::SetFlag(&FLAGS_override_hostname, ""); }
@@ -125,11 +117,11 @@ INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestKQueue,
 }  // namespace
 
 bool IsRealtime() {
-#if defined(__linux__)
   int scheduler;
+#if defined(__linux__)
   PCHECK((scheduler = sched_getscheduler(0)) != -1);
 #else
-  int scheduler = aos::GetCurrentThreadSchedulingPolicy();
+  scheduler = aos::GetCurrentThreadSchedulingPolicy();
 #endif
 
   {
@@ -545,6 +537,7 @@ TEST_P(ShmEventLoopDeathTest, OutOfBoundsWrite) {
   }
 }
 
+#ifndef _WIN32
 // Tests that the next message not being available prints a helpful error in the
 // normal case.
 TEST_P(ShmEventLoopDeathTest, NextMessageNotAvailable) {
@@ -568,6 +561,7 @@ TEST_P(ShmEventLoopDeathTest, NextMessageNotAvailableNoRun) {
 TEST_P(ShmEventLoopDeathTest, NextMessageNotAvailableNoRunNoTimingReports) {
   TestNextMessageNotAvailableNoRun(true);
 }
+#endif
 
 // Test that an ExitHandle outliving its EventLoop is caught.
 TEST_P(ShmEventLoopDeathTest, ExitHandleOutlivesEventLoop) {
@@ -579,12 +573,22 @@ TEST_P(ShmEventLoopDeathTest, ExitHandleOutlivesEventLoop) {
 
 // TODO(austin): Test that missing a deadline with a timer recovers as expected.
 
+// The trailing bool parameter selects the io_uring (true) vs epoll (false)
+// backend.  On Linux, AOS_EPOLL_ONLY / AOS_IO_URING_ONLY split the two into
+// separate test targets that run in parallel; the plain Linux build runs both.
+// Every non-Linux platform has a single backend, so instantiate with just one
+// value there instead of redundantly running the whole suite twice.
 #if defined(AOS_EPOLL_ONLY)
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("epoll")
 #elif defined(AOS_IO_URING_ONLY)
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("io_uring")
-#else
+#elif defined(__linux__)
 #define SHM_EVENT_LOOP_BACKENDS ::testing::Values("io_uring", "epoll")
+#else
+// Windows and macOS each have exactly one backend, and Aio::Aio() there
+// builds it without consulting --aio_backend at all -- so this names the
+// suite after what it runs on rather than after a Linux backend it does not.
+#define SHM_EVENT_LOOP_BACKENDS ::testing::Values("native")
 #endif
 
 // The ReadMethod half is already in each suite's name, so naming these by

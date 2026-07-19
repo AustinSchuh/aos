@@ -230,6 +230,10 @@ class ShmEventLoop : public EventLoop {
   // Returns the TID of the event loop.
   pid_t GetTid() const override;
 
+  void IgnoreWakeupSignal();
+  void RegisterSignalHandler();
+  void UnregisterSignalHandler();
+
   // Private method to access the shared memory mapping of a ShmSender.
   absl::Span<char> GetShmSenderSharedMemory(const aos::RawSender *sender) const;
 
