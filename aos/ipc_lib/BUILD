@@ -606,6 +606,7 @@ cc_test(
         "//aos:realtime",
         "//aos/testing:googletest",
         "//aos/testing:test_logging",
+        "//aos/testing:tmpdir",
         "//aos/time",
     ],
 )
