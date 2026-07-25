@@ -68,10 +68,9 @@ cc_library(
 # get it on OSX at all.  Every one of those is >= 4.7, so the aruco/charuco
 # detectors live in objdetect everywhere and we do not need the contrib module.
 #
-# We list the individual BCR modules rather than @opencv//:opencv because the
-# umbrella target pulls in videoio and highgui, and on OSX both are backed by
-# objc_library targets (AVFoundation and Cocoa) which our LLVM toolchain cannot
-# compile.  See :opencv_highgui.
+# We list the individual BCR modules rather than @opencv//:opencv so that the
+# windowing and video-capture code is not dragged into everything that just
+# wants to manipulate an image; that lives in :opencv_highgui instead.
 _OPENCV_BCR_MODULES = [
     "@opencv//:core",
     "@opencv//:imgproc",
@@ -95,11 +94,13 @@ cc_library(
     }),
 )
 
-# The windowing half of OpenCV (cv::imshow and friends).  Not available on OSX:
-# highgui unconditionally depends on videoio, which there drags in the
-# AVFoundation objc_library.  On x86 this comes from the BCR module with its
-# GTK3 backend turned on (see --@opencv//:with_gtk3 and --@opencv//:gtk3 in
-# .bazelrc); the ORIN's prebuilt opencv4 already contains it.
+# The windowing half of OpenCV (cv::imshow and friends).  This pulls in videoio
+# too, and with it the AVFoundation and Cocoa objc_library targets on OSX; our
+# toolchain grows Objective-C support via
+# //third_party/rules_cc:0001-Declare-the-Objective-C-compile-actions.patch.
+# On x86 this comes from the BCR module with its GTK3 backend turned on (see
+# --@opencv//:with_gtk3 and --@opencv//:gtk3 in .bazelrc); the ORIN's prebuilt
+# opencv4 already contains it.
 cc_library(
     name = "opencv_highgui",
     target_compatible_with = select({
@@ -108,7 +109,7 @@ cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = select({
-        "//tools:arm64_macos": [":unavailable"],
+        "//tools:arm64_macos": ["@opencv//:highgui"],
         "//tools:cpu_arm64": ["@arm64_debian_sysroot//:opencv4"],
         "//tools:cpu_k8": ["@opencv//:highgui"],
         "//conditions:default": [":unavailable"],

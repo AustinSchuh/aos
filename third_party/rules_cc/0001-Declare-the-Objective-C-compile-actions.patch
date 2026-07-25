@@ -1,0 +1,177 @@
+Declare the Objective-C compile actions
+
+objc_library() checks cc_common.action_is_enabled("objc-compile") and
+fails with "Compiling objc_library targets requires the Apple CC
+toolchain" unless the toolchain declares that action.  unix_cc's config
+never did, so any toolchain built on it -- including toolchains_llvm --
+could not build Objective-C at all.
+
+clang drives Objective-C with the same binary and the same flags as
+C/C++; the language comes from the source extension.  So declare
+objc-compile and objc++-compile with the same tool and the same implied
+features as the C/C++ actions.
+
+Getting the flags there takes two things.  Adding the actions to
+all_compile_actions (and objc++ to all_cpp_compile_actions) covers every
+feature keyed off those lists.  The rest of the features spell their
+actions out literally, and simply omit objc; the one that matters most
+is "sysroot", without which the compile cannot find so much as
+<unistd.h>.  Mirror c-compile to objc-compile and c++-compile to
+objc++-compile in those, so an Objective-C translation unit is compiled
+the same way a C one is.  The C++ module and header-parsing features are
+left alone deliberately.
+
+--- a/cc/private/toolchain/unix_cc_toolchain_config.bzl	2026-07-25 12:30:55
++++ b/cc/private/toolchain/unix_cc_toolchain_config.bzl	2026-07-25 12:33:08
+@@ -154,6 +154,8 @@
+ all_compile_actions = [
+     ACTION_NAMES.c_compile,
+     ACTION_NAMES.cpp_compile,
++    ACTION_NAMES.objc_compile,
++    ACTION_NAMES.objcpp_compile,
+     ACTION_NAMES.linkstamp_compile,
+     ACTION_NAMES.assemble,
+     ACTION_NAMES.preprocess_assemble,
+@@ -169,6 +171,7 @@
+ 
+ all_cpp_compile_actions = [
+     ACTION_NAMES.cpp_compile,
++    ACTION_NAMES.objcpp_compile,
+     ACTION_NAMES.linkstamp_compile,
+     ACTION_NAMES.cpp_header_parsing,
+     ACTION_NAMES.cpp_module_compile,
+@@ -347,6 +350,34 @@
+     )
+     action_configs.append(cpp20_module_codegen)
+ 
++    # Objective-C and Objective-C++.  Bazel's objc_library rule refuses to
++    # build unless the toolchain declares these actions, and clang compiles
++    # them with the same driver and the same flags as C/C++ -- the language is
++    # selected from the source file extension.
++    objc_compile = action_config(
++        action_name = ACTION_NAMES.objc_compile,
++        enabled = True,
++        tools = [
++            tool(
++                path = cc,
++            ),
++        ],
++        implies = compile_implies,
++    )
++    action_configs.append(objc_compile)
++
++    objcpp_compile = action_config(
++        action_name = ACTION_NAMES.objcpp_compile,
++        enabled = True,
++        tools = [
++            tool(
++                path = cc,
++            ),
++        ],
++        implies = compile_implies,
++    )
++    action_configs.append(objcpp_compile)
++
+     supports_pic_feature = feature(
+         name = "supports_pic",
+         enabled = True,
+@@ -502,7 +533,9 @@
+                     ACTION_NAMES.preprocess_assemble,
+                     ACTION_NAMES.linkstamp_compile,
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.cpp_header_parsing,
+                     ACTION_NAMES.cpp_module_compile,
+                     ACTION_NAMES.cpp_module_codegen,
+@@ -713,7 +746,9 @@
+                     ACTION_NAMES.preprocess_assemble,
+                     ACTION_NAMES.linkstamp_compile,
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.cpp_module_codegen,
+                     ACTION_NAMES.cpp_module_compile,
+                     ACTION_NAMES.cpp20_module_compile,
+@@ -735,7 +770,9 @@
+                     ACTION_NAMES.assemble,
+                     ACTION_NAMES.preprocess_assemble,
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.cpp_module_codegen,
+                     ACTION_NAMES.cpp20_module_codegen,
+                 ],
+@@ -758,7 +795,9 @@
+                     ACTION_NAMES.preprocess_assemble,
+                     ACTION_NAMES.linkstamp_compile,
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.cpp_header_parsing,
+                     ACTION_NAMES.cpp_module_compile,
+                     ACTION_NAMES.cpp_module_deps_scanning,
+@@ -980,7 +1019,9 @@
+             flag_set(
+                 actions = [
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.cpp_module_codegen,
+                     ACTION_NAMES.cpp_module_compile,
+                     ACTION_NAMES.cpp_module_deps_scanning,
+@@ -1032,7 +1073,9 @@
+             flag_set(
+                 actions = [
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                 ] + all_link_actions + lto_index_actions,
+                 flag_groups = [
+                     flag_group(
+@@ -1054,7 +1097,9 @@
+             flag_set(
+                 actions = [
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.lto_backend,
+                 ] + all_link_actions + lto_index_actions,
+                 flag_groups = [
+@@ -1331,7 +1376,9 @@
+             flag_set(
+                 actions = [
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.lto_backend,
+                 ],
+                 flag_groups = [
+@@ -1597,7 +1644,9 @@
+                 actions = [
+                     ACTION_NAMES.preprocess_assemble,
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                     ACTION_NAMES.cpp_header_parsing,
+                     ACTION_NAMES.cpp_module_compile,
+                 ],
+@@ -1628,7 +1677,9 @@
+             flag_set(
+                 actions = [
+                     ACTION_NAMES.c_compile,
++                    ACTION_NAMES.objc_compile,
+                     ACTION_NAMES.cpp_compile,
++                    ACTION_NAMES.objcpp_compile,
+                 ] + all_link_actions + lto_index_actions,
+                 flag_groups = [
+                     flag_group(flags = ["-flto=thin"]),
