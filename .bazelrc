@@ -17,6 +17,14 @@ build --@rules_python//python/config_settings:venvs_use_declare_symlink=no
 # platform.
 build:linux --host_platform=//tools/platforms:linux_x86
 
+# Build OpenCV's highgui with its GTK3 backend, against the GTK out of our
+# sysroot rather than whatever the host happens to have.  Only set on Linux
+# hosts: on OSX highgui is unavailable (it pulls objc in via AVFoundation), and
+# setting these unconditionally would force @opencv to be fetched even for
+# builds that have no use for it.
+build:linux --@opencv//:with_gtk3=True
+build:linux --@opencv//:gtk3=//third_party:gtk3
+
 # macOS ARM64 (Apple Silicon) platform configuration
 build:macos --host_platform=//tools/platforms:darwin_arm64
 

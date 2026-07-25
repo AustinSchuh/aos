@@ -9,8 +9,10 @@
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "opencv2/core/eigen.hpp"
-#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/imgcodecs.hpp"
 #include "opencv2/imgproc.hpp"
+#include "opencv2/objdetect/aruco_detector.hpp"
+#include "opencv2/objdetect/charuco_detector.hpp"
 
 #include "aos/events/event_loop.h"
 #include "aos/flatbuffers.h"
@@ -245,18 +247,34 @@ ImageCallback::ImageCallback(
           },
           max_age) {}
 
+namespace {
+// Replacement for cv::aruco::estimatePoseSingleMarkers(), which the objdetect
+// API dropped.  It solved each marker independently against a square of the
+// given side length centred on the origin, so do exactly that.
+void EstimatePoseSingleMarkers(
+    const std::vector<std::vector<cv::Point2f>> &corners, float side_length,
+    cv::InputArray camera_matrix, cv::InputArray dist_coeffs,
+    std::vector<cv::Vec3d> *rvecs, std::vector<cv::Vec3d> *tvecs) {
+  const float half_length = side_length / 2.0f;
+  const std::vector<cv::Point3f> object_points{
+      {-half_length, half_length, 0.0f},
+      {half_length, half_length, 0.0f},
+      {half_length, -half_length, 0.0f},
+      {-half_length, -half_length, 0.0f}};
+  for (const std::vector<cv::Point2f> &marker : corners) {
+    cv::Vec3d rvec, tvec;
+    cv::solvePnP(object_points, marker, camera_matrix, dist_coeffs, rvec, tvec);
+    rvecs->emplace_back(rvec);
+    tvecs->emplace_back(tvec);
+  }
+}
+}  // namespace
+
 cv::Ptr<cv::aruco::CharucoBoard> MakeCharucoBoard(
     cv::Size board_size, float square_length, float marker_length,
     cv::Ptr<cv::aruco::Dictionary> dictionary) {
-#if CV_VERSION_MINOR >= 9
   return cv::makePtr<cv::aruco::CharucoBoard>(board_size, square_length,
                                               marker_length, *dictionary);
-
-#else
-  return cv::aruco::CharucoBoard::create(board_size.width, board_size.height,
-                                         square_length, marker_length,
-                                         dictionary);
-#endif
 }
 
 void CharucoExtractor::SetupTargetData() {
@@ -269,10 +287,7 @@ void CharucoExtractor::SetupTargetData() {
   if (target_type_ == TargetType::kCharuco ||
       target_type_ == TargetType::kAruco) {
     dictionary_ =
-#if CV_VERSION_MINOR >= 9
-        cv::makePtr<cv::aruco::Dictionary>
-#endif
-        (cv::aruco::getPredefinedDictionary(
+        cv::makePtr<cv::aruco::Dictionary>(cv::aruco::getPredefinedDictionary(
             (absl::GetFlag(FLAGS_twenty_inch_large_board))
                 ? cv::aruco::DICT_4X4_250
             : absl::GetFlag(FLAGS_large_board)
@@ -307,12 +322,7 @@ void CharucoExtractor::SetupTargetData() {
       }
       if (!absl::GetFlag(FLAGS_board_template_path).empty()) {
         cv::Mat board_image;
-#if CV_VERSION_MINOR >= 9
-        board_->generateImage(
-#else
-        board_->draw(
-#endif
-            cv::Size(600, 500), board_image, 10, 1);
+        board_->generateImage(cv::Size(600, 500), board_image, 10, 1);
         cv::imwrite(absl::GetFlag(FLAGS_board_template_path), board_image);
       }
     }
@@ -496,12 +506,12 @@ void CharucoExtractor::ProcessImage(
   std::vector<std::vector<cv::Point2f>> marker_corners;
 
   // Do initial marker detection; this is the same for all target types
-  cv::Ptr<cv::aruco::DetectorParameters> detector_params =
-      cv::makePtr<cv::aruco::DetectorParameters>();
-  detector_params->cornerRefinementMethod = cv::aruco::CORNER_REFINE_CONTOUR;
+  cv::aruco::DetectorParameters detector_params;
+  detector_params.cornerRefinementMethod =
+      static_cast<int>(cv::aruco::CORNER_REFINE_CONTOUR);
 
-  cv::aruco::detectMarkers(rgb_image, dictionary_, marker_corners, marker_ids,
-                           detector_params);
+  const cv::aruco::ArucoDetector aruco_detector(*dictionary_, detector_params);
+  aruco_detector.detectMarkers(rgb_image, marker_corners, marker_ids);
   if (absl::GetFlag(FLAGS_draw_axes)) {
     cv::aruco::drawDetectedMarkers(rgb_image, marker_corners, marker_ids);
   }
@@ -525,19 +535,25 @@ void CharucoExtractor::ProcessImage(
         // multiple samples), and also to use data from a previous/stored
         // calibration to determine a more accurate pose in real time (used
         // for extrinsics calibration)
-        cv::aruco::interpolateCornersCharuco(marker_corners, marker_ids,
-                                             rgb_image, board_, charuco_corners,
-                                             charuco_ids);
+        const cv::aruco::CharucoDetector charuco_detector(*board_);
+        charuco_detector.detectBoard(rgb_image, charuco_corners, charuco_ids,
+                                     marker_corners, marker_ids);
 
         std::vector<cv::Point2f> charuco_corners_with_calibration;
         std::vector<int> charuco_ids_with_calibration;
 
         // This call uses a previous intrinsic calibration to get more
         // accurate marker locations, for a better pose estimate
-        cv::aruco::interpolateCornersCharuco(
-            marker_corners, marker_ids, rgb_image, board_,
-            charuco_corners_with_calibration, charuco_ids_with_calibration,
-            calibration_.CameraIntrinsics(), calibration_.CameraDistCoeffs());
+        cv::aruco::CharucoParameters charuco_params_with_calibration;
+        charuco_params_with_calibration.cameraMatrix =
+            calibration_.CameraIntrinsics();
+        charuco_params_with_calibration.distCoeffs =
+            calibration_.CameraDistCoeffs();
+        const cv::aruco::CharucoDetector charuco_detector_with_calibration(
+            *board_, charuco_params_with_calibration);
+        charuco_detector_with_calibration.detectBoard(
+            rgb_image, charuco_corners_with_calibration,
+            charuco_ids_with_calibration, marker_corners, marker_ids);
 
         if (charuco_ids.size() >= absl::GetFlag(FLAGS_min_charucos)) {
           if (absl::GetFlag(FLAGS_draw_axes)) {
@@ -545,11 +561,17 @@ void CharucoExtractor::ProcessImage(
                 rgb_image, charuco_corners, charuco_ids, cv::Scalar(255, 0, 0));
           }
 
+          // estimatePoseCharucoBoard() is gone in the objdetect API; it was
+          // matchImagePoints() followed by solvePnP(), so do that directly.
           cv::Vec3d rvec, tvec;
-          valid = cv::aruco::estimatePoseCharucoBoard(
-              charuco_corners_with_calibration, charuco_ids_with_calibration,
-              board_, calibration_.CameraIntrinsics(),
-              calibration_.CameraDistCoeffs(), rvec, tvec);
+          cv::Mat board_object_points, board_image_points;
+          board_->matchImagePoints(charuco_corners_with_calibration,
+                                   charuco_ids_with_calibration,
+                                   board_object_points, board_image_points);
+          valid = !board_object_points.empty() &&
+                  cv::solvePnP(board_object_points, board_image_points,
+                               calibration_.CameraIntrinsics(),
+                               calibration_.CameraDistCoeffs(), rvec, tvec);
 
           // if charuco pose is valid, return pose, with ids and corners
           if (valid) {
@@ -584,9 +606,9 @@ void CharucoExtractor::ProcessImage(
       // estimate pose for arucos doesn't return valid, so marking true
       valid = true;
       std::vector<cv::Vec3d> rvecs, tvecs;
-      cv::aruco::estimatePoseSingleMarkers(
+      EstimatePoseSingleMarkers(
           marker_corners, square_length_, calibration_.CameraIntrinsics(),
-          calibration_.CameraDistCoeffs(), rvecs, tvecs);
+          calibration_.CameraDistCoeffs(), &rvecs, &tvecs);
       DrawTargetPoses(rgb_image, rvecs, tvecs);
       PackPoseResults(rvecs, tvecs, &rvecs_eigen, &tvecs_eigen);
 
@@ -598,9 +620,13 @@ void CharucoExtractor::ProcessImage(
       // Extract the diamonds associated with the markers
       std::vector<cv::Vec4i> diamond_ids;
       std::vector<std::vector<cv::Point2f>> diamond_corners;
-      cv::aruco::detectCharucoDiamond(rgb_image, marker_corners, marker_ids,
-                                      square_length_ / marker_length_,
-                                      diamond_corners, diamond_ids);
+      // detectCharucoDiamond() is now a CharucoDetector method, and takes the
+      // square/marker lengths via a 3x3 board rather than as a ratio.
+      const cv::aruco::CharucoBoard diamond_board(
+          cv::Size(3, 3), square_length_, marker_length_, *dictionary_);
+      const cv::aruco::CharucoDetector diamond_detector(diamond_board);
+      diamond_detector.detectDiamonds(rgb_image, diamond_corners, diamond_ids,
+                                      marker_corners, marker_ids);
 
       // Check that we have an acceptable number of diamonds detected.
       // Should be at least one, and no more than FLAGS_max_diamonds.
@@ -628,9 +654,9 @@ void CharucoExtractor::ProcessImage(
           // true
           valid = true;
           std::vector<cv::Vec3d> rvecs, tvecs;
-          cv::aruco::estimatePoseSingleMarkers(
+          EstimatePoseSingleMarkers(
               diamond_corners, square_length_, calibration_.CameraIntrinsics(),
-              calibration_.CameraDistCoeffs(), rvecs, tvecs);
+              calibration_.CameraDistCoeffs(), &rvecs, &tvecs);
 
           DrawTargetPoses(rgb_image, rvecs, tvecs);
           PackPoseResults(rvecs, tvecs, &rvecs_eigen, &tvecs_eigen);

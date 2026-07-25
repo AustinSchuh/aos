@@ -5,8 +5,6 @@
 #include "Eigen/Dense"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
-#include "opencv2/aruco.hpp"
-#include "opencv2/aruco/charuco.hpp"
 #include "opencv2/calib3d.hpp"
 #include "opencv2/core/eigen.hpp"
 #include "opencv2/highgui/highgui.hpp"

@@ -44,6 +44,7 @@ cc_binary(
         "//aos/events:simulated_event_loop",
         "//aos/events/logging:log_reader",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
     ],
 )
 
@@ -157,7 +158,6 @@ cc_library(
     hdrs = [
         "charuco_lib.h",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         ":vision_fbs",
@@ -210,6 +210,7 @@ cc_library(
         "//frc/wpilib:imu_batch_fbs",
         "//frc/wpilib:imu_fbs",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "@ceres-solver//:ceres",
         "@com_github_foxglove_schemas//:CompressedImage_schema",
         "@com_github_foxglove_schemas//:ImageAnnotations_schema",
@@ -323,6 +324,7 @@ cc_binary(
         "//aos:init",
         "//frc/vision:visualize_robot",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "@ceres-solver//:ceres",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
@@ -439,7 +441,6 @@ cc_library(
     hdrs = [
         "intrinsics_calibration_lib.h",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":vision_fbs",
         "//aos/events:event_loop",
@@ -449,6 +450,7 @@ cc_library(
         "//frc/wpilib:imu_batch_fbs",
         "//frc/wpilib:imu_fbs",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/log:die_if_null",
@@ -528,6 +530,7 @@ cc_test(
         "//aos/testing:random_seed",
         "//aos/util:math",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "@bazel_tools//tools/cpp/runfiles",
     ],
 )
@@ -593,6 +596,7 @@ cc_library(
         "//frc/vision:target_mapper",
         "//frc/vision:vision_util_lib",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "@eigen",
     ],
 )

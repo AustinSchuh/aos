@@ -7,14 +7,11 @@
 #include "Eigen/Dense"
 #include "Eigen/Geometry"
 #include "absl/types/span.h"
+#include "opencv2/calib3d.hpp"
+#include "opencv2/objdetect/aruco_detector.hpp"
+#include "opencv2/objdetect/charuco_detector.hpp"
 
 #include "ImageAnnotations_generated.h"
-#if CV_VERSION_MINOR >= 9
-#include "opencv2/aruco/aruco_calib.hpp"
-#endif
-#include "opencv2/aruco/charuco.hpp"
-#include "opencv2/calib3d.hpp"
-
 #include "aos/events/event_loop.h"
 #include "aos/network/message_bridge_server_generated.h"
 #include "frc/vision/calibration_generated.h"

@@ -7,7 +7,6 @@
 #include "absl/log/log.h"
 #include "absl/strings/str_format.h"
 #include "opencv2/calib3d.hpp"
-#include "opencv2/highgui/highgui.hpp"
 #include "opencv2/imgproc.hpp"
 
 #include "aos/events/shm_event_loop.h"

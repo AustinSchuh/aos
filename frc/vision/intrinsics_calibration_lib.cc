@@ -493,11 +493,38 @@ void IntrinsicsCalibration::MaybeCalibrate() {
     // correct values
     cv::TermCriteria term_crit = cv::TermCriteria(
         cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 10000, 1e-12);
-    reprojection_error_ = cv::aruco::calibrateCameraCharuco(
-        all_charuco_corners_, all_charuco_ids_, charuco_extractor_.board(),
-        image_size_, camera_mat_, dist_coeffs_, rvecs_, tvecs_,
-        std_deviations_intrinsics, std_deviations_extrinsics, per_view_errors,
-        calibration_flags, term_crit);
+    // cv::aruco::calibrateCameraCharuco() is gone in the objdetect API.  All
+    // it did was match each view's charuco corners against the board and then
+    // hand the resulting correspondences to calibrateCamera(), so do that
+    // directly.
+    std::vector<std::vector<cv::Point3f>> all_object_points;
+    std::vector<std::vector<cv::Point2f>> all_image_points;
+    all_object_points.reserve(all_charuco_corners_.size());
+    all_image_points.reserve(all_charuco_corners_.size());
+    for (size_t view = 0; view < all_charuco_corners_.size(); ++view) {
+      std::vector<cv::Point3f> object_points;
+      std::vector<cv::Point2f> image_points;
+      charuco_extractor_.board()->matchImagePoints(all_charuco_corners_[view],
+                                                   all_charuco_ids_[view],
+                                                   object_points, image_points);
+      CHECK_EQ(object_points.size(), image_points.size());
+      // A view whose corners did not match the board contributes nothing, and
+      // calibrateCamera() rejects empty views outright.
+      if (object_points.empty()) {
+        VLOG(1) << "Skipping view " << view << " with no matched board points";
+        continue;
+      }
+      all_object_points.emplace_back(std::move(object_points));
+      all_image_points.emplace_back(std::move(image_points));
+    }
+    CHECK(!all_object_points.empty())
+        << ": No captured view matched the charuco board.";
+
+    reprojection_error_ = cv::calibrateCamera(
+        all_object_points, all_image_points, image_size_, camera_mat_,
+        dist_coeffs_, rvecs_, tvecs_, std_deviations_intrinsics,
+        std_deviations_extrinsics, per_view_errors, calibration_flags,
+        term_crit);
 
     CHECK_LE(reprojection_error_, 5.0)
         << ": Reproduction error is bad-- greater than 5 pixels.";

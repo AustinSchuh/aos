@@ -228,6 +228,13 @@ bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1", repo_name = "com_git
 bazel_dep(name = "lz4", version = "1.9.4")
 bazel_dep(name = "tl-expected", version = "1.1.0", repo_name = "tl-expected")
 bazel_dep(name = "eigen", version = "5.0.1.bcr.1")
+
+# Built from source rather than taken from a sysroot, so that it is available
+# on every platform we build for -- notably OSX, where there is no sysroot to
+# take it from.  Pinned to 4.x deliberately: the aruco/charuco detectors we use
+# live in objdetect from 4.7 onwards, and 4.x keeps CV_VERSION_MINOR meaningful
+# for any remaining version checks.
+bazel_dep(name = "opencv", version = "4.13.0.bcr.5")
 bazel_dep(name = "xz", version = "5.4.5.bcr.7")
 single_version_override(
     module_name = "xz",

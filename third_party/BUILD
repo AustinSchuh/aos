@@ -63,6 +63,23 @@ cc_library(
     }),
 )
 
+# OpenCV.  The ORIN keeps using the prebuilt opencv4 out of its sysroot; x86
+# and OSX build it from source out of the BCR module, which is the only way to
+# get it on OSX at all.  Every one of those is >= 4.7, so the aruco/charuco
+# detectors live in objdetect everywhere and we do not need the contrib module.
+#
+# We list the individual BCR modules rather than @opencv//:opencv because the
+# umbrella target pulls in videoio and highgui, and on OSX both are backed by
+# objc_library targets (AVFoundation and Cocoa) which our LLVM toolchain cannot
+# compile.  See :opencv_highgui.
+_OPENCV_BCR_MODULES = [
+    "@opencv//:core",
+    "@opencv//:imgproc",
+    "@opencv//:imgcodecs",
+    "@opencv//:calib3d",
+    "@opencv//:objdetect",
+]
+
 cc_library(
     name = "opencv",
     target_compatible_with = select({
@@ -71,11 +88,43 @@ cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = select({
-        "//tools:arm64_macos": [":unavailable"],
+        "//tools:arm64_macos": _OPENCV_BCR_MODULES,
         "//tools:cpu_arm64": ["@arm64_debian_sysroot//:opencv4"],
-        "//tools:cpu_k8": ["@amd64_debian_sysroot//:opencv4"],
+        "//tools:cpu_k8": _OPENCV_BCR_MODULES,
         "//conditions:default": [":unavailable"],
     }),
+)
+
+# The windowing half of OpenCV (cv::imshow and friends).  Not available on OSX:
+# highgui unconditionally depends on videoio, which there drags in the
+# AVFoundation objc_library.  On x86 this comes from the BCR module with its
+# GTK3 backend turned on (see --@opencv//:with_gtk3 and --@opencv//:gtk3 in
+# .bazelrc); the ORIN's prebuilt opencv4 already contains it.
+cc_library(
+    name = "opencv_highgui",
+    target_compatible_with = select({
+        "//tools:has_msan": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//tools:arm64_macos": [":unavailable"],
+        "//tools:cpu_arm64": ["@arm64_debian_sysroot//:opencv4"],
+        "//tools:cpu_k8": ["@opencv//:highgui"],
+        "//conditions:default": [":unavailable"],
+    }),
+)
+
+# GTK3 for the BCR OpenCV's highgui backend, taken from the sysroot rather than
+# the host.  Referenced by --@opencv//:gtk3.  Only x86 needs it; the ORIN uses
+# its prebuilt opencv4 instead.
+alias(
+    name = "gtk3",
+    actual = select({
+        "//tools:cpu_k8": "@amd64_debian_sysroot//:gtk+-3.0",
+        "//conditions:default": ":unavailable",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(

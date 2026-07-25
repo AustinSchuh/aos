@@ -18,7 +18,6 @@
 #include "frc/vision/visualize_robot.h"
 // clang-format off
 // OpenCV eigen files must be included after Eigen includes
-#include "opencv2/aruco.hpp"
 #include "opencv2/calib3d.hpp"
 #include "opencv2/core/eigen.hpp"
 #include "opencv2/features2d.hpp"
