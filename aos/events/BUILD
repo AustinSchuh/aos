@@ -105,13 +105,26 @@ cc_test(
 )
 
 cc_library(
+    name = "timerfd",
+    srcs = ["timerfd.cc"],
+    hdrs = ["timerfd.h"],
+    # timerfd_* is a Linux syscall family with no equivalent elsewhere.  Aio::Timer
+    # is the cross-platform timer; this only remains for code which needs a timer
+    # as a pollable file descriptor.
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//aos/time",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
+cc_library(
     name = "epoll",
     srcs = [
         "epoll.cc",
-    ] + select({
-        "@platforms//os:linux": ["epoll_linux.cc"],
-        "@platforms//os:macos": ["epoll_darwin.cc"],
-    }),
+    ],
     hdrs = ["epoll.h"],
     visibility = ["//visibility:public"],
     deps = [
@@ -151,6 +164,7 @@ cc_test(
     srcs = ["timerfd_test.cc"],
     deps = [
         ":epoll",
+        ":timerfd",
         "//aos/testing:googletest",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
