@@ -47,8 +47,10 @@ cc_library(
     srcs = [
         "aio.cc",
         "aio_internal.h",
-        "aio_linux.cc",
-    ],
+    ] + select({
+        "@platforms//os:linux": ["aio_linux.cc"],
+        "@platforms//os:macos": ["aio_darwin.cc"],
+    }),
     hdrs = ["aio.h"],
     # Which backend --aio_backend defaults to is a property of the platform,
     # not of the machine that happens to run the build, so it is compiled in
@@ -64,7 +66,6 @@ cc_library(
             "AOS_AIO_DEFAULT_BACKEND=\\\"epoll\\\"",
         ],
     }),
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         "//aos:realtime",
@@ -76,14 +77,19 @@ cc_library(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
-        "@liburing",
-    ],
+    ] + select({
+        "@platforms//os:linux": [
+            "@liburing",
+        ],
+        "@platforms//os:macos": [
+            "//aos/mutex",
+        ],
+    }),
 )
 
 cc_test(
     name = "aio_test",
     srcs = ["aio_test.cc"],
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":aio",
         ":pipe",
@@ -101,10 +107,11 @@ cc_library(
     name = "epoll",
     srcs = [
         "epoll.cc",
-        "epoll_linux.cc",
-    ],
+    ] + select({
+        "@platforms//os:linux": ["epoll_linux.cc"],
+        "@platforms//os:macos": ["epoll_darwin.cc"],
+    }),
     hdrs = ["epoll.h"],
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         ":aio",
@@ -476,7 +483,6 @@ cc_library(
     name = "shm_event_loop",
     srcs = ["shm_event_loop.cc"],
     hdrs = ["shm_event_loop.h"],
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         ":aio",
@@ -506,7 +512,6 @@ cc_test(
     srcs = ["shm_event_loop_test.cc"],
     flaky = True,
     shard_count = 50,
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":event_loop_param_test",
         ":shm_event_loop",
@@ -532,6 +537,7 @@ cc_library(
         "//aos/network:timestamp_schema",
         "//aos/testing:googletest",
     ],
+    alwayslink = True,
 )
 
 cc_test(
