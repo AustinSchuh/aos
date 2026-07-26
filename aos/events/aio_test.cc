@@ -7,6 +7,13 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#else
+#define EPOLLIN 0x01
+#define EPOLLOUT 0x04
+#define EPOLLERR 0x08
+#endif
 
 #include <algorithm>
 #include <array>
@@ -104,6 +111,17 @@ inline void ThrottleOnKernelRingTeardown() {
 #endif
 }
 
+// Delivers a wakeup to the calling thread, the way a ThreadSignalSender on
+// some other thread would.  This is pthread_kill(pthread_self(), ...) spelled
+// portably: ThreadSignalSender is the abstraction that already knows how each
+// platform delivers these (a signal on POSIX, a queued APC-alike on Windows),
+// so tests that just need "wake me" should go through it rather than reach
+// for the POSIX call directly.
+inline void SignalSelf() {
+  aos::ipc_lib::ThreadSignalSender sender;
+  sender.Signal(aos::GetProcessId(), aos::GetThreadId());
+}
+
 // A repeating timer, built the way consumers have to build one now that
 // Aio::Timer is deliberately one-shot (see Aio::Timer::Schedule()):
 // re-schedule from the callback against an absolute grid the caller owns.
@@ -158,7 +176,32 @@ class AioTest : public ::testing::TestWithParam<std::string> {
   // Whether the backend under test is io_uring.  Several tests below cover
   // behavior only it has (SINGLE_ISSUER enforcement, orphaned destruction);
   // they skip elsewhere rather than assert something epoll never promised.
-  static bool IsIoUring() { return GetParam() == "io_uring"; }
+  //
+  // Only Linux has an io_uring backend at all.  Everywhere else --aio_backend
+  // is accepted and ignored -- macOS always runs kqueue, Windows always IOCP --
+  // so the "io_uring" parameter is a second pass over the single backend that
+  // platform has, and none of the io_uring-specific behavior applies to it.
+  static bool IsIoUring() {
+#if defined(__linux__)
+    return GetParam() == "io_uring";
+#else
+    return false;
+#endif
+  }
+
+  // The name the backend under test calls itself by in its messages.  On
+  // Linux the parameter is that name; everywhere else the parameter is
+  // ignored along with --aio_backend, so both passes run the one backend
+  // that platform has and it is that one's name that surfaces.
+  static std::string BackendName() {
+#if defined(__linux__)
+    return GetParam();
+#elif defined(_WIN32)
+    return "iocp";
+#else
+    return "kqueue";
+#endif
+  }
 
   void SetUp() override {
     // Pace ring creation across the whole suite, not just the
@@ -204,9 +247,12 @@ TEST_P(AioTest, BasicPipeReadWrite) {
     }
   }
 
-  // The epoll backend processes exactly one event per Poll() call.  This aligns
-  // with the behavior of epoll_linux.cc.
+  // The epoll/kqueue backend processes exactly one event per Poll() call.
+#if defined(__linux__)
   EXPECT_EQ(count, IsIoUring() ? 1 : 2);
+#else
+  EXPECT_EQ(count, 2);
+#endif
   EXPECT_STREQ(read_buf, "Hello io_uring!");
 }
 
@@ -342,6 +388,169 @@ TEST_P(AioTest, ThreadSignalTest) {
 
   signaler.join();
   aio.UnregisterThreadSignalReceiver(&sfd);
+}
+
+// Two independent Aio loops, each driven by its own thread, each with its own
+// ThreadSignalReceiver.  Nothing here is shared between them, so each has to
+// wake for its own signal and neither may be blocked by the other.
+//
+// The signal side is where the platforms actually differ.  On Linux each
+// receiver owns a signalfd and ThreadSignalSender::Signal() targets a thread,
+// so a wakeup reaches exactly one loop.  macOS has no per-thread target:
+// Signal() falls back to kill(pid), and EVFILT_SIGNAL fires on every kqueue in
+// the process watching that signal -- so both loops wake for either signal.
+// That is allowed (thread_signal.h documents wakeups as possibly spurious) and
+// this test is written to hold either way: it requires that each loop sees its
+// own wakeup, not that it sees only its own.
+TEST_P(AioTest, TwoLoopsOnTwoThreadsTest) {
+  ScopedDeathTestWatchdog watchdog;
+
+  struct Loop {
+    Aio aio;
+    aos::ipc_lib::ThreadSignalReceiver receiver;
+    std::atomic<int> wakeups{0};
+    std::atomic<pid_t> tid{0};
+    std::atomic<bool> ready{false};
+  };
+  Loop a, b;
+
+  const auto pid = aos::GetProcessId();
+
+  auto run = [](Loop *loop) {
+    loop->tid.store(aos::GetThreadId());
+    loop->aio.RegisterThreadSignalReceiver(&loop->receiver,
+                                           [loop]() { ++loop->wakeups; });
+    loop->ready.store(true);
+    while (loop->aio.should_run() && loop->aio.Poll(true)) {
+    }
+    loop->aio.UnregisterThreadSignalReceiver(&loop->receiver);
+  };
+
+  std::thread thread_a([&]() { run(&a); });
+  std::thread thread_b([&]() { run(&b); });
+  while (!a.ready.load() || !b.ready.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  aos::ipc_lib::ThreadSignalSender sender;
+  // Each loop must see its own wakeup.  Re-sending covers the startup race
+  // where a signal lands before the receiver's watch is armed.
+  for (int i = 0; i < 100 && (a.wakeups.load() == 0 || b.wakeups.load() == 0);
+       ++i) {
+    if (a.wakeups.load() == 0) sender.Signal(pid, a.tid.load());
+    if (b.wakeups.load() == 0) sender.Signal(pid, b.tid.load());
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  EXPECT_GT(a.wakeups.load(), 0) << "The first loop never woke.";
+  EXPECT_GT(b.wakeups.load(), 0) << "The second loop never woke.";
+
+  a.aio.Quit();
+  b.aio.Quit();
+  thread_a.join();
+  thread_b.join();
+}
+
+// One loop unregistering must not stop the other one waking.
+//
+// Two things could break it, and they are worth naming because neither is
+// visible from a single-loop test.  The wakeup disposition is process-wide on
+// macOS (kWakeupSignal is SIG_IGN there, not blocked, because blocking is
+// per-thread and the sender is a process-directed kill(2)) -- so restoring it
+// on the first unregister rather than the last would leave the survivor's next
+// wakeup hitting the default action.  And the kqueue backend leaves its
+// EVFILT_SIGNAL knote armed across an unregister, so the two loops' knotes have
+// to be independent rather than one being able to consume the other's.
+TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
+  ScopedDeathTestWatchdog watchdog;
+
+  struct Loop {
+    Aio aio;
+    // Held by pointer so one can be destroyed while the other lives, which is
+    // what puts the shared disposition's refcount under test.
+    std::unique_ptr<aos::ipc_lib::ThreadSignalReceiver> receiver =
+        std::make_unique<aos::ipc_lib::ThreadSignalReceiver>();
+    std::atomic<int> wakeups{0};
+    std::atomic<pid_t> tid{0};
+    std::atomic<bool> ready{false};
+    std::atomic<bool> unregister{false};
+    std::atomic<bool> unregistered{false};
+  };
+  Loop a, b;
+  const auto pid = aos::GetProcessId();
+
+  auto run = [](Loop *loop) {
+    loop->tid.store(aos::GetThreadId());
+    loop->aio.RegisterThreadSignalReceiver(loop->receiver.get(),
+                                           [loop]() { ++loop->wakeups; });
+    loop->ready.store(true);
+    while (loop->aio.should_run() && loop->aio.Poll(true)) {
+      if (loop->unregister.load() && !loop->unregistered.load()) {
+        loop->aio.UnregisterThreadSignalReceiver(loop->receiver.get());
+        // Destroyed, not merely unregistered: on macOS the SIG_IGN
+        // disposition is process-wide and shared, and it is the receiver's
+        // destructor that gives it up.  Restoring it here rather than when
+        // the last receiver goes would leave the survivor's next wakeup
+        // hitting the default action, which terminates the process.
+        loop->receiver.reset();
+        loop->unregistered.store(true);
+      }
+    }
+    if (!loop->unregistered.load()) {
+      loop->aio.UnregisterThreadSignalReceiver(loop->receiver.get());
+    }
+  };
+
+  std::thread thread_a([&]() { run(&a); });
+  std::thread thread_b([&]() { run(&b); });
+  while (!a.ready.load() || !b.ready.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  aos::ipc_lib::ThreadSignalSender sender;
+
+  // Retire a's receiver.  Poll() is what performs it, so a needs a wakeup to
+  // get there.
+  a.unregister.store(true);
+  for (int i = 0; i < 200 && !a.unregistered.load(); ++i) {
+    sender.Signal(pid, a.tid.load());
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(a.unregistered.load()) << "the first loop never unregistered";
+
+  // Everything b saw up to here is irrelevant; the question is whether it can
+  // still be woken now that a is gone -- repeatedly, not once, and while a is
+  // still polling as fast as it can.
+  //
+  // a keeps running after unregistering, so it keeps observing the wakeups
+  // its knote is still armed for.  What must not happen is a consuming them
+  // on b's behalf: this platform delivers a wakeup by signalling the whole
+  // process, so every loop sees every wakeup, and the two loops' knotes have
+  // to be independent counters rather than views onto one queue.  A backend
+  // that shared them -- or that drained something process-wide on a's behalf
+  // -- would starve b here while a spun happily.
+  b.wakeups.store(0);
+  int seen = 0;
+  for (int round = 0; round < 5; ++round) {
+    const int before = b.wakeups.load();
+    bool woke = false;
+    for (int i = 0; i < 200 && !woke; ++i) {
+      sender.Signal(pid, b.tid.load());
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      woke = b.wakeups.load() > before;
+    }
+    if (!woke) break;
+    ++seen;
+  }
+  EXPECT_EQ(seen, 5)
+      << "the surviving loop stopped waking once its peer unregistered; it "
+         "got "
+      << seen << " of 5 wakeups while the peer kept polling";
+
+  a.aio.Quit();
+  b.aio.Quit();
+  thread_a.join();
+  thread_b.join();
 }
 
 // Tests that a registered ThreadSignalReceiver callback is successfully invoked
@@ -744,6 +953,7 @@ TEST_P(AioTest, DuplicateRegistrationDeathTest) {
 // dispatch, as EPoll always has -- here EnableWritable() on an fd registered
 // only OnReadable.  Silently skipping it instead would spin on the
 // unconsumable level-triggered event.
+//
 TEST_P(AioTest, EnabledEventWithNoHandlerDeathTest) {
   Aio aio;
   Pipe pipe;
@@ -1150,7 +1360,7 @@ TEST_P(AioTest, FailedIoErrorTest) {
   ASSERT_TRUE(fired_status.has_value());
   EXPECT_FALSE(aos::IsOk(*fired_status));
   // Each backend names itself in its operational-failure message.
-  EXPECT_EQ(fired_status->error().message(), GetParam() + " error");
+  EXPECT_EQ(fired_status->error().message(), BackendName() + " error");
   EXPECT_EQ(result_code, EBADF);
 }
 
@@ -1215,6 +1425,37 @@ TEST_P(AioTest, LegacyHandlerAfterCancelBeforeDispatchDeathTest) {
         aio.OnReadable(pipe.read_fd(), []() {});
       },
       "Cannot mix OnReadable and AsyncRead");
+}
+
+// The same window, seen from the request rather than the fd.  Cancel()
+// detaches the request from its registration, but the Canceled completion is
+// not delivered until the next Poll(), so the request is still in flight and
+// re-arming it is the same misuse as re-arming one that never finished.
+//
+// Nothing caught it: the registration walk cannot see the request, because the
+// cancel is exactly what cleared read_req.  It matters because the list the
+// request is waiting on is intrusive and threaded through
+// AsyncRequest::internal_state, and shares its links with the sync-completion
+// list besides (see AioState::link) -- so arming it again clears the link to
+// whatever was behind it, and those completions never arrive.
+//
+// A second fd, so that the per-fd "Duplicate AsyncRead on fd" check is not
+// what does the catching.  Everything inside the child, as
+// DoubleSubmitDeathTest explains.
+TEST_P(AioTest, ResubmitAfterCancelBeforeDispatchDeathTest) {
+  EXPECT_DEATH(
+      {
+        Aio aio;
+        Pipe first;
+        Pipe second;
+        AsyncRequest req;
+        char buf[8];
+        aio.AsyncRead(first.read_fd(), buf, &req);
+        aio.Cancel(&req);
+        // No Poll() in between, so the Canceled completion is still queued.
+        aio.AsyncRead(second.read_fd(), buf, &req);
+      },
+      "still in flight");
 }
 
 // ...and once that completion is dispatched, the fd is free again.
@@ -2566,7 +2807,7 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
     // (Under DEFER_TASKRUN nothing posts until the next Poll() enters the
     // kernel; the CQ overflows there, in wake order.)
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+    SignalSelf();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Poll() dispatches one user-visible completion (one timer callback)
@@ -2653,7 +2894,7 @@ TEST_P(AioTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
     // its terminal completion is what makes the in-callback unregister
     // take the fast path.
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+    SignalSelf();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     const auto deadline_stop =
@@ -2764,7 +3005,6 @@ TEST_P(AioTest, DowngradeReArmsActiveTimers) {
   EXPECT_EQ(fired, kTimers);
 }
 
-#if defined(__linux__)
 // A Timer must be destroyed before its Aio: ~Timer dereferences the Aio's
 // impl, so a Timer outliving its Aio is a use-after-free.  The destructor
 // CHECKs active timers so the bug dies loudly at the Aio instead.
@@ -2829,6 +3069,133 @@ TEST_P(AioTest, TimerCompletionUserDataIsNull) {
   EXPECT_EQ(result.user_data, nullptr);
 }
 
+// Pins the coalescing contract from Aio::RegisterThreadSignalReceiver()'s
+// docs: every pending wakeup is consumed first, then the callback runs
+// exactly once.  kWakeupSignal is a realtime signal, so the three sends
+// below genuinely queue three pending siginfos; a per-signal dispatch
+// would invoke the callback three times.
+TEST_P(AioTest, PendingWakeupsCoalesceIntoOneCallback) {
+  Aio aio;
+  aos::ipc_lib::ThreadSignalReceiver sfd;
+
+  // Bind and enable the loop before queueing the signals, so delivery
+  // happens through the armed receiver rather than at registration time.
+  aio.Poll(false);
+  int count = 0;
+  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+
+  for (int i = 0; i < 3; ++i) {
+    SignalSelf();
+  }
+
+  while (count == 0 && aio.Poll(true)) {
+  }
+  // Drain any further deliveries the backend queued for the same burst.
+  const auto deadline_stop =
+      aos::monotonic_clock::now() + std::chrono::milliseconds(200);
+  while (aos::monotonic_clock::now() < deadline_stop) {
+    if (!aio.Poll(false)) break;
+  }
+  EXPECT_EQ(count, 1);
+  aio.UnregisterThreadSignalReceiver(&sfd);
+}
+
+// Pins the contract from Aio::RegisterThreadSignalReceiver()'s docs: once
+// UnregisterThreadSignalReceiver() returns, the signalfd is the caller's
+// again -- a wakeup that was still kernel-side at unregister time is
+// discarded without reading the fd, so a successor receiver registered on
+// the same fd owns every pending signal.
+TEST_P(AioTest, SuccessorReceiverOwnsPendingWakeups) {
+  Aio aio;
+  aos::ipc_lib::ThreadSignalReceiver sfd;
+
+  // Enable the loop, then arm a wakeup while nothing polls: the first
+  // receiver's kernel-side poll fires, but its completion is never
+  // dispatched before the unregister.
+  aio.Poll(false);
+  aio.RegisterThreadSignalReceiver(&sfd, []() {});
+  SignalSelf();
+  aio.UnregisterThreadSignalReceiver(&sfd);
+
+  int count = 0;
+  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+  const auto deadline_stop =
+      aos::monotonic_clock::now() + std::chrono::seconds(2);
+  while (count == 0 && aos::monotonic_clock::now() < deadline_stop) {
+    aio.Poll(false);
+  }
+  EXPECT_EQ(count, 1) << "the unregistered receiver consumed the wakeup";
+  aio.UnregisterThreadSignalReceiver(&sfd);
+}
+
+// The same ownership rule, but with the loop running in between.
+//
+// SuccessorReceiverOwnsPendingWakeups above never polls between the
+// unregister and the successor's registration, so a backend can satisfy it by
+// leaving the wakeup wherever the kernel put it.  A loop that keeps polling --
+// which is the normal case, since unregistering does not stop the loop -- gives
+// the backend a chance to observe the wakeup with nobody to hand it to, and
+// dropping it there loses it just as thoroughly as consuming it early.  The
+// signalfd backends are immune by construction: an unregistered signalfd stops
+// being polled at all, so nothing can consume what is queued in it.
+TEST_P(AioTest, SuccessorReceiverOwnsWakeupObservedWhileUnregistered) {
+  Aio aio;
+  aos::ipc_lib::ThreadSignalReceiver sfd;
+
+  aio.Poll(false);
+  aio.RegisterThreadSignalReceiver(&sfd, []() {});
+  SignalSelf();
+  aio.UnregisterThreadSignalReceiver(&sfd);
+
+  // Poll with nothing registered.  The backend is allowed to notice the
+  // wakeup here; it is not allowed to forget it.
+  for (int i = 0; i < 4; ++i) {
+    aio.Poll(false);
+  }
+
+  int count = 0;
+  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+  const auto deadline_stop =
+      aos::monotonic_clock::now() + std::chrono::seconds(2);
+  while (count == 0 && aos::monotonic_clock::now() < deadline_stop) {
+    aio.Poll(false);
+  }
+  EXPECT_EQ(count, 1) << "the wakeup was dropped while no receiver was "
+                         "registered";
+  aio.UnregisterThreadSignalReceiver(&sfd);
+}
+
+// A receiver callback that unregisters its own receiver keeps executing
+// after UnregisterThreadSignalReceiver() returns -- so the std::function
+// (and its captures) must not be destroyed out from under it.  The old
+// implementation assigned nullptr to the executing function; with a
+// heap-allocated capture this is a use-after-free ASAN catches.
+TEST_P(AioTest, ReceiverCallbackCapturesSurviveSelfUnregister) {
+  Aio aio;
+  aos::ipc_lib::ThreadSignalReceiver sfd;
+
+  const std::string canary(64, 'x');  // Big enough to defeat SSO.
+  bool checked = false;
+  aio.RegisterThreadSignalReceiver(&sfd, [&aio, &sfd, canary, &checked]() {
+    if (checked) return;
+    checked = true;
+    aio.UnregisterThreadSignalReceiver(&sfd);
+    // The capture must still be alive after the unregister.
+    EXPECT_EQ(canary, std::string(64, 'x'));
+  });
+
+  SignalSelf();
+  while (!checked && aio.Poll(true)) {
+  }
+  EXPECT_TRUE(checked);
+}
+
+// The two tests below are Linux-only, each for a concrete reason rather than
+// by default: SetEventsUntranslatedMaskKeepsRegistration needs EPOLLHUP (the
+// fallbacks at the top of this file cover IN/OUT/ERR but not HUP), and
+// StaleEventBitsDoNotReachReusedFdNumber close()s a FileDescriptor, which is
+// a HANDLE off POSIX.
+#if defined(__linux__)
 // A SetEvents() mask made only of bits the epoll translation drops (like
 // EPOLLHUP, which the kernel always reports and never accepts in a mask)
 // must keep the fd registered, exactly as EPoll::DoEpollCtl() keyed its
@@ -2858,90 +3225,6 @@ TEST_P(AioTest, SetEventsUntranslatedMaskKeepsRegistration) {
     aio.Poll(false);
   }
   EXPECT_EQ(events_seen, 1);
-}
-
-// Pins the coalescing contract from Aio::RegisterThreadSignalReceiver()'s
-// docs: every pending wakeup is consumed first, then the callback runs
-// exactly once.  kWakeupSignal is a realtime signal, so the three sends
-// below genuinely queue three pending siginfos; a per-signal dispatch
-// would invoke the callback three times.
-TEST_P(AioTest, PendingWakeupsCoalesceIntoOneCallback) {
-  Aio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
-
-  // Bind and enable the loop before queueing the signals, so delivery
-  // happens through the armed receiver rather than at registration time.
-  aio.Poll(false);
-  int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
-
-  for (int i = 0; i < 3; ++i) {
-    pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
-  }
-
-  while (count == 0 && aio.Poll(true)) {
-  }
-  // Drain any further deliveries the backend queued for the same burst.
-  const auto deadline_stop =
-      aos::monotonic_clock::now() + std::chrono::milliseconds(200);
-  while (aos::monotonic_clock::now() < deadline_stop) {
-    if (!aio.Poll(false)) break;
-  }
-  EXPECT_EQ(count, 1);
-  aio.UnregisterThreadSignalReceiver(&sfd);
-}
-
-// Pins the contract from Aio::RegisterThreadSignalReceiver()'s docs: once
-// UnregisterThreadSignalReceiver() returns, the signalfd is the caller's
-// again -- a wakeup that was still kernel-side at unregister time is
-// discarded without reading the fd, so a successor receiver registered on
-// the same fd owns every pending signal.
-TEST_P(AioTest, SuccessorReceiverOwnsPendingWakeups) {
-  Aio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
-
-  // Enable the loop, then arm a wakeup while nothing polls: the first
-  // receiver's kernel-side poll fires, but its completion is never
-  // dispatched before the unregister.
-  aio.Poll(false);
-  aio.RegisterThreadSignalReceiver(&sfd, []() {});
-  pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
-  aio.UnregisterThreadSignalReceiver(&sfd);
-
-  int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
-  const auto deadline_stop =
-      aos::monotonic_clock::now() + std::chrono::seconds(2);
-  while (count == 0 && aos::monotonic_clock::now() < deadline_stop) {
-    aio.Poll(false);
-  }
-  EXPECT_EQ(count, 1) << "the unregistered receiver consumed the wakeup";
-  aio.UnregisterThreadSignalReceiver(&sfd);
-}
-
-// A receiver callback that unregisters its own receiver keeps executing
-// after UnregisterThreadSignalReceiver() returns -- so the std::function
-// (and its captures) must not be destroyed out from under it.  The old
-// implementation assigned nullptr to the executing function; with a
-// heap-allocated capture this is a use-after-free ASAN catches.
-TEST_P(AioTest, ReceiverCallbackCapturesSurviveSelfUnregister) {
-  Aio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
-
-  const std::string canary(64, 'x');  // Big enough to defeat SSO.
-  bool checked = false;
-  aio.RegisterThreadSignalReceiver(&sfd, [&aio, &sfd, canary, &checked]() {
-    if (checked) return;
-    checked = true;
-    aio.UnregisterThreadSignalReceiver(&sfd);
-    // The capture must still be alive after the unregister.
-    EXPECT_EQ(canary, std::string(64, 'x'));
-  });
-
-  pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
-  while (!checked && aio.Poll(true)) {
-  }
-  EXPECT_TRUE(checked);
 }
 
 // A callback that deletes its own fd, closes it, and registers a fresh fd
@@ -3384,8 +3667,12 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTest) {
   int count = 0;
   aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
 
-  // Send kWakeupSignal to our thread.
-  pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+  const auto pid = aos::GetProcessId();
+  const auto tid = aos::GetThreadId();
+  aos::ipc_lib::ThreadSignalSender signaler_signal;
+
+  // Send kWakeupSignal.
+  signaler_signal.Signal(pid, tid);
 
   // Poll until the signal is handled.
   while (count == 0 && aio.Poll(true)) {
@@ -3396,7 +3683,7 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTest) {
   aio.UnregisterThreadSignalReceiver(&sfd);
 
   // Send the signal again.
-  pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+  signaler_signal.Signal(pid, tid);
 
   // Clean up the pending wakeup so it doesn't stay pending.
   sfd.ConsumeWakeup();
@@ -3450,13 +3737,17 @@ TEST_P(AioTest, ForkDeathTest) {
   aio.OnEvents(pipe.write_fd(), [&](uint32_t events) {
     EXPECT_TRUE(events & EPOLLOUT);
     ++fd_count;
+    aio.SetEvents(pipe.write_fd(), 0);
   });
 
   aio.SetEvents(pipe.write_fd(), EPOLLOUT);
 
   EXPECT_EXIT(
       {
-        pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+        const auto pid = aos::GetProcessId();
+        const auto tid = aos::GetThreadId();
+        aos::ipc_lib::ThreadSignalSender signaler_signal;
+        signaler_signal.Signal(pid, tid);
         while ((signal_count == 0 || fd_count == 0) && aio.Poll(true)) {
         }
         if (signal_count == 1 && fd_count == 1) {
@@ -3686,6 +3977,56 @@ TEST_P(AioTest, WakeupSurvivesAChildConsumingItTest) {
 }
 #endif  // !_WIN32
 
+// Kqueue-only, for a concrete reason rather than by default: the delivery
+// path it exercises exists on no other backend.  Rebuilding the EVFILT_SIGNAL
+// knote after a fork leaves a window the backend cannot see into, so it
+// conservatively queues one synthetic wakeup rather than risk swallowing a
+// real one (see signal_wakeup_pending_after_fork_).  The Linux backends
+// re-arm their persistent signal poll instead and have nothing to replay, so
+// the callback simply never fires in the child there and the test cannot say
+// anything.
+//
+// The rule this depends on -- unregistering from inside the callback must not
+// free the std::function that is running -- is checked on every backend by
+// ReceiverCallbackCapturesSurviveSelfUnregister above.  Only the second
+// delivery path is macOS-specific.
+#if defined(__APPLE__)
+// A receiver that unregisters from inside its own callback has to survive it
+// on every path that delivers that callback, not just the usual one.
+//
+// The kqueue backend has two: the ordinary EVFILT_SIGNAL dispatch, and a
+// replay of the wakeup a fork may have swallowed, queued when the child
+// rebuilds its kernel state.  Unregister defers clearing the std::function
+// until the callback returns, and it can only do that if the delivery path
+// told it a callback was running -- a path that forgets destroys the
+// std::function while it is executing and crashes on the way out of it.
+TEST_P(AioTest, UnregisterReceiverFromPostForkWakeupTest) {
+  Aio aio;
+  ipc_lib::ThreadSignalReceiver sfd;
+
+  // Captured by value and touched after the unregister, so that freeing the
+  // std::function early is a read of freed memory rather than a no-op.
+  auto payload = std::make_shared<std::string>(std::string(256, 'x'));
+  int fired = 0;
+
+  aio.RegisterThreadSignalReceiver(&sfd, [&aio, &sfd, payload, &fired]() {
+    ++fired;
+    aio.UnregisterThreadSignalReceiver(&sfd);
+    ABSL_CHECK_EQ(payload->size(), 256u);
+  });
+
+  EXPECT_EXIT(
+      {
+        // The child's rebuild queues the post-fork wakeup this delivers.
+        aio.Poll(false);
+        exit(fired > 0 ? 42 : 43);
+      },
+      ::testing::ExitedWithCode(42), "");
+
+  aio.UnregisterThreadSignalReceiver(&sfd);
+}
+#endif  // defined(__APPLE__)
+
 TEST_P(AioTest, TimerForkTest) {
   // A timer armed in the parent still fires in a forked child, i.e. the
   // backend re-registers pending timeouts when it recreates the loop.
@@ -3778,7 +4119,7 @@ TEST_P(AioTest, ForkDuringRepeatingTimerDeathTest) {
 }
 
 // Regression test for a kernel quirk in IORING_SETUP_DEFER_TASKRUN rings (see
-// global_parent_fork_count's comment in aio_linux.cc): a repeating timer
+// internal::ParentForkCount()'s comment in aio_unix.h): a repeating timer
 // outstanding in the parent becomes uncancelable after any fork() the parent
 // was party to -- the kernel's cancel/remove lookup returns -ENOENT even
 // though the op is demonstrably still alive and firing.  A plain fork()+exec()
