@@ -8,7 +8,6 @@ package(
 ts_project(
     name = "cpp_plot",
     srcs = ["cpp_plot.ts"],
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         "//aos:configuration_ts_fbs",
         "//aos/analysis:plot_data_utils",
@@ -19,7 +18,6 @@ ts_project(
 rollup_bundle(
     name = "cpp_plot_bundle",
     entry_point = "cpp_plot.js",
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":cpp_plot",
     ],

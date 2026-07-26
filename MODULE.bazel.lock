@@ -338,8 +338,6 @@
     "https://bcr.bazel.build/modules/libpng/1.6.54/source.json": "5a5158d1e62d73ad102d0e36af5e7f79113c91aa387d3ec1796454d857c3c0bf",
     "https://bcr.bazel.build/modules/libtiff/4.7.1/MODULE.bazel": "659a2278f7f3e505e5d1e7a209931afb6f7680dd39dc4f1db7611098a0ded5a9",
     "https://bcr.bazel.build/modules/libtiff/4.7.1/source.json": "69ca9e7edebd8a9d7ed8dc7560ca48d5d308d0a63acc8ee0b2f6f412c81bec0b",
-    "https://bcr.bazel.build/modules/liburing/2.14.bcr.1/MODULE.bazel": "6dfe9d6f9aa07421b5ddf9743b60bc12832857113b7a0eac2d89bd092cfc5544",
-    "https://bcr.bazel.build/modules/liburing/2.14.bcr.1/source.json": "43241c7a333296e208e0a21629763b30142aae53de3f34cebb323de39d2a0165",
     "https://bcr.bazel.build/modules/libwebp/1.6.0/MODULE.bazel": "b541e9026102a85fa3b5ec890e20f186e1664a06ab0f876bbfb3165f81c9b5df",
     "https://bcr.bazel.build/modules/libwebp/1.6.0/source.json": "ff540383b07271ba7d1a3ebe332dd0910a92dc13cd16e525305205526559ee6f",
     "https://bcr.bazel.build/modules/lz4/1.9.4/MODULE.bazel": "e3d307b1d354d70f6c809167eafecf5d622c3f27e3971ab7273410f429c7f83a",

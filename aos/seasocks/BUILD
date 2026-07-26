@@ -13,7 +13,6 @@ cc_library(
     name = "seasocks_logger",
     srcs = ["seasocks_logger.cc"],
     hdrs = ["seasocks_logger.h"],
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         "//third_party/seasocks",
