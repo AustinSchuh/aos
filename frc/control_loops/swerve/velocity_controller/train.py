@@ -6,9 +6,9 @@ import time
 import collections
 from absl import logging
 import flax
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 from matplotlib import pyplot
 from flax import linen as nn
 from flax.training import train_state

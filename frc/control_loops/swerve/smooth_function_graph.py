@@ -2,9 +2,9 @@
 
 import numpy
 import scipy
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 import matplotlib.pyplot as plt
 from scipy.special import logsumexp
 

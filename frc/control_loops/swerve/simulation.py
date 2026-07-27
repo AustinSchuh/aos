@@ -6,9 +6,9 @@ import scipy.integrate
 from frc.control_loops.python import control_loop
 from frc.control_loops.python import controls
 
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 from matplotlib import pylab
 import sys
 import gflags

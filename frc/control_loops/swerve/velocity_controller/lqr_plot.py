@@ -19,9 +19,9 @@ os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 import absl
 from absl import logging
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 from matplotlib.animation import FuncAnimation
 from matplotlib import pylab
 import numpy

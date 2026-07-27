@@ -80,6 +80,7 @@ py_binary(
     deps = [
         ":controls",
         ":python_init",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//pygobject",
     ],
@@ -94,6 +95,7 @@ py_library(
     deps = [
         ":controls",
         ":python_init",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//pygobject",
     ],
@@ -152,6 +154,17 @@ py_library(
 )
 
 py_library(
+    name = "matplotlib_backend",
+    srcs = ["matplotlib_backend.py"],
+    target_compatible_with = ["//tools/platforms/python:has_support"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":python_init",
+        "@pip_deps//matplotlib",
+    ],
+)
+
+py_library(
     name = "linear_system",
     srcs = ["linear_system.py"],
     target_compatible_with = ["//tools/platforms/python:has_support"],
@@ -160,6 +173,7 @@ py_library(
         ":controls",
         "//aos/util:py_trapezoid_profile",
         "//frc/control_loops:python_init",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//pygobject",
     ],
@@ -174,6 +188,7 @@ py_library(
         ":controls",
         "//aos/util:py_trapezoid_profile",
         "//frc/control_loops:python_init",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//pygobject",
     ],
@@ -188,6 +203,7 @@ py_library(
         ":controls",
         "//aos/util:py_trapezoid_profile",
         "//frc/control_loops:python_init",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//pygobject",
     ],
@@ -260,6 +276,7 @@ py_binary(
     deps = [
         ":python_init",
         "//frc/control_loops/python:controls",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//pygobject",
     ],

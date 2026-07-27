@@ -39,6 +39,7 @@ py_binary(
     deps = [
         ":experience_buffer",
         ":physics",
+        "//frc/control_loops/python:matplotlib_backend",
         "//frc/control_loops/swerve:jax_dynamics",
         "@pip_deps//absl_py",
         "@pip_deps//clu",
@@ -76,6 +77,7 @@ py_binary(
     deps = [
         ":experience_buffer",
         ":physics",
+        "//frc/control_loops/python:matplotlib_backend",
         "//frc/control_loops/swerve:jax_dynamics",
         "@pip_deps//absl_py",
         "@pip_deps//flashbax",
@@ -101,6 +103,7 @@ py_binary(
     deps = [
         ":experience_buffer",
         ":physics",
+        "//frc/control_loops/python:matplotlib_backend",
         "//frc/control_loops/swerve:jax_dynamics",
         "@pip_deps//absl_py",
         "@pip_deps//flashbax",

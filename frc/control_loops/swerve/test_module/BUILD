@@ -9,6 +9,7 @@ py_binary(
     deps = [
         "//frc/control_loops/python:angular_system_current",
         "//frc/control_loops/python:controls",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//glog",
         "@pip_deps//python_gflags",
     ],

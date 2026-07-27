@@ -3,9 +3,9 @@
 # This is a quick script to show the effect of the wheel nonlinearity term on
 # turning rate
 
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 from matplotlib import pylab
 import numpy
 

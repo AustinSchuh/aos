@@ -2,9 +2,9 @@ from frc.control_loops.python import control_loop
 from frc.control_loops.python import controls
 import numpy
 
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 import matplotlib.pyplot as plt
 
 import glog

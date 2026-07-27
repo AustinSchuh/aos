@@ -3,9 +3,9 @@
 from frc.control_loops.swerve import dynamics
 from frc.control_loops.swerve.casadi_velocity_mpc_lib import MPC
 import pickle
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 import matplotlib.pyplot as pyplot
 from matplotlib import pylab
 import numpy

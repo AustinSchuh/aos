@@ -2,9 +2,9 @@
 from absl import app
 from frc.control_loops.swerve import dynamics
 from absl import flags
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 from matplotlib import pylab
 import sys, os, pickle
 from multiprocessing.pool import ThreadPool

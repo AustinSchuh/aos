@@ -63,6 +63,7 @@ py_binary(
     ],
     deps = [
         "//frc/control_loops/python:controls",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//numpy",
         "@pip_deps//pygobject",
@@ -315,6 +316,7 @@ py_binary(
     ],
     deps = [
         ":casadi_velocity_mpc_lib",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//absl_py",
         "@pip_deps//matplotlib",
         "@pip_deps//numpy",
@@ -397,6 +399,7 @@ py_binary(
         "smooth_function_graph.py",
     ],
     deps = [
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//matplotlib",
         "@pip_deps//numpy",
         "@pip_deps//pygobject",
@@ -410,6 +413,7 @@ py_binary(
     data = [":casadi_velocity_mpc"],
     deps = [
         ":dynamics",
+        "//frc/control_loops/python:matplotlib_backend",
         "@pip_deps//absl_py",
         "@pip_deps//matplotlib",
         "@pip_deps//numpy",

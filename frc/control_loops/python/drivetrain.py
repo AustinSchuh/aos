@@ -5,9 +5,9 @@ from frc.control_loops.python import controls
 import numpy
 import math
 import sys
-import matplotlib
+from frc.control_loops.python import matplotlib_backend
 
-matplotlib.use("GTK3Agg")
+matplotlib_backend.use_interactive()
 from matplotlib import pylab
 import glog
 
