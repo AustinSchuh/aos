@@ -1,6 +1,12 @@
 #ifndef FRC_WPILIB_NEWROBOTBASE_H_
 #define FRC_WPILIB_NEWROBOTBASE_H_
 
+#include <functional>
+#include <memory>
+#include <thread>
+#include <utility>
+#include <vector>
+
 #include "aos/events/shm_event_loop.h"
 #include "aos/init.h"
 #include "aos/logging/logging.h"
@@ -12,23 +18,20 @@ class WPILibRobotBase {
  public:
   virtual void Run() = 0;
 
-  // Runs all the loops.
+  // Runs all the loops, each on its own thread (the first on the calling
+  // thread, to save a thread's worth of memory).  Returns once every loop's
+  // Run() has returned.
   void RunLoops() {
     // TODO(austin): SIGINT handler calling Exit on all the loops.
     // TODO(austin): RegisterSignalHandler in ShmEventLoop for others.
-
-    ::std::vector<::std::thread> threads;
-    for (size_t i = 1; i < loops_.size(); ++i) {
-      threads.emplace_back([this, i]() {
-        LOG(INFO) << "Starting " << loops_[i]->name() << " with priority "
-                  << loops_[i]->runtime_realtime_priority();
-        loops_[i]->Run();
-      });
+    if (loop_factories_.empty()) {
+      LOG(FATAL) << "RunLoops() called with no loops added.";
     }
-    LOG(INFO) << "Starting " << loops_[0]->name() << " with priority "
-              << loops_[0]->runtime_realtime_priority();
-    // Save some memory and run the last one in the main thread.
-    loops_[0]->Run();
+    ::std::vector<::std::thread> threads;
+    for (size_t i = 1; i < loop_factories_.size(); ++i) {
+      threads.emplace_back([this, i]() { RunOneLoop(loop_factories_[i]); });
+    }
+    RunOneLoop(loop_factories_[0]);
 
     for (::std::thread &thread : threads) {
       thread.join();
@@ -38,12 +41,41 @@ class WPILibRobotBase {
   }
 
  protected:
-  // Adds a loop to the list of loops to run.
-  void AddLoop(::aos::ShmEventLoop *loop) { loops_.push_back(loop); }
+  // Adds a loop to run, expressed as a factory rather than an already-built
+  // loop: the factory is invoked on the same thread that will call Run(),
+  // and the loop it returns is destroyed on that thread too, once Run()
+  // returns.  Construction, Run(), and destruction sharing one thread is
+  // what the io_uring backend needs to keep IORING_SETUP_SINGLE_ISSUER's
+  // deterministic completion delivery (a loop constructed on one thread but
+  // run on another silently downgrades to a less deterministic mode -- see
+  // documentation/adr/0001-aio-io-uring-single-issuer.md), and what AOS's
+  // shared-memory queues require of the senders and watchers registered on
+  // the loop (each must be destroyed on its construction thread, a
+  // kernel-enforced PI-futex property).
+  //
+  // Application objects that must live while the loop runs should be
+  // constructed inside the factory and owned by the loop's own callbacks
+  // (captured in the std::functions registered on it), so they share the
+  // loop's thread-correct lifetime.
+  void AddLoop(
+      ::std::function<::std::unique_ptr<::aos::ShmEventLoop>()> factory) {
+    loop_factories_.push_back(::std::move(factory));
+  }
 
  private:
-  // List of the event loops to run in RunLoops.
-  ::std::vector<::aos::ShmEventLoop *> loops_;
+  static void RunOneLoop(
+      const ::std::function<::std::unique_ptr<::aos::ShmEventLoop>()>
+          &factory) {
+    ::std::unique_ptr<::aos::ShmEventLoop> loop = factory();
+    LOG(INFO) << "Starting " << loop->name() << " with priority "
+              << loop->runtime_realtime_priority();
+    loop->Run();
+    // `loop` is destroyed here, on the thread that constructed and ran it.
+  }
+
+  // Factories for the event loops to run in RunLoops.
+  ::std::vector<::std::function<::std::unique_ptr<::aos::ShmEventLoop>()>>
+      loop_factories_;
 };
 
 #define AOS_ROBOT_CLASS(_ClassName_) \
