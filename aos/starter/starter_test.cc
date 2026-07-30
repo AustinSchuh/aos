@@ -12,7 +12,10 @@
 #include "absl/flags/reflection.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
 #include "flatbuffers/string.h"
 #include "gtest/gtest.h"
 
@@ -142,12 +145,16 @@ TEST_P(StarterdConfigParamTest, MultiNodeStartStopTest) {
     success = true;
   });
 
+  // Failsafe only -- the success path exits event-driven, long before this
+  // fires.  Sized for heavily loaded CI executors (100 concurrent test
+  // actions per machine make multi-process spawn + status round trips take
+  // multiple seconds each), where the previous 7s fired routinely.
   watcher_loop
       .AddTimer([&watcher_loop] {
         watcher_loop.Exit();
         FAIL();
       })
-      ->Schedule(watcher_loop.monotonic_now() + std::chrono::seconds(7));
+      ->Schedule(watcher_loop.monotonic_now() + std::chrono::seconds(45));
 
   std::atomic<int> test_stage = 0;
   // Watch on the client loop since we need to interact with the StarterClient.
@@ -160,8 +167,10 @@ TEST_P(StarterdConfigParamTest, MultiNodeStartStopTest) {
       }
       case 2: {
         {
+          // Generous for loaded CI; the timeout handler is a test
+          // failure, not part of the flow under test.
           client.SendCommands({{Command::STOP, "ping", {client_loop.node()}}},
-                              std::chrono::seconds(3));
+                              std::chrono::seconds(15));
         }
         test_stage = 3;
         break;
@@ -265,17 +274,59 @@ TEST_F(StarterdTest, DeathTest) {
   aos::ShmEventLoop watcher_loop(config_msg);
   watcher_loop.SkipAosLog();
 
+  // Failsafe only, sized for heavily loaded CI -- see
+  // MultiNodeStartStopTest.  The chain here (start + 1s stability +
+  // restart + 1s stability, each step observed via status messages)
+  // routinely exceeded the previous 11s under 100-way executor load.
+  int test_stage = 0;
+  uint64_t id;
+  pid_t ping_pid = -1;
+
   watcher_loop
-      .AddTimer([&watcher_loop] {
+      .AddTimer([&watcher_loop, &test_stage, &ping_pid] {
+        // Diagnostics before failing: if ping was signaled but never came
+        // back (test_stage stuck at 1), it is wedged -- SIGABRT it so
+        // absl's failure handler dumps its stacks into this log via
+        // starterd's stderr forwarding, showing where it is stuck instead
+        // of leaving a silent 45s gap.
+        if (test_stage == 1 && ping_pid > 0) {
+          // What is it doing?  Scheduling state + wchan + signal masks
+          // distinguish "starved/blocked in the kernel" from "signals
+          // masked" from "userspace wedge".
+          for (const char *f : {"stat", "wchan", "status"}) {
+            const std::string path =
+                absl::StrFormat("/proc/%d/%s", ping_pid, f);
+            // Non-fatal: ping may get reaped between the failsafe firing
+            // and this read.
+            std::string contents =
+                aos::util::MaybeReadFileToString(path).value_or(
+                    "<gone -- reaped while dumping>");
+            if (f == std::string_view("status")) {
+              // Only the signal/state lines; the rest is noise.
+              std::string filtered;
+              for (std::string_view line : absl::StrSplit(contents, '\n')) {
+                if (absl::StartsWith(line, "State") ||
+                    absl::StartsWith(line, "Sig") ||
+                    absl::StartsWith(line, "ShdPnd")) {
+                  absl::StrAppend(&filtered, line, "\n");
+                }
+              }
+              contents = std::move(filtered);
+            }
+            LOG(ERROR) << "wedged ping " << path << ": " << contents;
+          }
+          LOG(ERROR) << "ping (pid " << ping_pid
+                     << ") never came back from SIGINT; sending SIGABRT "
+                        "for a stack dump.";
+          kill(ping_pid, SIGABRT);
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
         watcher_loop.Exit();
         FAIL();
       })
-      ->Schedule(watcher_loop.monotonic_now() + std::chrono::seconds(11));
+      ->Schedule(watcher_loop.monotonic_now() + std::chrono::seconds(45));
 
-  int test_stage = 0;
-  uint64_t id;
-
-  watcher_loop.MakeWatcher("/aos", [&test_stage, &watcher_loop,
+  watcher_loop.MakeWatcher("/aos", [&test_stage, &watcher_loop, &ping_pid,
                                     &id](const aos::starter::Status &status) {
     const aos::starter::ApplicationStatus *app_status =
         FindApplicationStatus(status, "ping");
@@ -290,7 +341,8 @@ TEST_F(StarterdTest, DeathTest) {
           LOG(INFO) << "Ping is running";
           test_stage = 1;
           ASSERT_TRUE(app_status->has_pid());
-          ASSERT_TRUE(kill(app_status->pid(), SIGINT) != -1);
+          ping_pid = app_status->pid();
+          ASSERT_TRUE(kill(ping_pid, SIGINT) != -1);
           ASSERT_TRUE(app_status->has_id());
           id = app_status->id();
         }
@@ -361,7 +413,8 @@ TEST_F(StarterdTest, Autostart) {
         watcher_loop.Exit();
         FAIL();
       })
-      ->Schedule(watcher_loop.monotonic_now() + std::chrono::seconds(7));
+      // Failsafe only, sized for loaded CI -- see MultiNodeStartStopTest.
+      ->Schedule(watcher_loop.monotonic_now() + std::chrono::seconds(45));
 
   int pong_running_count = 0;
   watcher_loop.MakeWatcher("/aos", [&watcher_loop, &pong_running_count](
@@ -553,7 +606,10 @@ TEST_F(StarterdTest, StarterChainTest) {
                   "The chain of stages defined below did not complete "
                   "within the time limit.";
       })
-      ->Schedule(client_loop.monotonic_now() + std::chrono::seconds(20));
+      // Failsafe only, sized for loaded CI: the flow below deliberately
+      // waits out a 5s command timeout plus up to 6s of starter-exit
+      // polling before its final command, which left little margin in 20s.
+      ->Schedule(client_loop.monotonic_now() + std::chrono::seconds(45));
 
   // variables have been defined, here we define the body of the test.
   // We want stage1 to succeed, triggering stage2.
