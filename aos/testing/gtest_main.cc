@@ -4,6 +4,7 @@
 #include "gtest/gtest.h"
 
 #include "aos/init.h"
+#include "aos/testing/hang_watchdog.h"
 #include "aos/testing/tmpdir.h"
 
 ABSL_FLAG(bool, print_logs, false,
@@ -39,6 +40,11 @@ __attribute__((weak)) void aos_ForcePrintLogsDuringTests() {}
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   aos::InitGoogle(&argc, &argv);
+
+  // A hang under remote execution is otherwise killed from outside with
+  // nothing in the log; this turns it into an abort with a backtrace of
+  // every thread.  No-op when not running under bazel.
+  aos::testing::MaybeStartHangWatchdog();
 
   if (absl::GetFlag(FLAGS_print_logs)) {
     aos_ForcePrintLogsDuringTests();

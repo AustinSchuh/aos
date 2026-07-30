@@ -12,12 +12,25 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":hang_watchdog",
         "//aos:init",
         "//aos/testing:tmpdir",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "hang_watchdog",
+    testonly = True,
+    srcs = ["hang_watchdog.cc"],
+    hdrs = ["hang_watchdog.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/debugging:stacktrace",
+        "@com_google_absl//absl/debugging:symbolize",
     ],
 )
 
