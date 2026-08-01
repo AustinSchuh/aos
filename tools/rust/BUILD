@@ -137,11 +137,19 @@ cc_library(
 # set CLANG_PATH, and the include paths, sysroot and -resource-dir all come from
 # the cc_toolchain of whatever is being compiled.  libclang does the parsing.
 #
-# Like every rust_toolchain above, this only ever runs on linux-x86_64.
+# One of these per host we run bindgen on.  libclang is dlopen'd by the bindgen
+# binary itself, so it has to come from the execution platform's LLVM
+# distribution rather than the target's.
 
 cc_import(
     name = "libclang",
     shared_library = "@llvm_k8//:lib/libclang.so",
+    tags = ["manual"],
+)
+
+cc_import(
+    name = "libclang_darwin",
+    shared_library = "@llvm_darwin_aarch64//:lib/libclang.dylib",
     tags = ["manual"],
 )
 
@@ -152,6 +160,13 @@ rust_bindgen_toolchain(
     tags = ["manual"],
 )
 
+rust_bindgen_toolchain(
+    name = "bindgen_toolchain_darwin_impl",
+    bindgen = "@rules_rust_bindgen//3rdparty:bindgen",
+    libclang = ":libclang_darwin",
+    tags = ["manual"],
+)
+
 toolchain(
     name = "bindgen_toolchain",
     exec_compatible_with = [
@@ -159,5 +174,15 @@ toolchain(
         "@platforms//cpu:x86_64",
     ],
     toolchain = ":bindgen_toolchain_impl",
+    toolchain_type = "@rules_rust_bindgen//:toolchain_type",
+)
+
+toolchain(
+    name = "bindgen_toolchain_darwin",
+    exec_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+    toolchain = ":bindgen_toolchain_darwin_impl",
     toolchain_type = "@rules_rust_bindgen//:toolchain_type",
 )
