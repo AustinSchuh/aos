@@ -30,6 +30,15 @@ sh_binary(
 )
 
 sh_binary(
+    name = "clang_format_parallel",
+    srcs = ["clang_format_parallel.sh"],
+    data = [":clang_format_binary"],
+    deps = [
+        "@bazel_tools//tools/bash/runfiles",
+    ],
+)
+
+sh_binary(
     name = "gofmt",
     srcs = ["gofmt.sh"],
     data = [
@@ -150,7 +159,7 @@ alias(
 
 format_multirun(
     name = "format",
-    cc = ":clang_format_binary",
+    cc = ":clang_format_parallel",
     css = ":prettier_wrapped",
     go = "@go_sdk//:bin/gofmt",
     html = ":prettier_wrapped",
