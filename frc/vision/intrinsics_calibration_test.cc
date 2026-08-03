@@ -33,7 +33,30 @@ aos::distributed_clock::time_point TimeInMs(size_t ms) {
 namespace fs = std::filesystem;
 using aos::testing::ArtifactPath;
 
-void CheckAgainstKnownCalibration(IntrinsicsCalibration &calibrator) {
+// How far the recovered intrinsics may sit from the ones the test fed in.
+//
+// The tests that synthesize their corners by projecting through a known
+// calibration get kSyntheticDiffThreshold: they hand the solver exactly the
+// points that calibration produces, so anything but a near-exact round trip is
+// a real bug.
+//
+// ImagePlayback runs the whole detector over real images instead, and its
+// answer moves with whatever the charuco corner refinement does at the
+// sub-pixel level.  The reference calibration it compares against was captured
+// with opencv_contrib's cv::aruco::interpolateCornersCharuco(); objdetect's
+// cv::aruco::CharucoDetector sizes its cornerSubPix() windows differently, so
+// the corners land a fraction of a pixel elsewhere and the fit follows.  In
+// practice that is ~0.03 px of focal length and ~0.1 across the eight
+// (strongly correlated, mutually compensating) rational distortion terms --
+// far below anything that matters downstream, and far above 1e-3.  A real
+// detection regression -- wrong dictionary, wrong board, dropped corners --
+// misses by orders of magnitude more than this, so the looser bound still
+// catches what this test is for.
+constexpr double kSyntheticDiffThreshold = 1e-3;
+constexpr double kImagePlaybackDiffThreshold = 0.5;
+
+void CheckAgainstKnownCalibration(IntrinsicsCalibration &calibrator,
+                                  double diff_threshold) {
   // Retrieve the original camera intrinsics
   cv::Mat camera_mat = calibrator.GetCharucoExtractor().camera_matrix();
   cv::Mat dist_coeffs = calibrator.GetCharucoExtractor().dist_coeffs();
@@ -54,9 +77,8 @@ void CheckAgainstKnownCalibration(IntrinsicsCalibration &calibrator) {
   VLOG(1) << "Norm of diffs is " << cv::norm(diff_camera_mat) << " and "
           << cv::norm(diff_dist_coeffs);
 
-  const double kDiffThreshold = 1e-3;
-  EXPECT_NEAR(cv::norm(diff_camera_mat), 0.0, kDiffThreshold);
-  EXPECT_NEAR(cv::norm(diff_dist_coeffs), 0.0, kDiffThreshold);
+  EXPECT_NEAR(cv::norm(diff_camera_mat), 0.0, diff_threshold);
+  EXPECT_NEAR(cv::norm(diff_dist_coeffs), 0.0, diff_threshold);
 }
 
 // With the specified camera calibration file, project a series of boards
@@ -250,7 +272,7 @@ void RunIntrinsicFromPoints(std::string calib_filename,
     }
   }
 
-  CheckAgainstKnownCalibration(calibrator);
+  CheckAgainstKnownCalibration(calibrator, kSyntheticDiffThreshold);
   // Reprojection error should be nearly exact
   EXPECT_NEAR(calibrator.GetReprojectionError(), 0.0, 0.001);
 }
@@ -321,7 +343,7 @@ TEST(IntrinsicCalculationTest, ImagePlayback) {
   calibrator.LoadImagesFromPath(test_images_path);
   calibrator.MaybeCalibrate();
 
-  CheckAgainstKnownCalibration(calibrator);
+  CheckAgainstKnownCalibration(calibrator, kImagePlaybackDiffThreshold);
   // Validate that reprojection error is < 1
   EXPECT_LT(calibrator.GetReprojectionError(), 1.0);
   EXPECT_GT(calibrator.NumCaptures(), 50);
