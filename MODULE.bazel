@@ -260,8 +260,8 @@ bazel_dep(name = "rules_m4", version = "0.2.4")
 bazel_dep(name = "rawrtc", version = "0.5.2")
 bazel_dep(name = "bazel_iwyu", version = "0.0.4")
 
-bazel_dep(name = "amd64_tensorrt", version = "10.9.0", dev_dependency = True)
-bazel_dep(name = "amd64_debian_sysroot", version = "2025.04.20", dev_dependency = True)
+bazel_dep(name = "amd64_tensorrt", version = "10.9.0")
+bazel_dep(name = "amd64_debian_sysroot", version = "2025.04.20")
 
 bazel_dep(name = "rules_rust", version = "0.71.3")
 
@@ -355,7 +355,7 @@ http_archive(
     urls = ["https://github.com/microsoft/Detours/archive/d644ce94e8c7f7f5a31591577c78134ea3ac1fae.tar.gz"],
 )
 
-bazel_dep(name = "arm64_debian_sysroot", version = "2025.10.25", dev_dependency = True)
+bazel_dep(name = "arm64_debian_sysroot", version = "2025.10.25")
 
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "buildozer", version = "8.2.1")
@@ -463,7 +463,15 @@ bazel_dep(name = "tcmalloc", version = "0.0.0-20250927-12f2552", repo_name = "co
 
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
-bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
+#
+# Not a dev_dependency, even though nothing outside //tools/refresh_compile_commands
+# uses it: dev dependencies are dropped for every module that is not the root,
+# so marking it one makes @hedron_compile_commands invisible inside @aos+ the
+# moment somebody depends on AOS.  //tools/refresh_compile_commands/BUILD.bazel
+# load()s from it unconditionally, and a load() cannot be made conditional, so
+# that package then fails to load and takes every downstream `bazel test
+# @aos//...` down with it.
+bazel_dep(name = "hedron_compile_commands")
 
 # archive_override rather than git_override so the fetch goes through Bazel's
 # downloader and respects --downloader_config URL rewriting (mirrorable).
@@ -490,15 +498,15 @@ single_version_override(
 
 bazel_dep(name = "asio", version = "1.28.2")
 
-bazel_dep(name = "ctre_phoenix6_api_cpp_headers", version = "25.3.2", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix6_tools_headers", version = "25.3.2", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix6_api_cpp_athena", version = "25.3.2", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix6_tools_athena", version = "25.3.2", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix6_arm64", version = "24.50.0", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix_api_cpp_headers", version = "5.35.0", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix_api_cpp_athena", version = "5.35.0", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix_cci_headers", version = "5.35.0", dev_dependency = True)
-bazel_dep(name = "ctre_phoenix_cci_athena", version = "5.35.0", dev_dependency = True)
+bazel_dep(name = "ctre_phoenix6_api_cpp_headers", version = "25.3.2")
+bazel_dep(name = "ctre_phoenix6_tools_headers", version = "25.3.2")
+bazel_dep(name = "ctre_phoenix6_api_cpp_athena", version = "25.3.2")
+bazel_dep(name = "ctre_phoenix6_tools_athena", version = "25.3.2")
+bazel_dep(name = "ctre_phoenix6_arm64", version = "24.50.0")
+bazel_dep(name = "ctre_phoenix_api_cpp_headers", version = "5.35.0")
+bazel_dep(name = "ctre_phoenix_api_cpp_athena", version = "5.35.0")
+bazel_dep(name = "ctre_phoenix_cci_headers", version = "5.35.0")
+bazel_dep(name = "ctre_phoenix_cci_athena", version = "5.35.0")
 
 bazel_dep(name = "rules_halide", version = "0.0.1")
 archive_override(
@@ -510,7 +518,7 @@ archive_override(
     ],
 )
 
-bazel_dep(name = "allwpilib", version = "0.0.0", dev_dependency = True, repo_name = "com_github_wpilibsuite_allwpilib")
+bazel_dep(name = "allwpilib", version = "0.0.0", repo_name = "com_github_wpilibsuite_allwpilib")
 local_path_override(
     module_name = "allwpilib",
     path = "third_party/allwpilib",
@@ -721,7 +729,11 @@ register_toolchains(
     dev_dependency = True,
 )
 
-dev_toolchains_ext = use_extension("//tools/cpp:extensions.bzl", "dev_toolchains_extension", dev_dependency = True)
+# Not dev_dependency: //tools/cpp/arm-frc-linux-gnueabi/BUILD and
+# //tools/cpp/gcc_arm_none_eabi/BUILD name these repos from plain filegroups, so
+# they have to resolve for a consuming module too -- see the note on
+# hedron_compile_commands above.
+dev_toolchains_ext = use_extension("//tools/cpp:extensions.bzl", "dev_toolchains_extension")
 use_repo(dev_toolchains_ext, "arm_frc_linux_gnueabi_repo", "gcc_arm_none_eabi")
 
 # Alias bridge for the `@llvm_toolchain` repo that `//tools/lint` needs for a
@@ -754,7 +766,11 @@ http_file(
     urls = ["https://github.com/foxglove/mcap/releases/download/releases%2Fmcap-cli%2Fv0.0.51/mcap-linux-amd64"],
 )
 
-frc_deps_ext = use_extension("//tools/frc:extensions.bzl", "frc_deps_extension", dev_dependency = True)
+# Not dev_dependency: //third_party/BUILD, //frc/orin/BUILD, //frc/vision/BUILD
+# and friends name the CTRE, wpilib, sysroot, TensorRT, CCCL and capture-data
+# repos directly, so they have to resolve for a consuming module too -- see the
+# note on hedron_compile_commands above.
+frc_deps_ext = use_extension("//tools/frc:extensions.bzl", "frc_deps_extension")
 use_repo(
     frc_deps_ext,
     "april_tag_test_image",
