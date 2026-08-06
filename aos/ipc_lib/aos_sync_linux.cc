@@ -415,24 +415,20 @@ int condition_wait(aos_condition *c, aos_mutex *m, struct timespec *end_time) {
       ABSL_PLOG(FATAL) << "FUTEX_WAIT_REQUEUE_PI(" << c << ", " << wait_start
                        << ", " << (&m->futex) << ") failed";
     } else {
-      // Record that the kernel relocked it for us.
-      lock_pthread_mutex(m);
-
       // We succeeded in waiting, and the kernel took care of locking the
-      // mutex
-      // for us and setting FUTEX_WAITERS iff it needed to (for REQUEUE_PI).
-
+      // mutex for us and setting FUTEX_WAITERS iff it needed to (for
+      // REQUEUE_PI).
+      //
+      // Record that the kernel relocked it for us, and pick up
+      // FUTEX_OWNER_DIED the same way every other lock does.  This has to go
+      // through mutex_finish_lock rather than plain lock_pthread_mutex: under
+      // tsan, a previous owner which died holding the mutex is still holding
+      // the shadow pthread mutex, and only force_lock_pthread_mutex (which
+      // mutex_finish_lock picks when it sees FUTEX_OWNER_DIED) can take that
+      // back.  Locking it normally blocks forever.
+      const int r = mutex_finish_lock(m);
       adder.Add();
-
-      const uint32_t value =
-          std::atomic_ref<uint32_t>(m->futex).load(std::memory_order_relaxed);
-      if (AOS_UNLIKELY((value & FUTEX_OWNER_DIED) != 0)) {
-        std::atomic_ref<uint32_t>(m->futex).fetch_and(
-            ~FUTEX_OWNER_DIED, std::memory_order_relaxed);
-        return 1;
-      } else {
-        return 0;
-      }
+      return r;
     }
   }
 }

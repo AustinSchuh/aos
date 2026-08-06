@@ -85,6 +85,21 @@
 // is the one place they're defined.
 #endif  // !__linux__
 
+#ifdef AOS_SANITIZER_thread
+extern "C" void AnnotateHappensBefore(const char *file, int line,
+                                      uintptr_t addr);
+extern "C" void AnnotateHappensAfter(const char *file, int line,
+                                     uintptr_t addr);
+#define ANNOTATE_HAPPENS_BEFORE(address)    \
+  AnnotateHappensBefore(__FILE__, __LINE__, \
+                        reinterpret_cast<uintptr_t>(address))
+#define ANNOTATE_HAPPENS_AFTER(address) \
+  AnnotateHappensAfter(__FILE__, __LINE__, reinterpret_cast<uintptr_t>(address))
+#else
+#define ANNOTATE_HAPPENS_BEFORE(address)
+#define ANNOTATE_HAPPENS_AFTER(address)
+#endif
+
 namespace aos::ipc_lib::sync {
 
 const bool kRobustListDebug = false;
@@ -380,6 +395,15 @@ class Adder {
       next_to_mutex(head_, old_head_next_value)->previous = m_;
     }
     aos_compiler_memory_barrier();
+    // The mutex is now published in this thread's robust list, which is the
+    // only thing another thread gets if this one dies holding it.  Tell tsan
+    // that: the OS hands the mutex over (the kernel's robust list walk on
+    // Linux, RobustListCleaner elsewhere), and the thread which recovers it
+    // pairs with this in mutex_finish_lock.  Without the pair, everything the
+    // dead owner wrote to the mutex looks like it races with the recovery,
+    // because tsan can't see any of the futex operations which actually order
+    // the two.
+    ANNOTATE_HAPPENS_BEFORE(m_);
     if (kRobustListDebug) {
       printf("%" PRId32 ": done adding %p\n", get_tid(), m_);
     }
@@ -507,6 +531,10 @@ inline int mutex_finish_lock(aos_mutex *m) {
   if (AOS_UNLIKELY((value & FUTEX_OWNER_DIED) != 0)) {
     std::atomic_ref<uint32_t>(m->futex).fetch_and(~FUTEX_OWNER_DIED,
                                                   std::memory_order_relaxed);
+    // Pairs with the dead owner's my_robust_list::Adder::Add(); see the
+    // comment there.  This has to come before we touch the mutex's
+    // bookkeeping below, which is what the dead owner last wrote.
+    ANNOTATE_HAPPENS_AFTER(m);
     force_lock_pthread_mutex(m);
     return 1;
   } else {

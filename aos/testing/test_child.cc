@@ -53,9 +53,16 @@ class TestChild::Impl {
   }
 
   // A forked process can be killed outright.  Dying by signal is expected.
+  //
+  // SIGKILL rather than SIGTERM: callers park the child in a blocking futex
+  // wait, and under tsan a catchable signal which arrives while a thread sits
+  // inside an interceptor gets queued until that thread reaches a safe point
+  // -- which a permanently blocked thread never does.  The child would ignore
+  // the signal forever and the Wait() below would hang.  There is nothing for
+  // it to clean up anyway; it already called PreventExit().
   void Terminate() {
     ABSL_CHECK_NE(child_, -1) << ": not started";
-    ABSL_PCHECK(kill(child_, SIGTERM) != -1);
+    ABSL_PCHECK(kill(child_, SIGKILL) != -1);
     const int status = Wait();
     ABSL_CHECK(WIFEXITED(status) || WIFSIGNALED(status));
     child_ = -1;

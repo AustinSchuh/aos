@@ -70,13 +70,20 @@ class MemoryEstimationTest : public ::testing::Test {
 TEST_F(MemoryEstimationTest, TotalMemoryUsage) {
   // Just hard-code these; we want to be able to visually check that they look
   // sane, and they can be updated when needed.
-#ifdef _WIN32
+  // Under tsan every aos_mutex carries an extra pthread_mutex_t (see
+  // aos_sync.h), so every queue's headers grow.  tsan only gets built for
+  // Linux, so it only needs the one pair of numbers.
+#if defined(AOS_SANITIZER_thread)
+  EXPECT_EQ(110000124224, TotalSharedMemoryUsage(config_, node1_));
+#elif defined(_WIN32)
   EXPECT_EQ(110000120720, TotalSharedMemoryUsage(config_, node1_));
 #else
   EXPECT_EQ(110000121200, TotalSharedMemoryUsage(config_, node1_));
 #endif
 
-#ifdef __APPLE__
+#if defined(AOS_SANITIZER_thread)
+  EXPECT_EQ(66128, TotalSharedMemoryUsage(config_, node2_));
+#elif defined(__APPLE__)
   EXPECT_EQ(65280, TotalSharedMemoryUsage(config_, node2_));
 #else
   EXPECT_EQ(65120, TotalSharedMemoryUsage(config_, node2_));

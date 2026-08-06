@@ -152,6 +152,15 @@ cc_binary(
 
 sanitizer_wrapper(
     name = "sanitizer_wrapper",
-    tsan_options = "detect_deadlocks=1:second_deadlock_stack=1",
+    # report_destroy_locked=0: aos_sync deliberately destroys a locked pthread
+    # mutex.  Its shadow pthread mutexes exist only so tsan can see the
+    # happens-before edges of an aos_mutex, and when an aos_mutex's owner dies
+    # holding it, ripping the shadow mutex out from under the dead thread is
+    # the whole recovery mechanism (see force_lock_pthread_mutex).
+    # die_after_fork=0: googletest death tests fork a process which tsan
+    # already knows is multithreaded, and the child then starts threads of its
+    # own.  tsan kills the child for that by default, which turns every such
+    # death test into a failure.
+    tsan_options = "detect_deadlocks=1:second_deadlock_stack=1:report_destroy_locked=0:die_after_fork=0",
     ubsan_options = "color=always:print_stacktrace=1",
 )

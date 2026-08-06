@@ -83,21 +83,6 @@ using ::aos::linux_code::ipc_lib::RunShmObservers;
 //
 // The value of an aos_condition is just a generation counter.
 
-#ifdef AOS_SANITIZER_thread
-extern "C" void AnnotateHappensBefore(const char *file, int line,
-                                      uintptr_t addr);
-extern "C" void AnnotateHappensAfter(const char *file, int line,
-                                     uintptr_t addr);
-#define ANNOTATE_HAPPENS_BEFORE(address)    \
-  AnnotateHappensBefore(__FILE__, __LINE__, \
-                        reinterpret_cast<uintptr_t>(address))
-#define ANNOTATE_HAPPENS_AFTER(address) \
-  AnnotateHappensAfter(__FILE__, __LINE__, reinterpret_cast<uintptr_t>(address))
-#else
-#define ANNOTATE_HAPPENS_BEFORE(address)
-#define ANNOTATE_HAPPENS_AFTER(address)
-#endif
-
 namespace aos::ipc_lib::sync {
 namespace {
 

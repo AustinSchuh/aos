@@ -321,6 +321,9 @@ inline int shared_mutex_lock(FutexCacheEntry *entry, aos_mutex *m, uint32_t tid,
   ABSL_CHECK_EQ(prev, v) << ": aos_mutex " << m
                          << " changed while its kernel mutex was held";
   if (AOS_UNLIKELY(owner_died)) {
+    // Pairs with the dead owner's my_robust_list::Adder::Add(), exactly like
+    // mutex_finish_lock does on the futex path.
+    ANNOTATE_HAPPENS_AFTER(m);
     force_lock_pthread_mutex(m);
     return 1;
   }

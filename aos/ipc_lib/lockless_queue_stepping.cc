@@ -3,6 +3,8 @@
 #ifdef SUPPORTS_SHM_ROBUSTNESS_TEST
 
 #include <assert.h>
+// dlsym()/RTLD_NEXT, used to reach around tsan's sigaction interceptor below.
+#include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
 #include <signal.h>
