@@ -30,12 +30,15 @@ cc_test(
     ],
     deps = [
         ":mutex",
+        "//aos/ipc_lib:aos_sync",
         "//aos/testing:googletest",
         "//aos/testing:test_logging",
         "//aos/testing:test_shm",
         "//aos/time",
         "//aos/util:death_test_log_implementation",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/log:check",
     ],
 )

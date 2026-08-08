@@ -86,6 +86,10 @@
 // private-vs-shared classification of every futex address it has touched.
 // Handles are closed via RAII on thread exit.
 
+// Benchmark hook; see aos_sync.h.  File-scope so both the backend (in the
+// namespaces below) and the global-scope setter can reach it.
+static bool assume_private_for_testing = false;
+
 namespace aos::ipc_lib::sync {
 namespace {
 
@@ -249,6 +253,12 @@ void CheckFutexIsProcessLocal(FutexCacheEntry *entry, void *addr) {
 // therefore which implementation backs it) and holds the kernel mutex handle
 // if it is shared.
 inline FutexCacheEntry *MutexCacheEntry(aos_mutex *m) {
+  // Benchmark hook: report everything as private, without creating or
+  // consulting real cache entries (which would outlive the hook).
+  static FutexCacheEntry private_entry{FutexMemoryType::kPrivate, NULL};
+  if (assume_private_for_testing) {
+    return &private_entry;
+  }
   return tl_futex_cache.GetOrCreate(&m->futex);
 }
 
@@ -483,4 +493,8 @@ void mutex_do_unlock(aos_mutex *m, uint32_t tid) {
 // scope.
 uint32_t mutex_owner_from_value(uint32_t value) {
   return (value & FUTEX_TID_MASK) << 2;
+}
+
+void mutex_set_assume_private_for_testing(bool assume) {
+  assume_private_for_testing = assume;
 }

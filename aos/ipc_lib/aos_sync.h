@@ -130,6 +130,11 @@ uint32_t mutex_owner_from_value(uint32_t value);
 // Returns whether the owner is dead from a raw futex value.
 bool mutex_owner_is_dead_from_value(uint32_t value);
 
+// Benchmark/testing hook, Windows only: when true, the backend skips the
+// FutexCache classification lookup and treats every mutex as
+// process-private.  Only safe when no shared-memory mutexes are in use.
+void mutex_set_assume_private_for_testing(bool assume);
+
 // Simulates a thread crash/death by marking the mutex as owner-died.
 // Returns true if the owner matched the provided tid.
 bool mutex_pretend_owner_died_for_testing(aos_mutex *m, uint32_t tid);
