@@ -1,5 +1,9 @@
 #include "aos/realtime.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "absl/base/internal/raw_logging.h"
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
@@ -102,6 +106,53 @@ TEST(RealtimeTest, GetSetSchedulingPolicy) {
   EXPECT_EQ(GetCurrentThreadSchedulingPolicy(), SCHED_RR);
   UnsetCurrentThreadRealtimePriority();
 }
+
+#ifdef __linux__
+// Tests that the fatal-path unset drops every thread in the process, not just
+// the one which is dying.  Sibling threads are about to be torn down with the
+// rest of the process, and nothing they do in the meantime is worth preempting
+// healthy realtime work elsewhere on the system.
+//
+// This also covers the /proc/self/task walk, which uses raw open()/getdents64()
+// rather than opendir() so that it stays async-signal-safe for the fatal signal
+// handler.
+TEST(RealtimeTest, FatalUnsetRealtimePriorityDropsEveryThread) {
+  std::atomic<pid_t> sibling_tid{0};
+  std::atomic<bool> sibling_is_realtime{false};
+  std::atomic<bool> done{false};
+
+  std::thread sibling([&]() {
+    sibling_tid = GetThreadId();
+    sibling_is_realtime =
+        SetCurrentThreadRealtimePriorityLowLevel(1, SCHED_FIFO) == 0;
+    while (!done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+
+  while (sibling_tid.load() == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  while (!sibling_is_realtime.load() &&
+         sched_getscheduler(sibling_tid.load()) != SCHED_FIFO) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // NO_MODE keeps the malloc hooks off, so gtest can keep allocating while we
+  // are on the realtime scheduler.
+  SetCurrentThreadRealtimePriority(1, SCHED_FIFO, RealtimePolicy::NO_MODE);
+  ASSERT_EQ(sched_getscheduler(0), SCHED_FIFO);
+  ASSERT_EQ(sched_getscheduler(sibling_tid.load()), SCHED_FIFO);
+
+  aos_FatalUnsetRealtimePriority();
+
+  EXPECT_EQ(sched_getscheduler(0), SCHED_OTHER);
+  EXPECT_EQ(sched_getscheduler(sibling_tid.load()), SCHED_OTHER);
+
+  done = true;
+  sibling.join();
+}
+#endif  // __linux__
 
 // Malloc hooks don't work with asan/msan.
 #if !defined(AOS_SANITIZE_MEMORY) && !defined(AOS_SANITIZE_ADDRESS)
