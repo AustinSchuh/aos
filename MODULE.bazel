@@ -526,13 +526,11 @@ use_repo(cypress, "cypress_toolchains")
 register_toolchains("@cypress_toolchains//:all")
 
 bazel_dep(name = "toolchains_llvm", version = "1.8.0", dev_dependency = True)
-single_version_override(
+archive_override(
     module_name = "toolchains_llvm",
-    patch_strip = 1,
-    patches = [
-        "//third_party:toolchains_llvm.patch",
-    ],
-    version = "1.8.0",
+    integrity = "sha256-FsKrLsmu6PkeifgeNsRZSb6VrPmE29DOEF1zY+zCbLM=",
+    strip_prefix = "toolchains_llvm-6e04cf2439df4b6b892d19c283d0436b0b29ab41",
+    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/6e04cf2439df4b6b892d19c283d0436b0b29ab41.tar.gz"],
 )
 
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm", dev_dependency = True)
