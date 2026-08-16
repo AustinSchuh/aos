@@ -142,6 +142,7 @@ cc_binary(
     ],
     linkopts = ["-lrt"],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
     deps = [
         ":event",
         "//aos:condition",
@@ -497,6 +498,7 @@ cc_binary(
         "signal_stress.cc",
     ],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
     deps = [
         ":latency_lib",
         "//aos:init",
@@ -511,6 +513,7 @@ cc_binary(
         "futex_latency.cc",
     ],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
     deps = [
         ":latency_lib",
         "//aos:condition",
@@ -526,6 +529,7 @@ cc_binary(
         "named_pipe_latency.cc",
     ],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
     deps = [
         ":latency_lib",
         "//aos:init",
@@ -540,6 +544,7 @@ cc_binary(
         "eventfd_latency.cc",
     ],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
     deps = [
         ":latency_lib",
         "//aos:init",
