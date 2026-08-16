@@ -13,11 +13,18 @@ copy_file(
     out = "docs/run_ping_pong.md",
 )
 
+copy_file(
+    name = "benchmarking_md",
+    src = "//documentation/examples/starterd:benchmarking.md",
+    out = "docs/benchmarking.md",
+)
+
 mkdocs(
     name = "docs",
     srcs = glob(["docs/*.md"]) + [
         ":build_ping_pong_md",
         ":run_ping_pong_md",
+        ":benchmarking_md",
     ],
     config = "mkdocs.yaml",
 )
