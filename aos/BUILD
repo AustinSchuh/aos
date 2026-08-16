@@ -816,9 +816,11 @@ cc_test(
         ":init",
         ":realtime",
         "//aos:sanitizers",
+        "@com_google_absl//absl/debugging:failure_signal_handler",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest",
     ],
 )
