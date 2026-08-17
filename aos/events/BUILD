@@ -43,6 +43,24 @@ cc_static_flatbuffer(
     target = ":event_loop_fbs_reflection_out",
 )
 
+# Process-lifetime Winsock startup, shared by every AOS component that makes
+# a SOCKET (:aio and :pipe today).  Its own target so both can depend on it
+# without one depending on the other.
+cc_library(
+    name = "winsock_init",
+    srcs = select({
+        "@platforms//os:windows": ["winsock_init.cc"],
+        "//conditions:default": [],
+    }),
+    hdrs = ["winsock_init.h"],
+    linkopts = select({
+        "@platforms//os:windows": ["-DEFAULTLIB:ws2_32.lib"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = ["@com_google_absl//absl/log:absl_check"],
+)
+
 cc_library(
     name = "aio",
     srcs = [
@@ -92,7 +110,7 @@ cc_library(
         "@platforms//os:macos": [
             "//aos/mutex",
         ],
-        "@platforms//os:windows": [],
+        "@platforms//os:windows": [":winsock_init"],
     }),
 )
 
@@ -166,7 +184,10 @@ cc_library(
         ":aio",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
-    ],
+    ] + select({
+        "@platforms//os:windows": [":winsock_init"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_test(

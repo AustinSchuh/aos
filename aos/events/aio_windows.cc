@@ -22,6 +22,7 @@
 
 #include "aos/containers/sized_array.h"
 #include "aos/events/aio_internal.h"
+#include "aos/events/winsock_init.h"
 #include "aos/ipc_lib/thread_signal.h"
 #include "aos/realtime.h"
 #include "aos/time/time.h"
@@ -568,7 +569,8 @@ IocpImpl::~IocpImpl() {
     CloseHandle(iocp_handle);
     iocp_handle = INVALID_HANDLE_VALUE;
   }
-  WSACleanup();
+  // No WSACleanup() to match the startup in Aio::Aio(): see
+  // EnsureWinsockInitialized().
 }
 
 void IocpImpl::Run() {
@@ -1395,8 +1397,7 @@ bool IocpImpl::Poll(bool block) {
 }
 
 Aio::Aio() : impl_(std::make_unique<IocpImpl>()) {
-  WSADATA wsaData;
-  WSAStartup(MAKEWORD(2, 2), &wsaData);
+  EnsureWinsockInitialized();
 
   auto *w_impl = static_cast<IocpImpl *>(impl_.get());
   w_impl->iocp_handle =

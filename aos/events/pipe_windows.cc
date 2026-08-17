@@ -17,6 +17,8 @@
 #include "absl/log/absl_log.h"
 #include "absl/strings/str_cat.h"
 
+#include "aos/events/winsock_init.h"
+
 namespace aos {
 
 namespace {
@@ -35,6 +37,10 @@ SOCKET ToSocket(FileDescriptor fd) { return reinterpret_cast<SOCKET>(fd); }
 // with no in-flight window where a write has happened but the reader can't see
 // it yet.
 Pipe::Pipe() {
+  // A Pipe can outlive every Aio, or be built before the first one, so it
+  // cannot rely on Aio having started Winsock.
+  EnsureWinsockInitialized();
+
   SOCKET listener =
       WSASocket(AF_UNIX, SOCK_STREAM, 0, nullptr, 0, WSA_FLAG_OVERLAPPED);
   ABSL_CHECK_NE(listener, INVALID_SOCKET)
