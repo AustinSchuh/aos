@@ -17,8 +17,16 @@ def locate(relative_path):
         raise ValueError(
             f"Expected relative path that starts with a repository, got absolute path: {relative_path}"
         )
-    absolute_path = _RUNFILES.Rlocation(str(relative_path))
-    if absolute_path is None or not absolute_path.startswith("/"):
+    # as_posix() rather than str(): on Windows str(Path) yields backslashes,
+    # and Rlocation splits the repository name off with path.partition("/").
+    # A backslash-separated path has no first component to map, so it silently
+    # skips the apparent-to-canonical repo mapping ("aos" -> "_main") and
+    # returns a path under a nonexistent "aos" runfiles directory.
+    absolute_path = _RUNFILES.Rlocation(relative_path.as_posix())
+    # os.path.isabs rather than a leading-"/" test: on Windows Rlocation
+    # returns a drive-qualified path like C:/... which is absolute but does
+    # not start with a separator.
+    if absolute_path is None or not os.path.isabs(absolute_path):
         raise FileNotFoundError(
             f"Failed to locate {relative_path}, got {absolute_path}")
     if not os.path.exists(absolute_path):
@@ -223,6 +231,9 @@ int aos_error_code(aos_error_t *self);
 import platform
 if platform.system() == "Darwin":
     lib_path = locate("aos/aos/events/libevent_loop_c.dylib")
+elif platform.system() == "Windows":
+    # No "lib" prefix here: linkshared cc_binary emits <name>.dll on Windows.
+    lib_path = locate("aos/aos/events/event_loop_c.dll")
 else:
     lib_path = locate("aos/aos/events/libevent_loop_c.so")
 lib = ffi.dlopen(str(lib_path))

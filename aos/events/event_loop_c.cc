@@ -407,6 +407,8 @@ void aos_shm_event_loop_lock_to_thread(aos_event_loop_t *self) {
   event_loop->LockToThread();
 }
 
+// See the matching guard in event_loop_c.h for why these are POSIX-only.
+#ifndef _WIN32
 void aos_shm_event_loop_on_fd_events(aos_event_loop_t *self, int fd,
                                      aos_shm_event_loop_fd_callback_t callback,
                                      void *user_data) {
@@ -429,6 +431,7 @@ void aos_shm_event_loop_set_fd_events(aos_event_loop_t *self, int fd,
       reinterpret_cast<aos::EventLoop *>(ABSL_DIE_IF_NULL(self)));
   event_loop->aio()->SetEvents(fd, events);
 }
+#endif  // !_WIN32
 
 aos_event_loop_t *aos_shm_event_loop_create(
     const aos_configuration_t *configuration) {

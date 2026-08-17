@@ -303,6 +303,15 @@ cc_binary(
         "event_loop_c.cc",
         "event_loop_c.h",
     ],
+    # ELF and Mach-O export every non-hidden symbol by default; a Windows DLL
+    # exports nothing without an export table, so cffi's dlopen() succeeds and
+    # then every lookup fails with ERROR_PROC_NOT_FOUND.  This feature has
+    # Bazel synthesize a .def listing all of them.  Windows-only because it is
+    # meaningless elsewhere, not because it would break anything there.
+    features = select({
+        "@platforms//os:windows": ["windows_export_all_symbols"],
+        "//conditions:default": [],
+    }),
     linkshared = True,
     deps = [
         ":context",

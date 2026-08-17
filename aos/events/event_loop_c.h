@@ -187,6 +187,14 @@ void aos_shm_event_loop_set_name(aos_event_loop_t *self, const char *name_data,
                                  size_t name_size);
 // All public-facing APIs will verify they are called in this thread.
 void aos_shm_event_loop_lock_to_thread(aos_event_loop_t *self);
+// The fd registration API is in terms of integer file descriptors, which
+// don't map onto Windows: Aio's FileDescriptor is an opaque handle there,
+// and the events are epoll bits (select.EPOLLIN and friends, which CPython
+// only defines on Linux).  Deciding what a descriptor even means to these
+// callers on Windows is a design question, not a cast -- so the API is
+// simply absent there rather than present and unusable.  Same reasoning as
+// //aos/events:epoll.
+#ifndef _WIN32
 // Registers a function to be called when the configured events occur on fd.
 void aos_shm_event_loop_on_fd_events(aos_event_loop_t *self, int fd,
                                      aos_shm_event_loop_fd_callback_t callback,
@@ -196,6 +204,7 @@ void aos_shm_event_loop_delete_fd(aos_event_loop_t *self, int fd);
 // Sets the epoll events for the given fd.
 void aos_shm_event_loop_set_fd_events(aos_event_loop_t *self, int fd,
                                       uint32_t events);
+#endif  // !_WIN32
 aos_event_loop_t *aos_shm_event_loop_create(
     const aos_configuration_t *configuration);
 

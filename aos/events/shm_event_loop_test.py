@@ -23,10 +23,18 @@ class ShmEventLoopTest(absltest.TestCase):
                 util.ConfigurationBuffer(
                     util.locate("aos/aos/events/event_loop_py_config.bfbs"))
         ) as event_loop:
-            self.assertEqual(event_loop.name(), "python3")
+            # The default name is the running program, which is the
+            # interpreter here -- "python3" on Linux and macOS, "python" on
+            # Windows.  Derive it rather than hardcoding either spelling.
+            self.assertEqual(event_loop.name(),
+                             os.path.splitext(os.path.basename(
+                                 sys.executable))[0])
             event_loop.set_name("new_name")
             self.assertEqual(event_loop.name(), "new_name")
 
+    @absltest.skipIf(
+        sys.platform == "win32",
+        "The fd registration API is POSIX-only; see event_loop_c.h.")
     def test_on_fd_events(self):
         if hasattr(os, 'pipe2'):
             read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
