@@ -1443,10 +1443,28 @@ bool IocpImpl::Poll(bool block) {
                 if (state.has_events_fn && state.events_fn) {
                   state.events_fn(events);
                 } else {
-                  if ((events & 0x01) && state.has_in_fn && state.in_fn) {
-                    state.in_fn();
+                  // A bare kErr with no err_fn is routed to in_fn (failing
+                  // that, out_fn), matching EpollImpl and DrainLegacyEpoll().
+                  // A hangup cannot be consumed by acknowledging it -- only
+                  // by a read() that observes the EOF and unregisters -- so
+                  // dispatching nothing here would re-fire the watch forever
+                  // with no callback ever running.
+                  const bool err_like = (events & 0x08) != 0;
+                  const bool err_unhandled =
+                      err_like && !(state.has_err_fn && state.err_fn);
+                  const bool has_in = state.has_in_fn && state.in_fn != nullptr;
+
+                  if ((events & 0x01) || (err_unhandled && has_in)) {
+                    if (has_in) {
+                      state.in_fn();
+                    }
                   }
-                  if ((events & 0x08) && state.has_err_fn && state.err_fn) {
+                  if ((events & 0x04) || (err_unhandled && !has_in)) {
+                    if (state.has_out_fn && state.out_fn) {
+                      state.out_fn();
+                    }
+                  }
+                  if (err_like && state.has_err_fn && state.err_fn) {
                     state.err_fn();
                   }
                 }
