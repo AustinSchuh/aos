@@ -4,6 +4,7 @@
 #include "aos/events/aio.h"
 
 #include <mswsock.h>
+#include <timeapi.h>
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -106,6 +107,36 @@ int TranslateWinsockError(int err) {
 // directly (see aio.h), so no lookup table is needed to recover it.
 inline SOCKET ToSocket(FileDescriptor fd) {
   return reinterpret_cast<SOCKET>(fd);
+}
+
+// Raises the process's timer resolution to 1ms, once, for the life of the
+// process.
+//
+// Poll() waits by handing GetQueuedCompletionStatus() a millisecond timeout,
+// and that timeout is rounded up to the system timer tick -- ~15.6ms by
+// default.  Every timer shorter than that therefore fires late by up to a
+// full tick, which is not a jitter problem so much as a correctness one for
+// a repeating timer: it is late every single cycle, so it spends the whole
+// run catching up on missed deadlines and firing back-to-back.  Linux gives
+// us hrtimers with no such request, so this is purely about matching the
+// resolution the rest of AOS already assumes.
+//
+// There is no matching timeEndPeriod(): the resolution is wanted for as long
+// as any event loop might run, and since Windows 10 2004 the setting is
+// scoped to the calling process, so leaving it raised costs other processes
+// nothing.
+void EnsureHighResolutionTimers() {
+  static const bool initialized = []() {
+    // TIMERR_NOERROR is 0.  A failure here is not fatal -- it only means
+    // timers keep the coarse default -- so log rather than die.
+    const MMRESULT result = timeBeginPeriod(1);
+    if (result != TIMERR_NOERROR) {
+      ABSL_LOG(WARNING) << "timeBeginPeriod(1) failed with " << result
+                        << "; timers will be quantized to the system tick";
+    }
+    return true;
+  }();
+  (void)initialized;
 }
 
 namespace {
@@ -1615,6 +1646,7 @@ bool IocpImpl::Poll(bool block) {
 
 Aio::Aio() : impl_(std::make_unique<IocpImpl>()) {
   EnsureWinsockInitialized();
+  EnsureHighResolutionTimers();
 
   auto *w_impl = static_cast<IocpImpl *>(impl_.get());
   w_impl->iocp_handle =

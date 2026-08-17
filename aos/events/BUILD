@@ -73,8 +73,12 @@ cc_library(
     }),
     hdrs = ["aio.h"],
     linkopts = select({
-        # WSAStartup/WSAPoll/overlapped socket I/O live in ws2_32.
-        "@platforms//os:windows": ["-DEFAULTLIB:ws2_32.lib"],
+        # WSAStartup/WSAPoll/overlapped socket I/O live in ws2_32;
+        # timeBeginPeriod lives in winmm.
+        "@platforms//os:windows": [
+            "-DEFAULTLIB:ws2_32.lib",
+            "-DEFAULTLIB:winmm.lib",
+        ],
         "//conditions:default": [],
     }),
     # Which backend --aio_backend defaults to is a property of the platform,
