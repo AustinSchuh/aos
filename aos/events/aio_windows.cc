@@ -152,6 +152,12 @@ struct IocpImpl : public Aio::Impl {
   std::atomic<bool> quit_requested{false};
   std::vector<std::function<void()>> before_wait_functions;
 
+  // Nonzero while inside Poll(), to enforce that it is not reentrant.  See
+  // the CHECK at the top of Poll(), and EpollImpl's dispatch_depth_.
+  int dispatch_depth_ = 0;
+  // True while running the before-wait functions; see BeforeWait().
+  bool in_before_wait_ = false;
+
   // Intrusive timer queue
   AsyncRequest *timers_head = nullptr;
 
@@ -801,6 +807,12 @@ void IocpImpl::Cancel(AsyncRequest *request) {
 }
 
 void IocpImpl::BeforeWait(std::function<void()> function) {
+  // Not from inside a before-wait function: the push_back can reallocate the
+  // vector while Poll()'s iteration is executing an element in the old
+  // storage.  Deterministically illegal rather than sometimes-corrupting,
+  // matching IoUringImpl/EpollImpl.
+  ABSL_CHECK(!in_before_wait_)
+      << ": BeforeWait() may not be called from a before-wait function";
   before_wait_functions.push_back(std::move(function));
 }
 
@@ -1055,15 +1067,29 @@ bool IocpImpl::HasRawRequestsInFlight() const {
 }
 
 bool IocpImpl::Poll(bool block) {
+  // Not reentrant, matching IoUringImpl::Poll() and EpollImpl::Poll().
+  // dispatch_depth_ covers the whole body below, before-wait functions
+  // included.
+  ABSL_CHECK_EQ(dispatch_depth_, 0)
+      << "Aio::Poll() reentered from inside a completion callback or "
+         "before-wait function; wait by returning to the event loop instead";
+  struct DispatchDepth {
+    int *depth;
+    explicit DispatchDepth(int *d) : depth(d) { ++*depth; }
+    ~DispatchDepth() { --*depth; }
+  } dispatch_depth_guard(&dispatch_depth_);
+
   // NOTE: Do not drop realtime here.  Poll() must run at whatever realtime
   // level the caller was at, exactly like the Linux backends: user callbacks
   // (timers, watchers, before-wait hooks) are dispatched from inside this
   // function and are expected to observe the caller's realtime state.  The
   // blocking wait itself is fine to perform while realtime (a sleeping thread
   // allocates nothing), so there is nothing to bracket with ScopedNotRealtime.
+  in_before_wait_ = true;
   for (const auto &fn : before_wait_functions) {
     fn();
   }
+  in_before_wait_ = false;
 
   bool processed = false;
 
