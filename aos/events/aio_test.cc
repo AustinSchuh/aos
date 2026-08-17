@@ -56,6 +56,28 @@ inline FileDescriptor FakeFd(intptr_t value) {
 #endif
 }
 
+// Delivers a wakeup to the calling thread, the way a ThreadSignalSender on
+// some other thread would.  This is pthread_kill(pthread_self(), ...) spelled
+// portably: ThreadSignalSender is the abstraction that already knows how each
+// platform delivers these (a signal on POSIX, a queued APC-alike on Windows),
+// so tests that just need "wake me" should go through it rather than reach
+// for the POSIX call directly.
+inline void SignalSelf() {
+  aos::ipc_lib::ThreadSignalSender sender;
+  sender.Signal(aos::GetProcessId(), aos::GetThreadId());
+}
+
+// Reads whatever is available right now, returning 0 at EOF and -1 on error.
+// The pipe ends are integer fds on POSIX and sockets on Windows, so the one
+// portable spelling of a short read is per-platform.
+inline int ReadSome(FileDescriptor fd, char *buffer, size_t size) {
+#if defined(_WIN32)
+  return recv(reinterpret_cast<SOCKET>(fd), buffer, static_cast<int>(size), 0);
+#else
+  return static_cast<int>(read(fd, buffer, size));
+#endif
+}
+
 // Scoped watchdog: arms a SIGALRM fuse so a wedged test dies loudly instead
 // of hanging until bazel's timeout, and disarms it on scope exit so the fuse
 // cannot leak into subsequent tests in this process (alarm(2) keeps exactly
@@ -229,6 +251,11 @@ class AioTest : public ::testing::TestWithParam<std::string> {
 // Fixture for io_uring-specific regression tests; the loops inside these
 // churn rings aggressively, so they also call ThrottleOnKernelRingTeardown()
 // periodically themselves.
+//
+// Not built on Windows: these force the io_uring backend, which does not
+// exist there, and drive it through --aio_queue_depth, which only the
+// submission-queue backends define -- so they would not even link.
+#ifndef _WIN32
 class AioReproTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -252,6 +279,7 @@ class AioReproTest : public ::testing::Test {
 
   absl::FlagSaver flag_saver_;
 };
+#endif  // !_WIN32
 
 // Tests that we can push basic strings through a pipe with io_uring.
 TEST_P(AioTest, BasicPipeReadWrite) {
@@ -1035,6 +1063,11 @@ TEST_P(AioTest, DeleteOwnFdFromCallbackKeepsCapturesTest) {
 // regular files with EPERM -- they have no wait queue and are simply always
 // ready -- which used to abort the epoll backend on a perfectly valid
 // mkstemp() descriptor.
+//
+// POSIX-only: the bug is a property of epoll_ctl, and the setup is built out
+// of mkstemp()/unlink()/lseek() on an integer descriptor, none of which map
+// onto the opaque handles the Windows backend takes.
+#ifndef _WIN32
 TEST_P(AioTest, RegularFileAsyncReadWriteTest) {
   Aio aio;
 
@@ -1079,6 +1112,7 @@ TEST_P(AioTest, RegularFileAsyncReadWriteTest) {
 
   ABSL_PCHECK(close(fd) == 0);
 }
+#endif  // !_WIN32
 
 // Tests that a pending AsyncRead() completes with EOF when the write end of
 // an empty pipe closes.  That hangup surfaces as EPOLLHUP with no EPOLLIN;
@@ -1817,6 +1851,9 @@ TEST_P(AioTest, RepeatingTimerHoldsPhaseTest) {
          "phase error.";
 }
 
+// The AioReproTest tests; see the fixture for why they are POSIX-only.
+#ifndef _WIN32
+
 // Cancel, reschedule, and destruction against a timer whose firing the loop
 // has not observed yet.
 //
@@ -2225,6 +2262,8 @@ TEST_F(AioReproTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
   }
   ::absl::SetFlag(&FLAGS_aio_queue_depth, saved_depth);
 }
+
+#endif  // !_WIN32
 
 // aio.h's constraint 2 lets a caller destroy the Aio with requests still
 // pending -- including one whose completion was already drained and queued
@@ -2698,7 +2737,7 @@ TEST_P(AioTest, LegacyReadableSeesHangup) {
   bool saw_eof = false;
   aio.OnReadable(pipe.read_fd(), [&aio, &pipe, &saw_eof]() {
     char buf[16];
-    const ssize_t n = read(pipe.read_fd(), buf, sizeof(buf));
+    const int n = ReadSome(pipe.read_fd(), buf, sizeof(buf));
     if (n == 0) {
       saw_eof = true;
       aio.DeleteFd(pipe.read_fd());
@@ -3165,6 +3204,12 @@ TEST_P(AioTest, ForkDuringRepeatingTimerDeathTest) {
 // io_uring_get_events() resync, lazily triggered on the next entry point
 // touched after a fork, keeps the parent's own still-outstanding ops
 // cancelable.
+//
+// POSIX-only: unlike the death tests above, which express the fork through
+// EXPECT_EXIT (and so re-exec on Windows), this one needs a bare fork() in
+// the parent's own process -- being party to the fork is the whole point --
+// and Windows has no equivalent.
+#ifndef _WIN32
 TEST_P(AioTest, ForkChildNeverTouchesAioTest) {
   // Bounds worst-case runtime if this ever regresses: the reap loop's own
   // kMaxReapAttempts bound would otherwise take on the order of a minute to
@@ -3201,6 +3246,7 @@ TEST_P(AioTest, ForkChildNeverTouchesAioTest) {
 
   // Canceling this (via ~Timer() below) must not hang.
 }
+#endif  // !_WIN32
 
 // Regression test for IoUringImpl::CheckSubmitterThread(): destroying an Aio
 // from a different thread than the one that first called Run()/Poll() on it
@@ -3323,7 +3369,7 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
   // still flow end-to-end on the rebuilt ring.
   int count = 0;
   aio->RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
-  pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+  SignalSelf();
   while (count == 0 && aio->Poll(true)) {
   }
   EXPECT_EQ(count, 1);
