@@ -216,6 +216,8 @@ struct IocpImpl : public Aio::Impl {
   // guarantee documented on Aio (see aio.h) and required by ScopedRealtime.
   std::vector<std::unique_ptr<FdState>> registrations_;
   std::vector<std::unique_ptr<FdState>> free_list_;
+  // Released but not yet scrubbed; see ReleaseRegistration().
+  std::vector<std::unique_ptr<FdState>> retired_;
   size_t initial_pool_size_ = 16;
 
   // Orders registrations_ by fd.  FileDescriptor is an opaque handle (SOCKET)
@@ -235,6 +237,11 @@ struct IocpImpl : public Aio::Impl {
   FdState &GetOrCreateAsyncRegistration(FileDescriptor fd);
 
   void ReleaseRegistration(FdState *reg);
+
+  // Finishes what ReleaseRegistration() deferred: destroys the retired
+  // states' callbacks and returns their slots to free_list_.  Only legal
+  // with dispatch_depth_ == 0.
+  void ScrubRetiredRegistrations();
 
   // Returns pool slots held by registrations that AsyncRead/AsyncWrite/
   // AsyncAccept created and that now have nothing outstanding.  Without
@@ -324,6 +331,10 @@ IocpImpl::IocpImpl() {
     free_list_.push_back(std::make_unique<FdState>());
   }
   registrations_.reserve(initial_pool_size_ * 2);
+  // Retiring happens on the completion path, which runs under ScopedRealtime
+  // and must not allocate.  Sized like registrations_ because in the worst
+  // case every active registration retires before anything is scrubbed.
+  retired_.reserve(initial_pool_size_ * 2);
   failed_requests.reserve(initial_pool_size_);
 }
 
@@ -423,11 +434,28 @@ void IocpImpl::ReleaseRegistration(FdState *reg) {
   std::unique_ptr<FdState> owned_reg = std::move(*it);
   registrations_.erase(it);
 
-  *owned_reg = FdState();
-
-  if (free_list_.size() < 2 * initial_pool_size_) {
-    free_list_.push_back(std::move(owned_reg));
+  // Erasing above is enough to make the registration invisible to lookups.
+  // The reset -- which destroys in_fn/out_fn/err_fn/events_fn -- has to wait
+  // until no dispatch is in flight: a callback is allowed to delete its own
+  // fd, and that callback is one of these std::functions, so destroying it
+  // here would free the running lambda's captures out from under it.  Park
+  // the state on retired_ and let ScrubRetiredRegistrations() finish the job
+  // once the stack is clear.  Matches EpollImpl::ReleaseRegistration().
+  retired_.push_back(std::move(owned_reg));
+  if (dispatch_depth_ == 0) {
+    ScrubRetiredRegistrations();
   }
+}
+
+void IocpImpl::ScrubRetiredRegistrations() {
+  ABSL_CHECK_EQ(dispatch_depth_, 0);
+  for (auto &reg : retired_) {
+    *reg = FdState();
+    if (free_list_.size() < 2 * initial_pool_size_) {
+      free_list_.push_back(std::move(reg));
+    }
+  }
+  retired_.clear();
 }
 
 void IocpImpl::RetireIdleAsyncRegistrations() {
@@ -454,6 +482,10 @@ void IocpImpl::RetireIdleAsyncRegistrations() {
     // ERROR_INVALID_PARAMETER, which it treats as success.
     ReleaseRegistration(reg);
   }
+  // Also finishes off anything a callback retired mid-dispatch (DeleteFd
+  // from inside its own handler), which ReleaseRegistration() could only
+  // park at the time.
+  ScrubRetiredRegistrations();
 }
 
 void IocpImpl::AssociateSocket(FdState &state) {
@@ -929,10 +961,12 @@ void IocpImpl::DeleteFd(FileDescriptor fd) {
   state.has_in_fn = false;
   state.has_out_fn = false;
   state.has_err_fn = false;
-  state.in_fn = nullptr;
-  state.out_fn = nullptr;
-  state.err_fn = nullptr;
-  state.events_fn = nullptr;
+  // The std::functions themselves are deliberately left alone here: a
+  // callback deleting its own fd is legal, and it is one of them, so
+  // clearing it would destroy the running lambda's captures mid-call.  The
+  // has_*_fn flags above already stop anything from dispatching to it, and
+  // ReleaseRegistration() -> ScrubRetiredRegistrations() destroys them once
+  // no dispatch is in flight.
   UpdateSocket(fd);
   ReleaseRegistration(reg);
 }
