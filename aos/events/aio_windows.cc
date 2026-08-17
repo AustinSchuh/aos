@@ -243,6 +243,19 @@ struct IocpImpl : public Aio::Impl {
   // with dispatch_depth_ == 0.
   void ScrubRetiredRegistrations();
 
+  // CancelIoEx()es whichever readiness watches this state has armed.  The
+  // cancelled operations still post their (aborted) completions, and those
+  // are what return pending_io_count to zero.
+  void CancelPendingWatches(FdState &state);
+
+  // Clears the pending flag a retired state is still holding for `overlapped`,
+  // if any, and reports whether it matched.  A completion whose registration
+  // has already been retired has nothing to dispatch, but the state must not
+  // be recycled until the kernel is finished with the OVERLAPPED living
+  // inside it -- otherwise the next AsyncRead() to draw that slot would share
+  // its OVERLAPPED with an operation the kernel still owns.
+  bool ClearRetiredPending(OVERLAPPED *overlapped);
+
   // Returns pool slots held by registrations that AsyncRead/AsyncWrite/
   // AsyncAccept created and that now have nothing outstanding.  Without
   // this the pool is a high-water mark of distinct fds ever used
@@ -447,15 +460,52 @@ void IocpImpl::ReleaseRegistration(FdState *reg) {
   }
 }
 
+void IocpImpl::CancelPendingWatches(FdState &state) {
+  if (state.read_pending) {
+    CancelIoEx(reinterpret_cast<HANDLE>(ToSocket(state.fd)),
+               &state.read_overlapped);
+  }
+  if (state.write_pending) {
+    CancelIoEx(reinterpret_cast<HANDLE>(ToSocket(state.fd)),
+               &state.write_overlapped);
+  }
+}
+
+bool IocpImpl::ClearRetiredPending(OVERLAPPED *overlapped) {
+  for (auto &reg : retired_) {
+    if (overlapped == &reg->read_overlapped) {
+      reg->read_pending = false;
+      reg->read_request = nullptr;
+      return true;
+    }
+    if (overlapped == &reg->write_overlapped) {
+      reg->write_pending = false;
+      reg->write_request = nullptr;
+      return true;
+    }
+  }
+  return false;
+}
+
 void IocpImpl::ScrubRetiredRegistrations() {
   ABSL_CHECK_EQ(dispatch_depth_, 0);
-  for (auto &reg : retired_) {
+  size_t kept = 0;
+  for (size_t i = 0; i < retired_.size(); ++i) {
+    std::unique_ptr<FdState> reg = std::move(retired_[i]);
+    // Still owed a completion: the kernel holds a pointer into this object,
+    // so it stays parked until that lands (ClearRetiredPending() clears the
+    // flag, ~IocpImpl() forces the issue by cancelling).
+    if (reg->read_pending || reg->write_pending || reg->read_request ||
+        reg->write_request || reg->accept_request) {
+      retired_[kept++] = std::move(reg);
+      continue;
+    }
     *reg = FdState();
     if (free_list_.size() < 2 * initial_pool_size_) {
       free_list_.push_back(std::move(reg));
     }
   }
-  retired_.clear();
+  retired_.resize(kept);
 }
 
 void IocpImpl::RetireIdleAsyncRegistrations() {
@@ -629,9 +679,29 @@ IocpImpl::~IocpImpl() {
     if (read_req) Cancel(read_req);
     if (write_req) Cancel(write_req);
     if (accept_req) Cancel(accept_req);
+    // The Cancel()s above only cover the completion-based requests.  A
+    // legacy fd's readiness watch is an overlapped operation too, and it
+    // counts toward pending_io_count just the same, so the drain below hangs
+    // forever unless it is cancelled as well.
+    {
+      std::lock_guard<std::recursive_mutex> lock(fd_states_mutex);
+      if (auto *state = GetActiveRegistration(fd)) {
+        CancelPendingWatches(*state);
+      }
+    }
+  }
+  // Same for anything retired but not yet recycled.
+  {
+    std::lock_guard<std::recursive_mutex> lock(fd_states_mutex);
+    for (auto &reg : retired_) {
+      CancelPendingWatches(*reg);
+    }
   }
 
-  // Wait for all pending overlapped operations to complete
+  // Wait for all pending overlapped operations to complete.  Everything that
+  // incremented pending_io_count has been cancelled by this point -- the
+  // requests above, and the readiness watches via CancelPendingWatches() --
+  // so each one still outstanding owes exactly one (aborted) completion.
   while (pending_io_count > 0) {
     DWORD bytes = 0;
     ULONG_PTR key = 0;
@@ -967,6 +1037,14 @@ void IocpImpl::DeleteFd(FileDescriptor fd) {
   // has_*_fn flags above already stop anything from dispatching to it, and
   // ReleaseRegistration() -> ScrubRetiredRegistrations() destroys them once
   // no dispatch is in flight.
+
+  // Cancel the readiness watches explicitly rather than letting
+  // UpdateSocket() notice that legacy_events is now empty: is_legacy was
+  // just cleared, and UpdateSocketLocked() returns immediately for a
+  // non-legacy state, so its cancel branch is unreachable from here.  A
+  // watch left armed keeps its pending_io_count reference forever, which
+  // wedges ~IocpImpl()'s drain.
+  CancelPendingWatches(state);
   UpdateSocket(fd);
   ReleaseRegistration(reg);
 }
@@ -1287,6 +1365,10 @@ bool IocpImpl::Poll(bool block) {
         pending_io_count--;
         FileDescriptor fd = reinterpret_cast<FileDescriptor>(completion_key);
         std::lock_guard<std::recursive_mutex> lock(fd_states_mutex);
+        // A completion for an fd that has since been retired (DeleteFd, or a
+        // request cancelled at teardown) still has to release the hold the
+        // kernel had on that state before it can be recycled.
+        ClearRetiredPending(lp_overlapped);
         if (auto *state_ptr = GetActiveRegistration(fd)) {
           auto &state = *state_ptr;
           if (lp_overlapped == &state.read_overlapped) {
