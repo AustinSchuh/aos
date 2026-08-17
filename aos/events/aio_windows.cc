@@ -552,6 +552,18 @@ void IocpImpl::AssociateSocket(FdState &state) {
     } else {
       int err = GetLastError();
       if (err == ERROR_INVALID_PARAMETER) {
+        // Already associated with a completion port.  Normally that port is
+        // ours -- this is a re-registration of an fd we retired earlier, and
+        // re-associating is both harmless and unavoidable, since the state
+        // carrying associated_with_iocp went back to the pool.
+        //
+        // It can also mean the socket belongs to a *different* Aio's port,
+        // which is unrecoverable: a socket's completion-port association is
+        // permanent for the life of the socket, so this Aio will never see a
+        // completion for it and any Poll() waiting on one blocks forever.
+        // The two cases are indistinguishable here -- Windows offers no way
+        // to ask a socket which port it is on -- so this stays permissive.
+        // Callers must not hand the same socket to two Aio instances.
         state.associated_with_iocp = true;
       } else {
         // AssociateSocket is reachable from AsyncRead/AsyncWrite/

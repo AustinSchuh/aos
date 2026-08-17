@@ -2308,15 +2308,21 @@ TEST_P(AioTest, ReuseRequestPendingAtDestruction) {
 
   // Reuse a leftover request with a fresh Aio: its callback must fire.
   AsyncRequest *reuse = fired_a ? &request_b : &request_a;
-  Pipe *reuse_pipe = fired_a ? &pipe_b : &pipe_a;
   bool *reuse_fired = fired_a ? &fired_b : &fired_a;
-  // The first Aio may have consumed the byte before being destroyed; make
-  // the fd readable again either way.
-  reuse_pipe->Write("x");
+
+  // A *new* pipe, deliberately, not the one the retired request was reading.
+  // What is under test is the AsyncRequest outliving its Aio and being
+  // reusable, which this still exercises; carrying the old fd across as well
+  // would additionally require re-registering a descriptor with a second
+  // Aio, and on Windows that cannot work at all -- a socket's IOCP
+  // association is permanent, so the new Aio's completions would be posted
+  // to the old (closed) port and its Poll() would block forever.
+  Pipe reuse_pipe;
+  reuse_pipe.Write("x");
 
   Aio aio2;
   char buf2[8];
-  aio2.AsyncRead(reuse_pipe->read_fd(), buf2, reuse);
+  aio2.AsyncRead(reuse_pipe.read_fd(), buf2, reuse);
   while (!*reuse_fired && aio2.Poll(true)) {
   }
   EXPECT_TRUE(*reuse_fired);
