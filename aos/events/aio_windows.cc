@@ -1379,16 +1379,16 @@ bool IocpImpl::Poll(bool block) {
                 req->done = true;
                 if (req->callback) {
                   if (success) {
-                    if (bytes_transferred == 0 &&
-                        State(req).buffer.size() > 0) {
-                      req->callback({aos::MakeError("EOF"), 0, req->user_data},
-                                    req->context);
-                    } else {
-                      req->callback(
-                          {aos::Ok(), static_cast<int32_t>(bytes_transferred),
-                           req->user_data},
-                          req->context);
-                    }
+                    // Note a zero-byte completion on a non-empty buffer is
+                    // EOF -- the peer hung up -- and that is a *successful*
+                    // zero-length read, not a failure.  It is what read(2)
+                    // reports as 0, and what the io_uring and kqueue backends
+                    // pass through as Ok(); reporting an error here instead
+                    // made a hangup indistinguishable from real I/O failure.
+                    req->callback(
+                        {aos::Ok(), static_cast<int32_t>(bytes_transferred),
+                         req->user_data},
+                        req->context);
                   } else {
                     DWORD dw_flags = 0;
                     DWORD err = 0;
