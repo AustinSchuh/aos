@@ -236,6 +236,19 @@ struct IocpImpl : public Aio::Impl {
 
   void ReleaseRegistration(FdState *reg);
 
+  // Returns pool slots held by registrations that AsyncRead/AsyncWrite/
+  // AsyncAccept created and that now have nothing outstanding.  Without
+  // this the pool is a high-water mark of distinct fds ever used
+  // asynchronously rather than of simultaneously-outstanding requests, and
+  // the 17th one CHECK-fails in GetOrCreateAsyncRegistration().  Matches
+  // EpollImpl::MaybeRetireAsyncRegistration().
+  //
+  // Swept at the end of Poll() rather than inline at each completion: the
+  // completion handlers hold an FdState & across the user callback (and
+  // that callback may itself start new work on the same fd), so releasing
+  // mid-dispatch would hand the slot out from under a live reference.
+  void RetireIdleAsyncRegistrations();
+
   aos::SizedArray<AsyncRequest *, MAXIMUM_WAIT_OBJECTS> cancelled_requests;
   struct FailedRequest {
     AsyncRequest *request;
@@ -414,6 +427,32 @@ void IocpImpl::ReleaseRegistration(FdState *reg) {
 
   if (free_list_.size() < 2 * initial_pool_size_) {
     free_list_.push_back(std::move(owned_reg));
+  }
+}
+
+void IocpImpl::RetireIdleAsyncRegistrations() {
+  std::lock_guard<std::recursive_mutex> lock(fd_states_mutex);
+  // Walk backwards: ReleaseRegistration() erases from registrations_, so
+  // indices at or past the erased one shift.
+  for (size_t i = registrations_.size(); i > 0; --i) {
+    FdState *reg = registrations_[i - 1].get();
+    // Legacy registrations belong to the caller until DeleteFd(); only the
+    // ones the Async* API created on demand are ours to reclaim.
+    if (reg->is_legacy || reg->has_events_fn || reg->has_in_fn ||
+        reg->has_out_fn || reg->has_err_fn) {
+      continue;
+    }
+    if (reg->read_request != nullptr || reg->write_request != nullptr ||
+        reg->accept_request != nullptr || reg->read_pending ||
+        reg->write_pending) {
+      continue;
+    }
+    // Note the socket stays associated with the completion port -- that is
+    // not undoable -- so a later AsyncRead() on this same fd builds a fresh
+    // registration whose associated_with_iocp starts false.  AssociateSocket()
+    // handles that: re-associating an already-associated socket fails with
+    // ERROR_INVALID_PARAMETER, which it treats as success.
+    ReleaseRegistration(reg);
   }
 }
 
@@ -1073,6 +1112,12 @@ bool IocpImpl::Poll(bool block) {
   ABSL_CHECK_EQ(dispatch_depth_, 0)
       << "Aio::Poll() reentered from inside a completion callback or "
          "before-wait function; wait by returning to the event loop instead";
+  // Declared before dispatch_depth_guard so it destructs after it: the sweep
+  // must see dispatch_depth_ back at 0, with no callback frame live.
+  struct RetireGuard {
+    IocpImpl *impl;
+    ~RetireGuard() { impl->RetireIdleAsyncRegistrations(); }
+  } retire_guard{this};
   struct DispatchDepth {
     int *depth;
     explicit DispatchDepth(int *d) : depth(d) { ++*depth; }
