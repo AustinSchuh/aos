@@ -53,6 +53,13 @@ single_version_override(
     patch_strip = 1,
     patches = [
         "third_party/glib/0001-Add-sysroot-select.patch",
+        # Upstream's Bazel port stops at POSIX: BUILD.bazel selects a
+        # "glibconfig.h.in-windows" that was never written (it carries a
+        # literal "# TODO"), and there is no config.h-windows either, so the
+        # config.h select has no Windows arm and fails to configure.  This
+        # adds both.  Intended to go upstream to the BCR module rather than
+        # live here indefinitely.
+        "third_party/glib/0002-Add-Windows-config-headers.patch",
     ],
     version = "2.82.2.bcr.7",
 )

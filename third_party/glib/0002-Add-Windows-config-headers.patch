@@ -1,0 +1,608 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+index f124d25..e2d7492 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -37,6 +37,7 @@ expand_template(
+     template = select({
+         "@platforms//os:macos": "config.h-macos",
+         "@platforms//os:linux": "config.h-linux",
++        "@platforms//os:windows": "config.h-windows",
+     }),
+ )
+ 
+diff --git a/gio/BUILD.bazel b/gio/BUILD.bazel
+index 7779117..31cad20 100644
+--- a/gio/BUILD.bazel
++++ b/gio/BUILD.bazel
+@@ -484,6 +484,13 @@ PUBLIC_HDRS = GIO_HDRS + GIO_APPLICATION_HDRS + GIO_SETTINGS_HDRS + GIO_GDBUS_HD
+ 
+ PUBLIC_HDRS_OSX = ["gosxappinfo.h"]
+ 
++# Installed alongside the rest of gio on Windows, same role as
++# PUBLIC_HDRS_OSX above.
++PUBLIC_HDRS_WIN32 = [
++    "gwin32inputstream.h",
++    "gwin32outputstream.h",
++]
++
+ INTERNAL_HDRS = [
+     "gappinfoprivate.h",
+     "gapplicationimpl.h",
+@@ -571,6 +578,32 @@ INTERNAL_HDRS_OSX = [
+     "gosxnetworkmonitor.h",
+ ]
+ 
++# giowin32-private.c is a textual include (gwin32appinfo.c pulls it in), not
++# a separately compiled source, which is why it sits with the headers.
++#
++# Windows takes INTERNAL_HDRS_UNIX alongside this group: several of those
++# headers (gfiledescriptorbased.h, gunixfdmessage.h, gunixmounts.h) are
++# consulted by portable sources such as glocalfile.c and gsocket*stream.c,
++# not only by the Unix-only ones.  They are textual_hdrs, so the entries
++# that go unused on Windows cost nothing.
++INTERNAL_HDRS_WIN32 = [
++    "giowin32-priv.h",
++    "giowin32-afunix.h",
++    "giowin32-private.c",
++    "gwin32api-application-activation-manager.h",
++    "gwin32api-iterator.h",
++    "gwin32api-misc.h",
++    "gwin32api-package.h",
++    "gwin32api-storage.h",
++    "gwin32appinfo.h",
++    "gwin32file-sync-stream.h",
++    "gwin32packageparser.h",
++    "gwin32registrykey.h",
++    "gwin32mount.h",
++    "gwin32volumemonitor.h",
++    "gregistrysettingsbackend.h",
++]
++
+ UPSTREAM_VERSION = module_version().split(".bcr.", 1)[0]
+ 
+ run_binary(
+@@ -590,6 +623,7 @@ run_binary(
+         name = "glib_mkenums_for_%s" % out.replace(".", "_"),
+         srcs = ["gnetworking.h"] + PUBLIC_HDRS + select({
+             "@platforms//os:macos": PUBLIC_HDRS_OSX,
++            "@platforms//os:windows": PUBLIC_HDRS_WIN32,
+             "//conditions:default": [],
+         }),
+         out = out,
+@@ -609,13 +643,14 @@ run_binary(
+ ) for hdr in (PUBLIC_HDRS + [
+     "gioenumtypes.h",
+     "gnetworking.h",
+-] + PUBLIC_HDRS_OSX)]
++] + PUBLIC_HDRS_OSX + PUBLIC_HDRS_WIN32)]
+ 
+ cc_library(
+     name = "gio_internal_textual_hdrs",
+     textual_hdrs = INTERNAL_HDRS + select({
+         "@platforms//os:linux": INTERNAL_HDRS_UNIX + INTERNAL_HDRS_LINUX,
+         "@platforms//os:macos": INTERNAL_HDRS_UNIX + INTERNAL_HDRS_OSX,
++        "@platforms//os:windows": INTERNAL_HDRS_UNIX + INTERNAL_HDRS_WIN32,
+         "//conditions:default": [],
+     }) + ["strinfo.c"],
+ )
+@@ -641,6 +676,7 @@ cc_library(
+         "//conditions:default": GIO_PORTAL_SRCS,
+     }) + GIO_LOCAL_SRCS + PUBLIC_HDRS + select({
+         "@platforms//os:macos": PUBLIC_HDRS_OSX,
++        "@platforms//os:windows": PUBLIC_HDRS_WIN32,
+         "//conditions:default": [],
+     }) + select({
+         "@platforms//os:linux": glob([
+@@ -670,6 +706,7 @@ cc_library(
+            ])] +
+            select({
+                "@platforms//os:macos": [":public_hdr_" + hdr for hdr in PUBLIC_HDRS_OSX],
++               "@platforms//os:windows": [":public_hdr_" + hdr for hdr in PUBLIC_HDRS_WIN32],
+                "//conditions:default": [],
+            }) + [
+         ":gio-visibility_h",
+diff --git a/glib/BUILD.bazel b/glib/BUILD.bazel
+index 863d0d9..da94659 100644
+--- a/glib/BUILD.bazel
++++ b/glib/BUILD.bazel
+@@ -217,6 +217,13 @@ GLIB_WIN32_SRCS = [
+     "giowin32.c",
+     "gwin32.c",
+     "gspawn-win32-helper.c",
++    # glib ships its own dirent for Windows, which gdir.c includes as
++    # "dirent/dirent.h".  wdirent.c is the only compiled entry point: it
++    # defines UNICODE and then textually includes dirent.c (listed under
++    # GLIB_INTERNAL_TEXTUAL_HDRS below, so it is available to the compile
++    # without being built on its own).
++    "dirent/wdirent.c",
++    "dirent/dirent.h",
+ ]
+ 
+ GLIB_INTERNAL_TEXTUAL_HDRS = [
+@@ -226,6 +233,7 @@ GLIB_INTERNAL_TEXTUAL_HDRS = [
+     "gthread-win32.c",
+     "gwin32-private.c",
+     "win_iconv.c",
++    "dirent/dirent.c",
+ ]
+ 
+ GLIB_TOOL_SRCS = [
+diff --git a/gmodule/BUILD.bazel b/gmodule/BUILD.bazel
+index e1456b7..624127f 100644
+--- a/gmodule/BUILD.bazel
++++ b/gmodule/BUILD.bazel
+@@ -54,6 +54,10 @@ cc_library(
+     srcs = [
+         "gmodule.c",
+         "gmodule-deprecated.c",
++        # gmodule.c reaches this with a quoted include, which resolves
++        # against its own directory before the generated copy under
++        # include_glib-2.0, so the source header has to be declared too.
++        "gmodule.h",
+         ":gmodule-visibility_h",
+         ":gmoduleconf_h",
+     ],
+diff --git a/config.h-windows b/config.h-windows
+new file mode 100644
+index 0000000..591c6d4
+--- /dev/null
++++ b/config.h-windows
+@@ -0,0 +1,168 @@
++/*
++ * Hand-written counterpart to the meson-generated config.h-linux and
++ * config.h-macos, for the MSVC/UCRT Windows build.
++ *
++ * The HAVE_* set below is what MSVC with the Universal CRT provides; every
++ * POSIX-only entry from the other two (pwd.h, grp.h, unistd.h, poll.h,
++ * mmap, fork/spawn, pthreads, xattr, statfs/statvfs, syslog, termios,
++ * res_n*, RTLD_*, ...) is deliberately absent rather than stubbed, so glib
++ * takes its win32 code paths.
++ */
++
++#pragma once
++
++/* NLS is on, backed by glib/stub_libintl -- the BUILD hands every non-Linux
++ * target that stub, and it supplies the whole gettext family as identity
++ * functions, so the HAVE_*GETTEXT trio below is honest here.
++ */
++#define ENABLE_NLS 1
++
++#define EXEEXT ".exe"
++
++#define GETTEXT_PACKAGE "glib20"
++
++#define GLIB_BINARY_AGE {GLIB_BINARY_AGE}
++
++#define GLIB_INTERFACE_AGE 2
++
++/* These are compiled-in fallbacks only; on Windows glib resolves its
++ * locale and data directories relative to the running module instead (see
++ * gwin32.c's g_win32_get_package_installation_directory_of_module).
++ */
++#define GLIB_LOCALE_DIR "/usr/share/locale"
++
++#define GLIB_LOCALSTATEDIR "/var/local"
++
++#define GLIB_MAJOR_VERSION {GLIB_MAJOR_VERSION}
++
++#define GLIB_MICRO_VERSION {GLIB_MICRO_VERSION}
++
++#define GLIB_MINOR_VERSION {GLIB_MINOR_VERSION}
++
++#define GLIB_RUNSTATEDIR "/run"
++
++/* _aligned_malloc(), not the C11 aligned_alloc(): the latter is absent from
++ * the UCRT because its free() cannot release such a block.  gmem.c maps the
++ * two (arguments reversed) and routes g_aligned_free() to _aligned_free()
++ * when this is set.
++ */
++#define HAVE__ALIGNED_MALLOC 1
++
++#define HAVE_BIND_TEXTDOMAIN_CODESET 1
++
++#define HAVE_C99_SNPRINTF 1
++
++#define HAVE_C99_VSNPRINTF 1
++
++#define HAVE_DCGETTEXT 1
++
++#define HAVE_FLOAT_H 1
++
++#define HAVE_GETTEXT 1
++
++#define HAVE_INTMAX_T 1
++
++#define HAVE_INTTYPES_H 1
++
++#define HAVE_INTTYPES_H_WITH_UINTMAX 1
++
++#define HAVE_IPV6 1
++
++#define HAVE_LIMITS_H 1
++
++#define HAVE_LOCALE_H 1
++
++#define HAVE_LONG_DOUBLE 1
++
++#define HAVE_LONG_LONG 1
++
++#define HAVE_MEMORY_H 1
++
++#define HAVE_PTRDIFF_T 1
++
++#define HAVE_SIG_ATOMIC_T 1
++
++#define HAVE_SNPRINTF 1
++
++/* Deliberately not HAVE_STDATOMIC_H: MSVC only exposes <stdatomic.h> to C
++ * under /std:c11 or later, which is not what this module compiles with, and
++ * glib's gatomic.h has a G_PLATFORM_WIN32 branch built on the Interlocked
++ * intrinsics that works regardless.
++ */
++
++#define HAVE_STDINT_H 1
++
++#define HAVE_STDINT_H_WITH_UINTMAX 1
++
++#define HAVE_STDLIB_H 1
++
++#define HAVE_STRING_H 1
++
++#define HAVE_SYS_STAT_H 1
++
++#define HAVE_SYS_TYPES_H 1
++
++#define HAVE_VSNPRINTF 1
++
++#define HAVE_WCHAR_H 1
++
++#define HAVE_WCHAR_T 1
++
++#define HAVE_WCSLEN 1
++
++#define HAVE_WCSNLEN 1
++
++#define HAVE_WINT_T 1
++
++/* _stricmp/_strnicmp are the UCRT spellings; glib's gstrfuncs.c maps these
++ * when the POSIX names are unavailable.
++ */
++
++#define PACKAGE_BUGREPORT "https://gitlab.gnome.org/GNOME/glib/issues/new"
++
++#define PACKAGE_NAME "glib"
++
++#define PACKAGE_STRING "glib {GLIB_VERSION}"
++
++#define PACKAGE_TARNAME "glib"
++
++#define PACKAGE_URL ""
++
++#define PACKAGE_VERSION "{GLIB_VERSION}"
++
++/* MSVC defines none of the __SIZEOF_*__ builtins.  Windows is LLP64: long
++ * is 32 bits even on 64-bit targets, and wchar_t is 16 bits.
++ */
++#define SIZEOF_CHAR 1
++
++#define SIZEOF_INT 4
++
++#define SIZEOF_LONG 4
++
++#define SIZEOF_LONG_LONG 8
++
++#define SIZEOF_SHORT 2
++
++#ifdef _WIN64
++#define SIZEOF_SIZE_T 8
++
++#define SIZEOF_SSIZE_T 8
++
++#define SIZEOF_VOID_P 8
++#else
++#define SIZEOF_SIZE_T 4
++
++#define SIZEOF_SSIZE_T 4
++
++#define SIZEOF_VOID_P 4
++#endif
++
++#define SIZEOF_WCHAR_T 2
++
++#define THREADS_WIN32 1
++
++#define USE_SYSTEM_PRINTF 1
++
++#define gl_extern_inline
++
++#define gl_unused
+diff --git a/glib/glibconfig.h.in-windows b/glib/glibconfig.h.in-windows
+new file mode 100644
+index 0000000..d4e57ab
+--- /dev/null
++++ b/glib/glibconfig.h.in-windows
+@@ -0,0 +1,284 @@
++/* Derived from 'glibconfig.h.in' */
++
++#ifndef __GLIBCONFIG_H__
++#define __GLIBCONFIG_H__
++
++#include <glib/gmacros.h>
++
++#define __STDC_FORMAT_MACROS
++
++#include <limits.h>
++#include <float.h>
++#include <inttypes.h>
++#include <stdint.h>
++
++/* No <sys/socket.h> here, and deliberately no <winsock2.h> either: this is a
++ * public header, and pulling winsock2 into every translation unit that
++ * includes <glib.h> would force WIN32_LEAN_AND_MEAN discipline on every
++ * consumer (and break any that include <windows.h> first).  The handful of
++ * constants needed below are spelled numerically instead, which is what
++ * glib's own win32 glibconfig.h does.
++ */
++
++/* MSVC has alloca() in <malloc.h>, not <alloca.h>, so GLIB_HAVE_ALLOCA_H
++ * stays undefined; glib's gmem.h already handles the _MSC_VER case.
++ */
++
++#define GLIB_STATIC_COMPILATION 1
++#define GOBJECT_STATIC_COMPILATION 1
++#define GIO_STATIC_COMPILATION 1
++#define GMODULE_STATIC_COMPILATION 1
++#define GI_STATIC_COMPILATION 1
++#define G_INTL_STATIC_COMPILATION 1
++#define FFI_STATIC_BUILD 1
++
++/* Specifies that GLib's g_print*() functions wrap the
++ * system printf functions.  This is useful to know, for example,
++ * when using glibc's register_printf_function().
++ */
++#define GLIB_USING_SYSTEM_PRINTF
++
++G_BEGIN_DECLS
++
++#define G_MINFLOAT	FLT_MIN
++#define G_MAXFLOAT	FLT_MAX
++#define G_MINDOUBLE	DBL_MIN
++#define G_MAXDOUBLE	DBL_MAX
++#define G_MINSHORT	SHRT_MIN
++#define G_MAXSHORT	SHRT_MAX
++#define G_MAXUSHORT	USHRT_MAX
++#define G_MININT	INT_MIN
++#define G_MAXINT	INT_MAX
++#define G_MAXUINT	UINT_MAX
++#define G_MINLONG	LONG_MIN
++#define G_MAXLONG	LONG_MAX
++#define G_MAXULONG	ULONG_MAX
++
++typedef signed char gint8;
++typedef unsigned char guint8;
++
++typedef int16_t gint16;
++typedef uint16_t guint16;
++
++#define G_GINT16_MODIFIER "h"
++#define G_GINT16_FORMAT "hi"
++#define G_GUINT16_FORMAT "hu"
++
++
++typedef int32_t gint32;
++typedef uint32_t guint32;
++
++#define G_GINT32_MODIFIER ""
++#define G_GINT32_FORMAT "i"
++#define G_GUINT32_FORMAT "u"
++
++
++#define G_HAVE_GINT64 1          /* deprecated, always true */
++
++typedef int64_t gint64;
++typedef uint64_t guint64;
++
++#define G_GINT64_CONSTANT(val)	INT64_C(val)
++#define G_GUINT64_CONSTANT(val)	UINT64_C(val)
++
++/* The UCRT's printf is C99-conformant, so "ll" works; the "I64" spelling is
++ * only needed for the pre-2015 msvcrt.
++ */
++#define G_GINT64_MODIFIER "ll"
++#define G_GINT64_FORMAT PRIi64
++#define G_GUINT64_FORMAT PRIu64
++
++
++/* MSVC does not define the __SIZEOF_*__ builtins, and Windows is LLP64
++ * everywhere it is supported: long stays 32 bits even on 64-bit targets.
++ */
++#ifdef _WIN64
++#define GLIB_SIZEOF_VOID_P  8
++#define GLIB_SIZEOF_SIZE_T  8
++#define GLIB_SIZEOF_SSIZE_T 8
++#else
++#define GLIB_SIZEOF_VOID_P  4
++#define GLIB_SIZEOF_SIZE_T  4
++#define GLIB_SIZEOF_SSIZE_T 4
++#endif
++#define GLIB_SIZEOF_LONG   4
++
++/* ssize_t is not a Windows type.  Spell the signed counterpart of size_t out
++ * directly rather than depending on the SSIZE_T in <basetsd.h>, to keep this
++ * header free of windows.h.
++ */
++typedef size_t gsize;
++#ifdef _WIN64
++typedef int64_t gssize;
++#define G_MAXSSIZE INT64_MAX
++#define G_MINSSIZE INT64_MIN
++#else
++typedef int32_t gssize;
++#define G_MAXSSIZE INT32_MAX
++#define G_MINSSIZE INT32_MIN
++#endif
++
++/* The UCRT understands "z" for size_t, but glib formats these through its own
++ * printf implementation on Windows in some paths; "I64"/"I32" is the spelling
++ * that is correct for both.
++ */
++#ifdef _WIN64
++#define G_GSIZE_MODIFIER "I64"
++#define G_GSSIZE_MODIFIER "I64"
++#define G_GSIZE_FORMAT "I64u"
++#define G_GSSIZE_FORMAT "I64d"
++#else
++#define G_GSIZE_MODIFIER "I32"
++#define G_GSSIZE_MODIFIER "I32"
++#define G_GSIZE_FORMAT "I32u"
++#define G_GSSIZE_FORMAT "I32d"
++#endif
++
++#define G_MAXSIZE SIZE_MAX
++
++typedef gint64 goffset;
++#define G_MINOFFSET	G_MININT64
++#define G_MAXOFFSET	G_MAXINT64
++
++#define G_GOFFSET_MODIFIER      G_GINT64_MODIFIER
++#define G_GOFFSET_FORMAT        G_GINT64_FORMAT
++#define G_GOFFSET_CONSTANT(val) G_GINT64_CONSTANT(val)
++
++/* GPollFD::fd holds a SOCKET or a HANDLE on Windows and prints as hex.  It
++ * is only widened to gint64 on 64-bit -- see the G_OS_WIN32 branch of struct
++ * _GPollFD in gmain.h, which keys off GLIB_SIZEOF_VOID_P == 8 -- so the
++ * format has to follow the same split.
++ */
++#ifdef _WIN64
++#define G_POLLFD_FORMAT "%#I64x"
++#else
++#define G_POLLFD_FORMAT "%#x"
++#endif
++
++#define GPOINTER_TO_INT(p)	((gint)  (intptr_t) (p))
++#define GPOINTER_TO_UINT(p)	((guint) (uintptr_t) (p))
++
++#define GINT_TO_POINTER(i)	((gpointer) (intptr_t) (i))
++#define GUINT_TO_POINTER(u)	((gpointer) (uintptr_t) (u))
++
++typedef intptr_t gintptr;
++typedef uintptr_t guintptr;
++
++#if UINTPTR_MAX == UINT64_MAX
++#  define G_GINTPTR_MODIFIER      G_GINT64_MODIFIER
++#  define G_GINTPTR_FORMAT        G_GINT64_FORMAT
++#  define G_GUINTPTR_FORMAT       G_GUINT64_FORMAT
++#elif UINTPTR_MAX == UINT32_MAX
++#  define G_GINTPTR_MODIFIER      G_GINT32_MODIFIER
++#  define G_GINTPTR_FORMAT        G_GINT32_FORMAT
++#  define G_GUINTPTR_FORMAT       G_GUINT32_FORMAT
++#endif
++
++#define GLIB_MAJOR_VERSION @GLIB_MAJOR_VERSION@
++#define GLIB_MINOR_VERSION @GLIB_MINOR_VERSION@
++#define GLIB_MICRO_VERSION @GLIB_MICRO_VERSION@
++
++#define G_OS_WIN32
++#define G_PLATFORM_WIN32
++
++#define G_VA_COPY va_copy
++
++#define G_HAVE_ISO_VARARGS 1
++
++#define G_HAVE_GROWING_STACK 0
++
++#ifndef _MSC_VER
++# define G_HAVE_GNUC_VARARGS 1
++#endif
++
++#if defined (__GNUC__) && defined (G_HAVE_GNUC_VISIBILITY)
++#define G_GNUC_INTERNAL __attribute__((visibility("hidden")))
++#else
++#define G_GNUC_INTERNAL
++#endif
++
++#define G_THREADS_ENABLED
++#define G_THREADS_IMPL_WIN32
++
++#define G_ATOMIC_LOCK_FREE
++
++/* MSVC defines no __BYTE_ORDER__.  Every Windows target (x86, x86_64, arm,
++ * arm64) is little-endian, and Windows has never shipped on a big-endian
++ * target, so this is not a lost configuration.
++ */
++#define G_BYTE_ORDER G_LITTLE_ENDIAN
++
++#define GINT16_TO_LE(val)   ((gint16) (val))
++#define GUINT16_TO_LE(val)  ((guint16) (val))
++#define GINT16_TO_BE(val)   ((gint16) GUINT16_SWAP_LE_BE (val))
++#define GUINT16_TO_BE(val)  (GUINT16_SWAP_LE_BE (val))
++
++#define GINT32_TO_LE(val)   ((gint32) (val))
++#define GUINT32_TO_LE(val)  ((guint32) (val))
++#define GINT32_TO_BE(val)   ((gint32) GUINT32_SWAP_LE_BE (val))
++#define GUINT32_TO_BE(val)  (GUINT32_SWAP_LE_BE (val))
++
++#define GINT64_TO_LE(val)   ((gint64) (val))
++#define GUINT64_TO_LE(val)  ((guint64) (val))
++#define GINT64_TO_BE(val)   ((gint64) GUINT64_SWAP_LE_BE (val))
++#define GUINT64_TO_BE(val)  (GUINT64_SWAP_LE_BE (val))
++
++/* long is always 32 bits on Windows (LLP64). */
++#define GLONG_TO_LE(val)  ((glong) GINT32_TO_LE (val))
++#define GULONG_TO_LE(val) ((gulong) GUINT32_TO_LE (val))
++#define GLONG_TO_BE(val)  ((glong) GINT32_TO_BE (val))
++#define GULONG_TO_BE(val) ((gulong) GUINT32_TO_BE (val))
++
++#define GINT_TO_LE(val)   ((gint) GINT32_TO_LE (val))
++#define GUINT_TO_LE(val)  ((guint) GUINT32_TO_LE (val))
++#define GINT_TO_BE(val)   ((gint) GINT32_TO_BE (val))
++#define GUINT_TO_BE(val)  ((guint) GUINT32_TO_BE (val))
++
++#if SIZE_MAX == UINT64_MAX
++#  define GSIZE_TO_LE(val)  ((gsize) GUINT64_TO_LE (val))
++#  define GSSIZE_TO_LE(val) ((gssize) GINT64_TO_LE (val))
++#  define GSIZE_TO_BE(val)  ((gsize) GUINT64_TO_BE (val))
++#  define GSSIZE_TO_BE(val) ((gssize) GINT64_TO_BE (val))
++#elif SIZE_MAX == UINT32_MAX
++#  define GSIZE_TO_LE(val)  ((gsize) GUINT32_TO_LE (val))
++#  define GSSIZE_TO_LE(val) ((gssize) GINT32_TO_LE (val))
++#  define GSIZE_TO_BE(val)  ((gsize) GUINT32_TO_BE (val))
++#  define GSSIZE_TO_BE(val) ((gssize) GINT32_TO_BE (val))
++#else
++#  error "SIZE_MAX not in {UINT64_MAX, UINT32_MAX}"
++#endif
++
++#define GLIB_SYSDEF_POLLIN =1
++#define GLIB_SYSDEF_POLLOUT =4
++#define GLIB_SYSDEF_POLLPRI =2
++#define GLIB_SYSDEF_POLLHUP =16
++#define GLIB_SYSDEF_POLLERR =8
++#define GLIB_SYSDEF_POLLNVAL =32
++
++#define G_MODULE_SUFFIX "dll"
++
++/* A GPid is a process HANDLE on Windows, not a small integer. */
++typedef void * GPid;
++#define G_PID_FORMAT "p"
++
++/* Numeric rather than the winsock2.h names; see the include comment above.
++ * These are ABI, fixed since Winsock 1.1.
++ */
++#define GLIB_SYSDEF_AF_UNIX 1
++#define GLIB_SYSDEF_AF_INET 2
++#define GLIB_SYSDEF_AF_INET6 23
++
++#define GLIB_SYSDEF_MSG_OOB 1
++#define GLIB_SYSDEF_MSG_PEEK 2
++#define GLIB_SYSDEF_MSG_DONTROUTE 4
++
++#define G_DIR_SEPARATOR '\\'
++#define G_DIR_SEPARATOR_S "\\"
++#define G_SEARCHPATH_SEPARATOR ';'
++#define G_SEARCHPATH_SEPARATOR_S ";"
++
++#undef G_HAVE_FREE_SIZED
++
++G_END_DECLS
++
++#endif /* __GLIBCONFIG_H__ */
