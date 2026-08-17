@@ -3669,8 +3669,26 @@ TEST_P(AioTest, ForkedChildWithPendingAsyncWriteDies) {
 }
 #endif
 
-INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest,
-                         ::testing::Values("io_uring", "epoll"),
+// The backends this platform actually has.  --aio_backend is accepted and
+// ignored where there is only one, so instantiating the Linux names
+// everywhere does not select anything -- it just runs the whole suite once
+// per name against the same backend, and leaves GetParam() disagreeing with
+// the backend under test (which FailedIoErrorTest reads).
+//
+// Built as a function rather than inline in the macro call below: a
+// preprocessor directive inside a function-like macro's argument list is
+// undefined behavior, and MSVC rejects it outright.
+std::vector<std::string> Backends() {
+#if defined(__linux__)
+  return {"io_uring", "epoll"};
+#elif defined(_WIN32)
+  return {"iocp"};
+#else
+  return {"kqueue"};
+#endif
+}
+
+INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest, ::testing::ValuesIn(Backends()),
                          [](const ::testing::TestParamInfo<std::string> &info) {
                            return info.param;
                          });
