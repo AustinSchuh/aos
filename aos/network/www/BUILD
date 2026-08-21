@@ -1,5 +1,15 @@
 load("//aos:config.bzl", "aos_config")
+load("//tools:platforms.bzl", "platforms")
 load("//tools/build_rules:js.bzl", "rollup_bundle", "ts_project")
+
+# Bazel does not sandbox on Windows, and the root tsconfig.json declares no
+# files/include, so tsc falls back to globbing "**/*" and drags every unrelated
+# .ts/.tsx file in the shared bin tree into the compilation.  Keep the web UI on
+# Unix until the ts_projects get scoped tsconfigs of their own.
+_UNIX_ONLY = platforms.any_of([
+    "@platforms//os:linux",
+    "@platforms//os:macos",
+])
 
 exports_files(["styles.css"])
 
@@ -18,6 +28,7 @@ ts_project(
         "config_handler.ts",
         "proxy.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
     deps = [
         ":reflection_ts",
@@ -36,6 +47,7 @@ ts_project(
         "main.ts",
         "ping_handler.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     deps = [
         ":proxy",
         "//aos/testing/ping_pong:ping_ts_fbs",
@@ -46,6 +58,7 @@ ts_project(
 rollup_bundle(
     name = "main_bundle",
     entry_point = "main.js",
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//aos:__subpackages__"],
     deps = [
         ":main",
@@ -57,6 +70,7 @@ ts_project(
     srcs = [
         "reflection_test_main.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     deps = [
         ":reflection_ts",
         "//:node_modules/flatbuffers_reflection",
@@ -70,6 +84,7 @@ ts_project(
 ts_project(
     name = "reflection_ts",
     srcs = ["reflection.ts"],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
     deps = [
         "//:node_modules/flatbuffers_reflection",
@@ -84,6 +99,7 @@ ts_project(
     srcs = [
         "colors.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
 )
 
@@ -92,6 +108,7 @@ ts_project(
     srcs = [
         "plotter.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
     deps = [":colors"],
 )
@@ -101,6 +118,7 @@ ts_project(
     srcs = [
         "aos_plotter.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
     deps = [
         ":plotter",
@@ -119,6 +137,7 @@ ts_project(
     srcs = [
         "demo_plot.ts",
     ],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
     deps = [
         ":aos_plotter",
@@ -140,6 +159,7 @@ aos_config(
         "//aos:configuration_fbs",
         "//aos:json_to_flatbuffer_fbs",
     ],
+    target_compatible_with = _UNIX_ONLY,
     visibility = ["//visibility:public"],
     deps = [
         "//aos/events:aos_config",
@@ -149,6 +169,7 @@ aos_config(
 rollup_bundle(
     name = "reflection_test_bundle",
     entry_point = "reflection_test_main.js",
+    target_compatible_with = _UNIX_ONLY,
     deps = [
         ":reflection_test_main",
     ],
@@ -163,4 +184,5 @@ sh_binary(
         ":test_config",
         "//aos/network:web_proxy_main",
     ],
+    target_compatible_with = _UNIX_ONLY,
 )
