@@ -246,6 +246,7 @@ cc_library(
         "//frc/vision:visualize_robot",
         "//frc/vision/ceres:pose_graph_3d_lib",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "@ceres-solver//:ceres",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",

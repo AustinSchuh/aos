@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
+import base64
+import collections
 import contextlib
+import hashlib
+import json
 import unicodedata
 import jinja2
 import pathlib
@@ -258,6 +262,35 @@ def read_linker_script(filename):
         return None
 
 
+def parse_requires(line: str) -> list[str]:
+    """Parses the package names out of a pkgconf Requires/Requires.private line.
+
+    pkgconf separates the entries with commas, whitespace, or both, and each
+    entry is a package name optionally followed by a version constraint:
+
+      Requires: glib-2.0 >= 2.56.0, gobject-2.0
+      Requires: pango >= 1.41.0 pangocairo >= 1.41.0 cairo >= 1.14.0
+
+    So we can't just split on commas -- gdk-3.0 and gtk+-3.0 write their whole
+    list whitespace separated, and taking the first name of each comma chunk
+    silently drops everything after the first package.
+    """
+    tokens = line.replace(',', ' ').split()
+
+    packages = []
+    i = 0
+    while i < len(tokens):
+        packages.append(tokens[i])
+        # Skip the version constraint, if this entry has one.
+        if i + 2 < len(tokens) and tokens[i + 1] in ('<', '>', '<=', '>=', '=',
+                                                     '!='):
+            i += 3
+        else:
+            i += 1
+
+    return packages
+
+
 class NameVersion:
     """Class representing a package name and optionally a version constraint. """
 
@@ -462,18 +495,14 @@ class PkgConfig:
             elif line.startswith('Requires:'):
                 # Parse a Requires line of the form:
                 # Requires: glib-2.0 >= 2.56.0, gobject-2.0
-                self.requires += [
-                    f.split()[0] for f in self.expand(
-                        line.removeprefix('Requires:').strip()).split(',') if f
-                ]
+                self.requires += parse_requires(
+                    self.expand(line.removeprefix('Requires:').strip()))
             elif line.startswith('Requires.private:'):
                 # Parse a Requires.private line of the form:
                 # Requires.private: gmodule-2.0
-                self.requires += [
-                    f.split()[0] for f in self.expand(
-                        line.removeprefix('Requires.private:').strip()).split(
-                            ',') if f
-                ]
+                self.requires += parse_requires(
+                    self.expand(
+                        line.removeprefix('Requires.private:').strip()))
             elif line.startswith('Libs.private:'):
                 pass
             elif line.startswith('Conflicts:'):
@@ -621,6 +650,8 @@ class Filesystem:
         for p in self.packages.values():
             p.update_filetypes(self.directories, self.symlinks)
 
+        self.find_case_collisions()
+
         # Print out all the libraries and where they live as known to ldconfig
         result = subprocess.run(
             [
@@ -666,6 +697,124 @@ class Filesystem:
                     self.pkgcfg[package_name] = PkgConfig(
                         file.read(), self.files[f'{pkgconfig}/{f}'],
                         f"{candidate_folder}/{f}")
+
+    def find_case_collisions(self):
+        """Finds paths which are the same file on a case insensitive filesystem.
+
+        Debian ships a handful of these -- libCharLS.so.2 next to
+        libcharls.so.2, PAM.7.gz next to pam.7.gz, half the terminfo database.
+        On Linux they are separate files, but on OSX untarring the rootfs
+        collapses each pair down to whichever one tar wrote last.  A BUILD file
+        naming both then references a path which isn't there.
+
+        We can't tell from here which spelling survives, so we pick one and
+        only ever name that one.  Which one we can safely pick depends on what
+        the colliding paths are:
+
+          Symlinks can be recreated after the fact, so we keep one (preferring
+          the all lowercase spelling, since that is the one SONAMEs and #include
+          lines use) and report the patch_cmds which pin it.
+
+          Regular files can't be recreated -- we have no way to put the right
+          contents back -- so the whole group is dropped from the BUILD.  So far
+          these have all been man pages and terminfo entries that nothing
+          builds against.
+
+        Sets self.case_collisions, mapping every colliding path to the spelling
+        we keep (or None when the whole group is dropped).
+        """
+        groups = collections.defaultdict(set)
+        for path in list(self.files) + list(self.symlinks):
+            groups[path.lower()].add(path)
+
+        self.case_collisions = dict()
+        self.case_collision_groups = []
+        # Filled in by strip_case_collisions() as we emit rules.  Most of these
+        # collisions are in corners of the rootfs nothing builds against (the
+        # terminfo database alone accounts for two dozen), so only the ones we
+        # actually had to do something about are worth reporting.
+        self.hit_case_collisions = set()
+        for _, paths in sorted(groups.items()):
+            if len(paths) < 2:
+                continue
+
+            paths = sorted(paths)
+            if all(path in self.symlinks for path in paths):
+                # Prefer the all lowercase spelling if there is exactly one.
+                lowercase = [path for path in paths if path == path.lower()]
+                keep = lowercase[0] if len(lowercase) == 1 else paths[0]
+            else:
+                keep = None
+
+            self.case_collision_groups.append((paths, keep))
+            for path in paths:
+                self.case_collisions[path] = keep
+
+        if self.case_collision_groups:
+            logging.warning(
+                'Found %d case insensitive filename collisions.  See the '
+                'header of the generated BUILD file.',
+                len(self.case_collision_groups))
+
+    def strip_case_collisions(self, paths: list[str]) -> list[str]:
+        """Drops every spelling of a colliding path except the one we keep."""
+        result = []
+        for path in paths:
+            if path not in self.case_collisions:
+                result.append(path)
+                continue
+
+            self.hit_case_collisions.add(path.lower())
+            if self.case_collisions[path] == path:
+                result.append(path)
+
+        return result
+
+    def case_collision_report(self) -> str:
+        """Renders what find_case_collisions() decided as a BUILD comment.
+
+        The patch_cmds it prints are what MODULE.bazel needs for the rootfs to
+        match this BUILD file on a case insensitive filesystem.  Keep the two in
+        sync -- nothing checks it for you.
+        """
+        hits = [(paths, keep) for paths, keep in self.case_collision_groups
+                if paths[0].lower() in self.hit_case_collisions]
+        if not hits:
+            return ('# None of the case insensitive filename collisions in '
+                    'this rootfs are reachable\n# from the packages we build '
+                    'against.')
+
+        lines = [
+            '# Case insensitive filename collisions.',
+            '#',
+            '# These paths are distinct on Linux but the same file on OSX, so',
+            '# only the spelling marked "keeping" is named below.  Symlinks are',
+            '# pinned by patch_cmds in MODULE.bazel; regular files are dropped',
+            '# outright because we can\'t recreate their contents:',
+            '#',
+            '#     single_version_override(',
+            '#         module_name = "...",',
+            '#         patch_cmds = [',
+        ]
+        for paths, keep in hits:
+            if keep is None:
+                lines.append('#             "rm -f %s",' %
+                             ' '.join(path[1:] for path in paths))
+            else:
+                lines.append('#             "rm -f %s",' % keep[1:])
+                lines.append('#             "ln -s %s %s",' %
+                             (self.symlinks[keep], keep[1:]))
+        lines += [
+            '#         ],',
+            '#     )',
+            '#',
+        ]
+        for paths, keep in hits:
+            lines.append('# %s' % ' '.join(paths))
+            lines.append('#     -> %s' %
+                         ('dropped' if keep is None else 'keeping ' + keep))
+
+        return '\n'.join(lines)
 
     def resolve_symlink(self, path: str) -> str:
         """ Implements symlink resolution using self.symlinks. """
@@ -792,6 +941,36 @@ class Filesystem:
         return deps, soname, runpaths
 
 
+def write_overlay_build_file(build_file: str, contents: str):
+    """Writes a generated BUILD file out as a bazel registry overlay.
+
+    The BUILD file is an overlay on top of the sysroot tarball, and the
+    source.json beside it pins its hash.  Bazel refuses to fetch the module when
+    the two disagree, and buildifier rewrites the bytes we just generated, so
+    format first and stamp the hash afterwards -- both here, rather than leaving
+    them as steps to remember.
+    """
+    with open(build_file, "w") as file:
+        file.write(contents)
+
+    subprocess.run(['buildifier', build_file], check=True)
+
+    digest = hashlib.sha256(pathlib.Path(build_file).read_bytes()).digest()
+    integrity = 'sha256-' + base64.b64encode(digest).decode()
+
+    source_json = pathlib.Path(build_file).parent.parent / 'source.json'
+    source = json.loads(source_json.read_text())
+    previous = source['overlay'][os.path.basename(build_file)]
+    source['overlay'][os.path.basename(build_file)] = integrity
+    source_json.write_text(json.dumps(source, indent=4) + '\n')
+
+    print(f'Wrote {build_file}', file=sys.stderr)
+    if previous == integrity:
+        print(f'  {source_json} already had {integrity}', file=sys.stderr)
+    else:
+        print(f'  {source_json}: {previous} -> {integrity}', file=sys.stderr)
+
+
 def generate_build_file(filesystem, packages_to_eval, template_filename):
     # Now, we want to figure out what the dependencies of each of the packages are.
     # Generate the dependency tree starting from an initial list of packages.
@@ -814,8 +993,8 @@ def generate_build_file(filesystem, packages_to_eval, template_filename):
             continue
         packages_visited_set.add(next_package)
 
-        hdrs = next_package.headers()
-        objects = next_package.objects()
+        hdrs = filesystem.strip_case_collisions(next_package.headers())
+        objects = filesystem.strip_case_collisions(next_package.objects())
 
         deps = []
         for p in next_package.resolved_depends(filesystem.packages):
@@ -843,10 +1022,10 @@ def generate_build_file(filesystem, packages_to_eval, template_filename):
         hdrs_files = ''.join(hdrs)
         deps_joined = ''.join([f'        ":{d}-headers",\n' for d in deps])
 
-        filegroup_srcs = ''.join(
-            [f'        "{f[1:]}",\n' for f in next_package.files] +
-            [f'        "{f[1:]}",\n' for f in next_package.symlinks.keys()] +
-            [f'        ":{d}-filegroup",\n' for d in deps])
+        filegroup_srcs = ''.join([
+            f'        "{f[1:]}",\n' for f in filesystem.strip_case_collisions(
+                list(next_package.files) + list(next_package.symlinks.keys()))
+        ] + [f'        ":{d}-filegroup",\n' for d in deps])
 
         rules.append(
             f'filegroup(\n    name = "{next_package.name.name}-filegroup",\n    srcs = [\n{filegroup_srcs}    ],\n    visibility = ["//visibility:public"],\n)'
@@ -961,7 +1140,7 @@ def generate_build_file(filesystem, packages_to_eval, template_filename):
     # re-generating to minimize git diffs.
     rules.sort()
     substitutions = {
-        "RULES": '\n\n'.join(rules),
+        "RULES": '\n\n'.join([filesystem.case_collision_report()] + rules),
     }
 
     return template.render(substitutions)

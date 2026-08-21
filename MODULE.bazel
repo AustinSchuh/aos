@@ -11,6 +11,7 @@ single_version_override(
     patches = ["third_party/rules_cc/0001-Declare-the-Objective-C-compile-actions.patch"],
     version = "0.2.18",
 )
+
 bazel_dep(name = "rules_cuda", version = "0.3.0")
 
 # Pin to an upstream commit past v0.3.0 that includes the configurable
@@ -259,10 +260,8 @@ bazel_dep(name = "foxglove_ws_protocol", version = "0.8.1")
 bazel_dep(name = "rules_m4", version = "0.2.4")
 bazel_dep(name = "rawrtc", version = "0.5.2")
 bazel_dep(name = "bazel_iwyu", version = "0.0.4")
-
 bazel_dep(name = "amd64_tensorrt", version = "10.9.0")
 bazel_dep(name = "amd64_debian_sysroot", version = "2025.04.20")
-
 bazel_dep(name = "rules_rust", version = "0.71.3")
 
 # Generates the Rust declarations for our C FFI headers.  The toolchain in
@@ -281,6 +280,7 @@ single_version_override(
 )
 
 register_toolchains("//tools/rust:bindgen_toolchain")
+
 register_toolchains("//tools/rust:bindgen_toolchain_darwin")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
@@ -356,7 +356,6 @@ http_archive(
 )
 
 bazel_dep(name = "arm64_debian_sysroot", version = "2025.10.25")
-
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "buildozer", version = "8.2.1")
 
@@ -497,7 +496,6 @@ single_version_override(
 )
 
 bazel_dep(name = "asio", version = "1.28.2")
-
 bazel_dep(name = "ctre_phoenix6_api_cpp_headers", version = "25.3.2")
 bazel_dep(name = "ctre_phoenix6_tools_headers", version = "25.3.2")
 bazel_dep(name = "ctre_phoenix6_api_cpp_athena", version = "25.3.2")
@@ -507,7 +505,6 @@ bazel_dep(name = "ctre_phoenix_api_cpp_headers", version = "5.35.0")
 bazel_dep(name = "ctre_phoenix_api_cpp_athena", version = "5.35.0")
 bazel_dep(name = "ctre_phoenix_cci_headers", version = "5.35.0")
 bazel_dep(name = "ctre_phoenix_cci_athena", version = "5.35.0")
-
 bazel_dep(name = "rules_halide", version = "0.0.1")
 archive_override(
     module_name = "rules_halide",
@@ -839,10 +836,28 @@ use_repo(mock_external_fbs_repo_extension, "mock_external_fbs_repo")
 single_version_override(
     module_name = "amd64_debian_sysroot",
     patch_cmds = [
-        # OSX is case insensitive filenames.  Fix up the couple of them which are case sensitive.
-        "rm -f usr/lib/x86_64-linux-gnu/libCharLS.so.2",
-        "ln -s libcharls.so.2.4.1 usr/lib/x86_64-linux-gnu/libCharLS.so.2",
-        "rm -f usr/share/man/man2/_Exit.2.gz usr/share/man/man2/exit.2.gz usr/share/man/man7/pam.7.gz",
+        # OSX has case insensitive filenames, so each of these pairs is one
+        # file there rather than two.  Normalize the rootfs down to what the
+        # generated BUILD file names, so it resolves the same on both.
+        #
+        # compilers/rootfs_utils.py works out this list -- it is repeated at
+        # the top of the sysroot's BUILD.bazel.  Regenerate the sysroot and
+        # copy it back over if it changes.
+        "rm -f usr/include/linux/netfilter/xt_CONNMARK.h usr/include/linux/netfilter/xt_connmark.h",
+        "rm -f usr/include/linux/netfilter/xt_DSCP.h usr/include/linux/netfilter/xt_dscp.h",
+        "rm -f usr/include/linux/netfilter/xt_MARK.h usr/include/linux/netfilter/xt_mark.h",
+        "rm -f usr/include/linux/netfilter/xt_RATEEST.h usr/include/linux/netfilter/xt_rateest.h",
+        "rm -f usr/include/linux/netfilter/xt_TCPMSS.h usr/include/linux/netfilter/xt_tcpmss.h",
+        "rm -f usr/include/linux/netfilter_ipv4/ipt_ECN.h usr/include/linux/netfilter_ipv4/ipt_ecn.h",
+        "rm -f usr/include/linux/netfilter_ipv4/ipt_TTL.h usr/include/linux/netfilter_ipv4/ipt_ttl.h",
+        "rm -f usr/include/linux/netfilter_ipv6/ip6t_HL.h usr/include/linux/netfilter_ipv6/ip6t_hl.h",
+        "rm -f usr/lib/x86_64-linux-gnu/libcharls.so.2",
+        "ln -s libcharls.so.2.4.1 usr/lib/x86_64-linux-gnu/libcharls.so.2",
+        "rm -f usr/share/doc/libffi8/html/Index.html usr/share/doc/libffi8/html/index.html",
+        "rm -f usr/share/man/man7/PAM.7.gz usr/share/man/man7/pam.7.gz",
+        # Not reachable from any package we build against, so the generator
+        # doesn't list them, but tar still has to unpack them on a Mac.
+        "rm -f usr/share/man/man2/_Exit.2.gz usr/share/man/man2/exit.2.gz",
         "rm -f usr/share/terminfo/N/NCR260VT300WPP",
     ],
     version = "2025.04.20",

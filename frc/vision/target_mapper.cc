@@ -4,6 +4,7 @@
 
 #include "absl/flags/flag.h"
 #include "absl/strings/str_format.h"
+#include "opencv2/highgui.hpp"
 
 #include "frc/control_loops/control_loop.h"
 #include "frc/vision/ceres/pose_graph_3d_error_term.h"

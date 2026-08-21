@@ -177,6 +177,7 @@ cuda_library(
         "//aos/testing:random_seed",
         "//frc/vision:vision_fbs",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
         "//third_party/apriltag",
         "@bazel_tools//tools/cpp/runfiles",
     ],
@@ -290,6 +291,7 @@ cuda_library(
         "//frc/vision:target_map_fbs",
         "//frc/vision:vision_util_lib",
         "//third_party:opencv",
+        "//third_party:opencv_highgui",
     ],
 )
 
