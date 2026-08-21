@@ -166,12 +166,13 @@ inline WindowsAsyncState &State(AsyncRequest *request) {
 }  // namespace
 
 struct WindowsTimerState;
-struct IocpImpl;
+class IocpImpl;
 
 // Thread pool callbacks
 VOID CALLBACK CustomHandleCallback(PVOID lpParameter, BOOLEAN TimerOrWaitFired);
 
-struct IocpImpl : public Aio::Impl {
+class IocpImpl : public Aio::Impl {
+ public:
   IocpImpl();
   ~IocpImpl() override;
 
