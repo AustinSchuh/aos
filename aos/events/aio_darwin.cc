@@ -395,6 +395,11 @@ class KqueueImpl : public Aio::Impl {
   // Non-zero while Poll() is dispatching callbacks; see the
   // reclaim loop at the top of Poll().
   int dispatch_depth_ = 0;
+  // True only while Poll() is running the before-wait functions.  Separate
+  // from dispatch_depth_ because the two guard different things: BeforeWait()
+  // is legal from a completion callback (where dispatch_depth_ is also
+  // non-zero) and illegal only from another before-wait function.
+  bool in_before_wait_ = false;
   std::vector<std::function<void()>> before_wait_functions_;
 
   // Quit() is documented in aio.h as callable from any thread, so these are
@@ -768,6 +773,12 @@ void KqueueImpl::Run() {
 }
 
 bool KqueueImpl::Poll(bool block) {
+  // Not reentrant, matching IoUringImpl::Poll().  dispatch_depth_ covers
+  // the whole body below, before-wait functions included.
+  ABSL_CHECK_EQ(dispatch_depth_, 0)
+      << "Aio::Poll() reentered from inside a completion callback or "
+         "before-wait function; wait by returning to the event loop instead";
+
   CheckForFork();
   // Reclaim registrations retired by earlier dispatches.
   // ReleaseRegistration() deliberately does not scrub or free them itself: a
@@ -778,21 +789,22 @@ bool KqueueImpl::Poll(bool block) {
   // the reg->fd != -1 guard cannot help -- it is reading the recycled memory to
   // make its decision.  Destroying the parked std::functions there is just as
   // bad: one of them can be the very function running.  Here no dispatch is in
-  // flight, so nothing holds a registration pointer.  dispatch_depth_ keeps a
-  // nested Poll() (one invoked from a callback) from recycling something the
-  // Poll() underneath it is still walking.
-  if (dispatch_depth_ == 0) {
-    ScrubRetiredRegistrations();
-  }
+  // flight (the reentrancy CHECK above), so nothing holds a registration
+  // pointer and no retired callback is on the stack.
+  ScrubRetiredRegistrations();
   struct DispatchDepth {
     int *depth;
     explicit DispatchDepth(int *d) : depth(d) { ++*depth; }
     ~DispatchDepth() { --*depth; }
   } dispatch_depth_guard(&dispatch_depth_);
 
+  // Registering a before-wait function from inside one is disallowed --
+  // see KqueueImpl::BeforeWait().
+  in_before_wait_ = true;
   for (const auto &fn : before_wait_functions_) {
     fn();
   }
+  in_before_wait_ = false;
 
   bool processed = false;
 
@@ -1163,6 +1175,18 @@ void KqueueImpl::Cancel(AsyncRequest *request) {
 }
 
 void KqueueImpl::BeforeWait(std::function<void()> function) {
+  // Same-thread only, like every other registration call: Poll() iterates
+  // before_wait_functions_, so a push_back from another thread would race it.
+  // (CheckForFork() also enforces that -- see there.)
+  CheckForFork();
+  // Not from inside a before-wait function: the push_back can reallocate the
+  // vector while Poll()'s iteration is executing an element in the old
+  // storage.  Deterministically illegal rather than sometimes-corrupting --
+  // unguarded, this is a use-after-free of the running std::function, and it
+  // reproduces as a SIGSEGV the moment the callback touches a capture.
+  // Same contract, and the same message, as IoUringImpl::BeforeWait().
+  ABSL_CHECK(!in_before_wait_)
+      << ": BeforeWait() may not be called from a before-wait function";
   before_wait_functions_.push_back(std::move(function));
 }
 

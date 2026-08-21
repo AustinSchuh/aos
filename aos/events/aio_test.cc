@@ -200,6 +200,20 @@ class AioTest : public ::testing::TestWithParam<std::string> {
 #endif
   }
 
+  // The name the backend under test calls itself by in its messages.  On
+  // Linux the parameter is that name; everywhere else the parameter is
+  // ignored along with --aio_backend, so both passes run the one backend
+  // that platform has and it is that one's name that surfaces.
+  static std::string BackendName() {
+#if defined(__linux__)
+    return GetParam();
+#elif defined(_WIN32)
+    return "iocp";
+#else
+    return "kqueue";
+#endif
+  }
+
   void SetUp() override {
     // Pace ring creation across the whole suite, not just the
     // ring-churning tests -- see ThrottleOnKernelRingTeardown().
@@ -218,8 +232,22 @@ class AioTest : public ::testing::TestWithParam<std::string> {
 class AioReproTest : public ::testing::Test {
  protected:
   void SetUp() override {
+#if defined(__linux__)
     ThrottleOnKernelRingTeardown();
     ::absl::SetFlag(&FLAGS_aio_backend, "io_uring");
+#else
+    // These pin down io_uring's internals -- SQEs staged against
+    // --aio_queue_depth before the ring is enabled, CQ overflow terminating a
+    // multishot poll -- and no other backend has those shapes at all: kqueue
+    // submits each kevent() immediately and IOCP has no completion-queue
+    // overflow, so --aio_queue_depth is not even read off Linux.
+    //
+    // The SetFlag above is a no-op here (--aio_backend is accepted and ignored
+    // off Linux; see AioTest::IsIoUring()), so without this these would quietly
+    // run a second pass over kqueue/IOCP and assert behavior those backends
+    // never promised.  Skip rather than lie about what ran.
+    GTEST_SKIP() << "io_uring-specific regression tests; Linux only.";
+#endif
   }
 
   absl::FlagSaver flag_saver_;
@@ -941,7 +969,7 @@ TEST_P(AioTest, FailedIoErrorTest) {
   ASSERT_TRUE(fired_status.has_value());
   EXPECT_FALSE(aos::IsOk(*fired_status));
   // Each backend names itself in its operational-failure message.
-  EXPECT_EQ(fired_status->error().message(), GetParam() + " error");
+  EXPECT_EQ(fired_status->error().message(), BackendName() + " error");
   EXPECT_EQ(result_code, EBADF);
 }
 
