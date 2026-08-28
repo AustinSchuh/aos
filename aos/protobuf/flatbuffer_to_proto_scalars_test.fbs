@@ -1,0 +1,73 @@
+// Every encoding the translator can emit, and structs.
+//
+// flatbuffer_to_proto_test.fbs mirrors a real .proto, so what it covers is
+// whatever that proto happens to use -- which is no float, no double, no
+// fixed-width integer and no struct at all.  This schema exists to be
+// exhaustive rather than realistic, so each path through WriteScalar() and
+// WriteStruct() has a test that reaches only it.
+
+namespace aos.testing;
+
+attribute "proto_type";
+
+// Struct fields have no vtable, so none of them can be absent and a zero is a
+// real zero rather than a field that was left out.
+struct Inner {
+  a:int;
+  b:float;
+}
+
+// A struct inside a struct, which is the recursive half of WriteStruct().
+struct Outer {
+  inner:Inner;
+  c:double;
+}
+
+table Scalars {
+  the_bool:bool (id: 0);
+  the_byte:byte (id: 1);
+  the_ubyte:ubyte (id: 2);
+  the_short:short (id: 3);
+  the_ushort:ushort (id: 4);
+  the_int:int (id: 5);
+  the_uint:uint (id: 6);
+  the_long:long (id: 7);
+  the_ulong:ulong (id: 8);
+  the_float:float (id: 9);
+  the_double:double (id: 10);
+  the_string:string (id: 11);
+  zigzag_int:int (id: 12, proto_type: "sint32");
+  zigzag_long:long (id: 13, proto_type: "sint64");
+  fixed_uint:uint (id: 14, proto_type: "fixed32");
+  fixed_int:int (id: 15, proto_type: "sfixed32");
+  fixed_ulong:ulong (id: 16, proto_type: "fixed64");
+  fixed_long:long (id: 17, proto_type: "sfixed64");
+  outer:Outer (id: 18);
+  inners:[Inner] (id: 19);
+
+  // A vector of each of the above.  proto3 packs repeated scalars, so these go
+  // through a different path than the singular fields: one length-delimited
+  // field holding the elements back to back, sized by measuring each one
+  // before any of them is written.  Repeated strings are the exception -- not
+  // packable, so one tagged field each.
+  bools:[bool] (id: 20);
+  bytes_:[byte] (id: 21);
+  ubytes:[ubyte] (id: 22);
+  shorts:[short] (id: 23);
+  ushorts:[ushort] (id: 24);
+  ints:[int] (id: 25);
+  uints:[uint] (id: 26);
+  longs:[long] (id: 27);
+  ulongs:[ulong] (id: 28);
+  floats:[float] (id: 29);
+  doubles:[double] (id: 30);
+  strings:[string] (id: 31);
+  zigzag_ints:[int] (id: 32, proto_type: "sint32");
+  zigzag_longs:[long] (id: 33, proto_type: "sint64");
+  fixed_uints:[uint] (id: 34, proto_type: "fixed32");
+  fixed_ints:[int] (id: 35, proto_type: "sfixed32");
+  fixed_ulongs:[ulong] (id: 36, proto_type: "fixed64");
+  fixed_longs:[long] (id: 37, proto_type: "sfixed64");
+}
+
+root_type Scalars;

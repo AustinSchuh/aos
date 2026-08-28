@@ -1,0 +1,14 @@
+// A schema whose proto_type attribute has nothing to pick: a bool is a
+// protobuf bool and nothing else.  Its own file because it exists to be
+// rejected, and a schema that dies on construction cannot share one with the
+// schemas the other tests encode.
+
+namespace aos.testing;
+
+attribute "proto_type";
+
+table BadAttribute {
+  the_bool:bool (id: 0, proto_type: "sint32");
+}
+
+root_type BadAttribute;
