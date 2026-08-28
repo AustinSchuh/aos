@@ -1,0 +1,18 @@
+// A schema whose objects span two namespaces, which is what a .fbs that
+// includes another one from a different namespace produces -- aos/network/
+// web_proxy.fbs is namespace aos.web_proxy and includes aos/configuration.fbs,
+// so its .bfbs carries objects from both.
+//
+// Encoding one of these is fine; the wire format has no notion of a package.
+// Generating a FileDescriptorProto for one is not, and this schema exists to
+// hold that line down.
+
+include "aos/protobuf/flatbuffer_to_proto_test.fbs";
+
+namespace aos.testing.spanning;
+
+table Spanning {
+  control_data:aos.testing.ControlData (id: 0);
+}
+
+root_type Spanning;
