@@ -16,6 +16,10 @@ void Aio::Impl::CheckNoRawRequestsInFlightOnFork() const {
          "before forking, or keep the child away from this Aio.";
 }
 
+Aio::Aio(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
+  ABSL_CHECK(impl_ != nullptr) << ": Aio needs a backend";
+}
+
 Aio::~Aio() = default;
 
 // The calls below that register, replace or remove something allocate or

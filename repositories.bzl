@@ -159,6 +159,18 @@ alias(
         url = "https://github.com/axboe/liburing/archive/refs/tags/liburing-2.14.tar.gz",
     )
 
+    # Kept in sync with the libuv bazel_dep in MODULE.bazel.  bzlmod gets
+    # BUILD.bazel from the registry's overlay; WORKSPACE mode cannot apply an
+    # overlay, so it passes the same file as build_file.  See
+    # third_party/libuv/README.md.
+    http_archive(
+        name = "libuv",
+        build_file = "//:third_party/libuv/libuv.BUILD.bazel",
+        integrity = "sha256-jCU62w+ACSamy9HGV2q64LyOuGpPiRBJty+eW33FjzM=",
+        strip_prefix = "libuv-1.48.0",
+        url = "https://github.com/libuv/libuv/archive/refs/tags/v1.48.0.tar.gz",
+    )
+
     # Sysroot generated using //frc/amd64/build_rootfs.py
     http_archive(
         name = "amd64_debian_sysroot",

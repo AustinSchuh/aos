@@ -165,7 +165,8 @@ class Aio {
   struct Impl;
 
   Aio();
-  ~Aio();
+
+  virtual ~Aio();
 
   Aio(const Aio &) = delete;
   Aio &operator=(const Aio &) = delete;
@@ -235,6 +236,13 @@ class Aio {
 
   // Schedules an asynchronous read on a file descriptor.
   //
+  // Completion::result is a byte count, and like read(2) it may be short: a
+  // completion is one transfer, not a guarantee that the whole buffer moved.
+  // A caller who needs the rest reissues from where the count left off.  Every
+  // backend behaves this way -- io_uring's CQE carries the same count the
+  // syscall would, and the readiness backends complete on whatever the one
+  // read() they perform returned.
+  //
   // How many raw requests may be in flight on one fd at once is
   // backend-dependent, deliberately.  io_uring can have any number.  The
   // readiness backends hold one per direction per fd -- a registration has
@@ -248,11 +256,12 @@ class Aio {
   // the fd's flags are left as they were, and a regular-file read is not cut
   // short by what happens to be cached.
   //
-  // The readiness backends have gaps:
+  // The readiness backends (epoll, kqueue, UvAio) have gaps:
   //   - An fd with no per-call way to avoid sleeping (on Linux, any fd that
   //     refuses RWF_NOWAIT: a tty, say, or a pipe or socket on an older
-  //     kernel; and every fd on Linux 5.9 and 5.10, whose RWF_NOWAIT reads
-  //     can return a spurious 0) may be made O_NONBLOCK and left that way.
+  //     kernel; every fd on Linux 5.9 and 5.10, whose RWF_NOWAIT reads can
+  //     return a spurious 0; any fd on macOS) may be made O_NONBLOCK and left
+  //     that way.  UvAio always does: libuv's uv_poll_init() sets it.
   //   - Nothing can wait for a regular file or block device to be ready, so
   //     their I/O runs synchronously inside Poll(), and the loop thread
   //     sleeps on the disk.
@@ -477,11 +486,20 @@ class Aio {
   // ThreadSignalReceiver.
   void ConsumeThreadSignalReceiver(ipc_lib::ThreadSignalReceiver *receiver);
 
+ protected:
+  // Builds an Aio around a caller-supplied backend, for subclasses that
+  // implement one.  The backend selection in the default constructor stays
+  // where it is -- this is deliberately not a way to reach the built-in
+  // backends without going through --aio_backend.
+  explicit Aio(std::unique_ptr<Impl> impl);
+
  private:
   friend class IoUringImpl;
   friend class EpollImpl;
   friend class KqueueImpl;
   friend class IocpImpl;
+  // Reaches its own Impl for did_work(); see UvAio::TakeDidWork().
+  friend class UvAio;
 
   std::unique_ptr<Impl> impl_;
 };
