@@ -251,6 +251,26 @@ cc_test(
     ],
 )
 
+# The same contracts, against the libuv backend.  UvAio implements the same Aio
+# interface, so the suite that documents what that interface promises is the
+# test that says whether it does.
+cc_test(
+    name = "aio_test_uv",
+    srcs = ["aio_test_uv.cc"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":aio",
+        ":aio_test_lib",
+        ":aio_uv",
+        "//aos/testing:googletest",
+        "@com_google_absl//absl/log:check",
+        "@libuv",
+    ],
+)
+
 cc_library(
     name = "timerfd",
     srcs = ["timerfd.cc"],
@@ -1020,6 +1040,53 @@ cc_library(
         "@com_google_absl//absl/log:check",
         "@glib//glib",
         "@glib//gobject",
+    ],
+)
+
+cc_library(
+    name = "aio_uv",
+    srcs = [
+        # Same package as :aio, so this backend can see the Impl interface it
+        # implements without that interface becoming public.
+        "aio_internal.h",
+        "aio_uv.cc",
+        "aio_uv_internal.h",
+        # The platform half; see aio_uv_internal.h.
+        "aio_uv_posix.cc",
+    ],
+    hdrs = [
+        "aio_uv.h",
+    ],
+    # libuv's loop is a descriptor to poll on Linux and macOS, and an IOCP on
+    # Windows that nothing else can wait on.  macOS is excluded too for now:
+    # its ThreadSignalReceiver has no descriptor, and it has no timerfd.
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":aio",
+        "//aos:realtime",
+        "//aos/ipc_lib:thread_signal",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/log:die_if_null",
+        "@libuv",
+    ],
+)
+
+cc_test(
+    name = "aio_uv_backend_test",
+    srcs = [
+        "aio_uv_backend_test.cc",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":aio",
+        ":aio_uv",
+        ":pipe",
+        "//aos/testing:googletest",
+        "//aos/time",
+        "@com_google_absl//absl/log:absl_check",
+        "@libuv",
     ],
 )
 

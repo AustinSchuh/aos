@@ -13,6 +13,10 @@ void Aio::Impl::CheckNoRawRequestsInFlightOnFork() const {
          "Cancel() them before forking, or keep the child away from this Aio.";
 }
 
+Aio::Aio(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
+  ABSL_CHECK(impl_ != nullptr) << ": Aio needs a backend";
+}
+
 Aio::~Aio() = default;
 
 void Aio::Run() { impl_->Run(); }
