@@ -779,7 +779,10 @@ cc_test(
     flaky = True,
     local_defines = ["AOS_UV_ONLY"],
     shard_count = 50,
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":aio_uv",
         ":event_loop_param_test",

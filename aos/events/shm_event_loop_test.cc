@@ -90,6 +90,29 @@ class ShmEventLoopTestFactory : public EventLoopTestFactory {
 
 #if defined(AOS_UV_ONLY)
 
+// Sets gtest's death_test_style for as long as it exists, and puts back
+// whatever was there before.
+//
+// Hand-rolled because neither ready-made saver fits: gtest's own
+// GTEST_FLAG_SAVER_ is only forward-declared in the installed headers, so it
+// cannot be a member, and absl::FlagSaver does not see gtest's flags unless
+// gtest is built with --define absl=1, which we do not -- it would compile and
+// silently restore nothing.
+class ScopedDeathTestStyle {
+ public:
+  explicit ScopedDeathTestStyle(const char *style)
+      : saved_(GTEST_FLAG_GET(death_test_style)) {
+    GTEST_FLAG_SET(death_test_style, style);
+  }
+  ~ScopedDeathTestStyle() { GTEST_FLAG_SET(death_test_style, saved_); }
+
+  ScopedDeathTestStyle(const ScopedDeathTestStyle &) = delete;
+  ScopedDeathTestStyle &operator=(const ScopedDeathTestStyle &) = delete;
+
+ private:
+  const std::string saved_;
+};
+
 // Drives ShmEventLoop from a libuv loop instead of from its own Run().
 //
 // This exists to prove a specific thing: that Startup() and Shutdown() around
@@ -185,6 +208,20 @@ class UvShmEventLoopTestFactory : public EventLoopTestFactory {
   uv_loop_t *primary_uv_loop_ = nullptr;
   std::vector<ShmEventLoop *> event_loops_;
   std::vector<std::unique_ptr<Slot>> slots_;
+  // A libuv loop does not survive fork(2), so a death test forked the default
+  // "fast" way runs in a child holding a loop it cannot use.  macOS is where
+  // that is loudest -- the loop is backed by a kqueue, which the child does
+  // not inherit at all, so every call into it fails EBADF and the test dies of
+  // that rather than of what it came to check.  Re-exec'ing gives the child a
+  // loop of its own.
+  //
+  // Applied on every platform rather than just the one that fails today: the
+  // loop is the caller's, rebuilding it across a fork is not something a
+  // borrowed loop can do (see aio_uv.h), and there is nothing here worth
+  // testing under a fork that libuv does not support.  Scoped to this factory
+  // rather than set for the binary, since the other death tests in this file
+  // are slower and flakier under "threadsafe".
+  ScopedDeathTestStyle death_test_style_{"threadsafe"};
 };
 
 auto UvParameters() {
@@ -207,13 +244,16 @@ auto CommonParameters(std::string backend) {
 }
 #endif  // !AOS_UV_ONLY
 
-#ifdef __linux__
+// The libuv backend is its own axis rather than a Linux-only variant of one:
+// it borrows somebody else's loop on every platform it builds for, so
+// AOS_UV_ONLY selects it first and what the native backends are is what
+// differs below.
 #if defined(AOS_UV_ONLY)
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestUv, AbstractEventLoopTest,
                          UvParameters());
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestUv,
                          AbstractEventLoopDeathTest, UvParameters());
-#else
+#elif defined(__linux__)
 #ifndef AOS_EPOLL_ONLY
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestIoUring, AbstractEventLoopTest,
                          CommonParameters("io_uring"));
@@ -228,7 +268,6 @@ INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestEpoll, AbstractEventLoopTest,
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestEpoll,
                          AbstractEventLoopDeathTest, CommonParameters("epoll"));
 #endif  // AOS_IO_URING_ONLY
-#endif  // AOS_UV_ONLY
 #else
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestKQueue, AbstractEventLoopTest,
                          CommonParameters("kqueue"));
