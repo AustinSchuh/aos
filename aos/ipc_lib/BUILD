@@ -91,7 +91,10 @@ cc_test(
 
 cc_library(
     name = "thread_signal",
-    srcs = select({
+    srcs = [
+        # The one-receiver-per-thread binding, which is identical everywhere.
+        "thread_signal.cc",
+    ] + select({
         "@platforms//os:linux": ["thread_signal_linux.cc"],
         "@platforms//os:macos": ["thread_signal_darwin.cc"],
         "@platforms//os:windows": ["thread_signal_windows.cc"],

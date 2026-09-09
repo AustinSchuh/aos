@@ -2397,6 +2397,9 @@ void IoUringImpl::RegisterThreadSignalReceiver(
   ABSL_CHECK(receiver_state_ == nullptr)
       << "Duplicate ThreadSignalReceiver registration: only one receiver "
          "may be active at a time (see receiver_state_)";
+  // Registration runs on the polling thread, which is the thread whose
+  // wakeups this receiver serves.  Construction may not have.
+  receiver->BindToCurrentThread();
 
   if (ThreadSignalReceiverState *state = free_receivers_.Pop();
       state != nullptr) {
@@ -2421,6 +2424,9 @@ void IoUringImpl::UnregisterThreadSignalReceiver(
   ABSL_CHECK(receiver_state_ != nullptr &&
              receiver_state_->receiver == receiver)
       << "ThreadSignalReceiver not found";
+  // Unbind on every path, deferred teardown included: the binding is about
+  // which thread this receiver serves, not how long its state lives on.
+  receiver->UnbindFromCurrentThread();
 
   auto state = std::move(receiver_state_);
 
@@ -3143,6 +3149,9 @@ void EpollImpl::RegisterThreadSignalReceiver(
   ABSL_CHECK(receiver_ == nullptr)
       << "Duplicate ThreadSignalReceiver registration: only one receiver "
          "may be active at a time (see Aio::RegisterThreadSignalReceiver)";
+  // Registration runs on the polling thread, which is the thread whose
+  // wakeups this receiver serves.  Construction may not have.
+  receiver->BindToCurrentThread();
   receiver_ = receiver;
   OnReadable(receiver->fd(), [receiver, callback = std::move(callback)]() {
     receiver->ConsumeWakeup();
@@ -3159,6 +3168,7 @@ void EpollImpl::UnregisterThreadSignalReceiver(
   ABSL_CHECK(receiver_ == receiver) << "ThreadSignalReceiver not found";
   receiver_ = nullptr;
   DeleteFd(receiver->fd());
+  receiver->UnbindFromCurrentThread();
 }
 
 void EpollImpl::ConsumeThreadSignalReceiver(

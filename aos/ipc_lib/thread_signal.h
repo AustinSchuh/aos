@@ -20,6 +20,17 @@
 
 namespace aos::ipc_lib {
 
+namespace internal {
+
+// The one-receiver-per-thread rule, shared by every platform so it reads the
+// same everywhere; see ThreadSignalReceiver::BindToCurrentThread().  The
+// binding itself lives in thread_signal.cc -- a thread_local defined here
+// would be one per translation unit including this header.
+void BindReceiverToThread(const void *receiver);
+void UnbindReceiverFromThread(const void *receiver);
+
+}  // namespace internal
+
 #ifdef _WIN32
 const static unsigned int kWakeupSignal = 0;
 #elif defined(__APPLE__)
@@ -90,6 +101,18 @@ class ThreadSignalReceiver {
   int fd() const { return fd_; }
 #endif
 
+  // Binds this receiver to the calling thread -- the thread whose wakeups it
+  // delivers.  Aio::RegisterThreadSignalReceiver() calls this, because
+  // registration is the first moment the receiver learns which thread it
+  // serves: it runs on the polling thread, while construction may not.
+  //
+  // At most one receiver may be bound to a thread at a time; a second CHECKs.
+  void BindToCurrentThread();
+
+  // Releases the binding, so another receiver may take this thread.  Called
+  // by Aio::UnregisterThreadSignalReceiver().  Safe to call unbound.
+  void UnbindFromCurrentThread();
+
   // Drains any pending wakeups so we don't immediately wake again.
   void ConsumeWakeup();
 
@@ -107,6 +130,10 @@ class ThreadSignalReceiver {
   // successful wait leaves it set and ConsumeWakeup() is what clears it --
   // see the constructor for why the consumption point has to be ours.
   HANDLE event_handle_ = NULL;
+
+  // The thread event_handle_ is currently named for, so BindToCurrentThread()
+  // can tell a real thread change from a re-registration on the same thread.
+  pid_t bound_tid_ = 0;
 
   // Nothing backs the receiver on macOS, so it has no state at all.
 #elif !defined(__APPLE__)

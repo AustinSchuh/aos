@@ -2,17 +2,18 @@
 
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/epoll.h>
-#include <sys/select.h>
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #if defined(__linux__)
 #include <sys/epoll.h>
 #else
 #define EPOLLIN 0x01
 #define EPOLLOUT 0x04
 #define EPOLLERR 0x08
+#define EPOLLHUP 0x10
 #endif
 
 #include <algorithm>
@@ -39,9 +40,34 @@
 #include "aos/testing/tmpdir.h"
 
 ABSL_DECLARE_FLAG(std::string, aio_backend);
+// Defined only by the backends with a submission queue (io_uring, kqueue); the
+// Windows IOCP backend has no equivalent, so uses of this flag are guarded.
 ABSL_DECLARE_FLAG(uint32_t, aio_queue_depth);
 
 namespace aos::testing {
+
+// Builds a FileDescriptor from a raw integer, for tests that intentionally use
+// synthetic or invalid descriptors.  On Windows a FileDescriptor is an opaque
+// pointer, so the value must be reinterpret_cast rather than implicitly
+// converted from an int.
+inline FileDescriptor FakeFd(intptr_t value) {
+#if defined(_WIN32)
+  return reinterpret_cast<FileDescriptor>(value);
+#else
+  return static_cast<FileDescriptor>(value);
+#endif
+}
+
+// Reads whatever is available right now, returning 0 at EOF and -1 on error.
+// The pipe ends are integer fds on POSIX and sockets on Windows, so the one
+// portable spelling of a short read is per-platform.
+inline int ReadSome(FileDescriptor fd, char *buffer, size_t size) {
+#if defined(_WIN32)
+  return recv(reinterpret_cast<SOCKET>(fd), buffer, static_cast<int>(size), 0);
+#else
+  return static_cast<int>(read(fd, buffer, size));
+#endif
+}
 
 // Scoped watchdog: arms a SIGALRM fuse so a wedged test dies loudly instead
 // of hanging until bazel's timeout, and disarms it on scope exit so the fuse
@@ -51,11 +77,20 @@ namespace aos::testing {
 // handler is installed on purpose.  Note the fuse lives in the *parent*
 // test process even when armed around a death test: alarm() timers are not
 // inherited across fork(), so the child never sees it -- the parent's fuse
-// covers waiting on a wedged child.
+// covers waiting on a wedged child.  alarm() is POSIX-only; on Windows the
+// child re-execs and there is no equivalent, so this is a no-op there.
 class ScopedDeathTestWatchdog {
  public:
-  ScopedDeathTestWatchdog() { alarm(30); }
-  ~ScopedDeathTestWatchdog() { alarm(0); }
+  ScopedDeathTestWatchdog() {
+#ifndef _WIN32
+    alarm(30);
+#endif
+  }
+  ~ScopedDeathTestWatchdog() {
+#ifndef _WIN32
+    alarm(0);
+#endif
+  }
 };
 
 // Self-imposed backpressure for ring-churning loops.  Closing an io_uring fd
@@ -981,10 +1016,15 @@ TEST_P(AioTest, EnabledEventWithNoHandlerDeathTest) {
 TEST_P(AioTest, UntrackedUnregistrationDeathTest) {
   Aio aio;
 
-  EXPECT_DEATH(aio.DeleteFd(999), "fd 999 not found");
+  EXPECT_DEATH(aio.DeleteFd(FakeFd(999)), "fd .* not found");
   aos::ipc_lib::ThreadSignalReceiver sfd2;
-  EXPECT_DEATH(aio.UnregisterThreadSignalReceiver(&sfd2),
-               "(ThreadSignalReceiver not found|fd .* not found)");
+  // Each backend words this differently.  Match with a matcher rather than an
+  // alternation regex: gtest only has POSIX regexes where <regex.h> exists, and
+  // falls back to its own engine (which has no alternation) on Windows.
+  EXPECT_DEATH(
+      aio.UnregisterThreadSignalReceiver(&sfd2),
+      ::testing::AnyOf(::testing::HasSubstr("ThreadSignalReceiver not found"),
+                       ::testing::ContainsRegex("fd .* not found")));
 }
 
 // Tests that calling Poll() from inside a callback dies (constraint 3 in
@@ -1324,6 +1364,38 @@ TEST_P(AioTest, DoubleSubmitDeathTest) {
       "still in flight");
 }
 
+// The same check, for the one way a request can be in flight without being
+// attached to any registration.  A submit that fails outright never reaches
+// the kernel, but its completion has not been delivered either: every backend
+// parks the request on an internal list and resolves it from the next Poll(),
+// which is what NoCallbackRequestsRetireInOnePoll pins.
+//
+// Re-arming it in that window used to pass, because CheckNotAlreadyInFlight()
+// only ever walked the registrations, and the request is not on one.  Those
+// lists are intrusive and threaded through AsyncRequest::internal_state, so
+// pushing a request that is already on one links it to itself: the two pops
+// that follow leave the list with a tail and no head, and every later push
+// goes somewhere nothing can pop it from again.  The queue is dead for the
+// life of the loop, which a caller sees as completions that simply stop
+// arriving.
+//
+// Both calls inside the child, and a fresh Aio, for the reasons on
+// DoubleSubmitDeathTest.
+TEST_P(AioTest, DoubleSubmitAfterFailedSubmitDeathTest) {
+  Aio aio;
+  AsyncRequest read_req;
+  char buf[8];
+
+  EXPECT_DEATH(
+      {
+        // Fails at submit -- an invalid descriptor, as FailedIoErrorTest
+        // uses -- and is parked for a Poll() that this test never runs.
+        aio.AsyncRead(FakeFd(-1), buf, &read_req);
+        aio.AsyncRead(FakeFd(-1), buf, &read_req);
+      },
+      "still in flight");
+}
+
 // Tests that a failed I/O operation (like reading from an invalid fd)
 // is correctly captured as an error status and the raw errno is populated.
 TEST_P(AioTest, FailedIoErrorTest) {
@@ -1348,7 +1420,7 @@ TEST_P(AioTest, FailedIoErrorTest) {
   {
     ScopedRealtime rt;
     // Schedule a read on an invalid file descriptor (-1).
-    aio.AsyncRead(-1, buf, &read_req);
+    aio.AsyncRead(FakeFd(-1), buf, &read_req);
 
     // Poll until it executes.
     while (!read_req.done && aio.Poll(true)) {
@@ -1390,8 +1462,8 @@ TEST_P(AioTest, QueuedCompletionsDeliverInSubmissionOrder) {
   second.context = &order;
 
   char buf[8];
-  aio.AsyncRead(-1, buf, &first);
-  aio.AsyncRead(-1, buf, &second);
+  aio.AsyncRead(FakeFd(-1), buf, &first);
+  aio.AsyncRead(FakeFd(-1), buf, &second);
 
   // Driven off the callbacks, not `done`: io_uring marks a request done when
   // it drains the CQE and dispatches at most one callback per Poll(), so both
@@ -1491,10 +1563,22 @@ TEST_P(AioTest, LegacyHandlerAfterCancelDispatchTest) {
 // readable/writable/error handlers still run together -- but raw requests get
 // no such carve-out.
 TEST_P(AioTest, RawReadAndWriteOnOneFdTakeTwoPolls) {
+  // Needs one descriptor that is readable and writable at once, which is
+  // why this is a socketpair and not a Pipe: pipe(2)'s ends are
+  // unidirectional.  On Windows a Pipe already *is* a connected AF_UNIX
+  // socketpair with both ends non-blocking (see pipe_windows.cc), so it is
+  // exactly this shape there -- and socketpair()/fcntl()/write()/close()
+  // do not exist to spell it the POSIX way.
+#if defined(_WIN32)
+  Pipe pair;
+  const FileDescriptor local = pair.read_fd();
+#else
   int fds[2];
   ABSL_PCHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
   ABSL_PCHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
   ABSL_PCHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+  const FileDescriptor local = fds[0];
+#endif
 
   Aio aio;
   AsyncRequest read_req;
@@ -1510,10 +1594,14 @@ TEST_P(AioTest, RawReadAndWriteOnOneFdTakeTwoPolls) {
 
   char in_buf[8];
   const char out_buf[1] = {'x'};
-  aio.AsyncRead(fds[0], in_buf, &read_req);
-  aio.AsyncWrite(fds[0], out_buf, &write_req);
+  aio.AsyncRead(local, in_buf, &read_req);
+  aio.AsyncWrite(local, out_buf, &write_req);
   // Make the read side ready too, so one event reports both directions.
+#if defined(_WIN32)
+  pair.Write("y");
+#else
   ABSL_PCHECK(write(fds[1], "y", 1) == 1);
+#endif
 
   int polls = 0;
   while (completions < 2 && polls < 10) {
@@ -1524,8 +1612,10 @@ TEST_P(AioTest, RawReadAndWriteOnOneFdTakeTwoPolls) {
   EXPECT_EQ(completions, 2);
   EXPECT_EQ(polls, 2) << "two raw completions must take two Poll() calls";
 
+#if !defined(_WIN32)
   ABSL_PCHECK(close(fds[0]) == 0);
   ABSL_PCHECK(close(fds[1]) == 0);
+#endif  // ~Pipe closes both ends on Windows.
 }
 
 // A request with no callback is supported -- aio.h defaults the field to
@@ -1545,7 +1635,7 @@ TEST_P(AioTest, NoCallbackRequestsRetireInOnePoll) {
   AsyncRequest requests[3];
   char buf[8];
   for (auto &request : requests) {
-    aio.AsyncRead(-1, buf, &request);
+    aio.AsyncRead(FakeFd(-1), buf, &request);
   }
 
   EXPECT_TRUE(aio.Poll(true))
@@ -1701,6 +1791,11 @@ TEST_P(AioTest, DeleteOwnFdFromCallbackKeepsCapturesTest) {
 // Tests AsyncRead()/AsyncWrite() on a regular file, which epoll_ctl(ADD)
 // rejects with EPERM (always ready, no wait queue) -- this used to abort the
 // epoll backend.
+//
+// POSIX-only: the setup is built out of mkstemp()/unlink()/lseek() on an
+// integer descriptor, which does not map onto the opaque handles the
+// Windows backend takes.
+#ifndef _WIN32
 TEST_P(AioTest, RegularFileAsyncReadWriteTest) {
   Aio aio;
 
@@ -1743,6 +1838,7 @@ TEST_P(AioTest, RegularFileAsyncReadWriteTest) {
 
   ABSL_PCHECK(close(fd) == 0);
 }
+#endif  // !_WIN32
 
 // Tests that a pending AsyncRead() completes with EOF when the write end of
 // an empty pipe closes.  The hangup surfaces as EPOLLHUP with no EPOLLIN,
@@ -2958,15 +3054,21 @@ TEST_P(AioTest, ReuseRequestPendingAtDestruction) {
 
   // Reuse a leftover request with a fresh Aio: its callback must fire.
   AsyncRequest *reuse = fired_a ? &request_b : &request_a;
-  Pipe *reuse_pipe = fired_a ? &pipe_b : &pipe_a;
   bool *reuse_fired = fired_a ? &fired_b : &fired_a;
-  // The first Aio may have consumed the byte before being destroyed; make
-  // the fd readable again either way.
-  reuse_pipe->Write("x");
+
+  // A *new* pipe, deliberately, not the one the retired request was reading.
+  // What is under test is the AsyncRequest outliving its Aio and being
+  // reusable, which this still exercises; carrying the old fd across as well
+  // would additionally require re-registering a descriptor with a second
+  // Aio, and on Windows that cannot work at all -- a socket's IOCP
+  // association is permanent, so the new Aio's completions would be posted
+  // to the old (closed) port and its Poll() would block forever.
+  Pipe reuse_pipe;
+  reuse_pipe.Write("x");
 
   Aio aio2;
   char buf2[8];
-  aio2.AsyncRead(reuse_pipe->read_fd(), buf2, reuse);
+  aio2.AsyncRead(reuse_pipe.read_fd(), buf2, reuse);
   while (!*reuse_fired && aio2.Poll(true)) {
   }
   EXPECT_TRUE(*reuse_fired);
@@ -3071,9 +3173,14 @@ TEST_P(AioTest, TimerCompletionUserDataIsNull) {
 
 // Pins the coalescing contract from Aio::RegisterThreadSignalReceiver()'s
 // docs: every pending wakeup is consumed first, then the callback runs
-// exactly once.  kWakeupSignal is a realtime signal, so the three sends
-// below genuinely queue three pending siginfos; a per-signal dispatch
-// would invoke the callback three times.
+// exactly once.  A per-signal dispatch would run it once per send.
+//
+// How the three sends pile up is per-platform, and the contract holds
+// either way.  kWakeupSignal is a realtime signal on Linux, so they queue
+// three distinct siginfos.  Windows has one auto-reset Event and no queue
+// depth at all, so the third send finds the bit already set and does
+// nothing -- which is why a backend that re-arms before notifying reports
+// exactly two callbacks here rather than three.
 TEST_P(AioTest, PendingWakeupsCoalesceIntoOneCallback) {
   Aio aio;
   aos::ipc_lib::ThreadSignalReceiver sfd;
@@ -3293,22 +3400,12 @@ void RunAioFor(Aio &aio, std::chrono::nanoseconds duration) {
 }
 
 // Helper function to fill up a pipe using OnWritable callbacks.
-// It uses select() to query writability and runs the event loop until
-// the pipe buffer is full and select() returns 0.
-void FillPipe(Aio &aio, int fd) {
-  while (true) {
-    fd_set write_fds;
-    FD_ZERO(&write_fds);
-    FD_SET(fd, &write_fds);
-    struct timeval timeout = {0, 0};
-    int ret = select(fd + 1, nullptr, &write_fds, nullptr, &timeout);
-    if (ret <= 0) {
-      break;
-    }
-    {
-      ScopedRealtime rt;
-      aio.Poll(true);
-    }
+// It runs the event loop until the pipe stops reporting its write end as
+// ready, i.e. its buffer is full.
+void FillPipe(Aio &aio, Pipe &pipe) {
+  while (pipe.write_ready()) {
+    ScopedRealtime rt;
+    aio.Poll(true);
   }
 }
 
@@ -3323,13 +3420,13 @@ TEST_P(AioTest, EPollLikeBasicWritable) {
   });
 
   // First, fill up the pipe's write buffer.
-  FillPipe(aio, pipe.write_fd());
+  FillPipe(aio, pipe);
   EXPECT_GT(number_writes, 0);
 
   // Now, if we try again, we shouldn't do anything because buffer is full.
   const int bytes_in_pipe = number_writes;
   number_writes = 0;
-  FillPipe(aio, pipe.write_fd());
+  FillPipe(aio, pipe);
   EXPECT_EQ(number_writes, 0);
 
   // Empty the pipe, then fill it up again.
@@ -3337,11 +3434,146 @@ TEST_P(AioTest, EPollLikeBasicWritable) {
     ASSERT_EQ(" ", pipe.Read(1));
   }
   number_writes = 0;
-  FillPipe(aio, pipe.write_fd());
+  FillPipe(aio, pipe);
   EXPECT_EQ(number_writes, bytes_in_pipe);
 
   aio.DeleteFd(pipe.write_fd());
 }
+
+// A write watch on a descriptor that cannot be written to has to stay quiet,
+// the way EPOLLOUT does, and has to come back the moment it can be written
+// to again.  Both halves together: either one alone is satisfied by a
+// backend that never reports writability, or by one that always does.
+//
+// EPollLikeBasicWritable above cannot see this, because FillPipe() loops on
+// write_ready() and so stops polling exactly when the interesting case
+// starts.  On the IOCP backend the write watch used to be a zero-byte
+// WSASend, which completes immediately however full the socket is, so this
+// fired on every single Poll() -- see aio_windows.cc's comment above
+// IsInternalKey().
+TEST_P(AioTest, WritableWatchIsQuietWhileFullAndWakesWhenDrained) {
+  Aio aio;
+  Pipe pipe;
+  bool full = false;
+  int writes = 0;
+  int while_full = 0;
+  aio.OnWritable(pipe.write_fd(), [&]() {
+    if (full) {
+      ++while_full;
+    } else {
+      pipe.Write(" ");
+      ++writes;
+    }
+  });
+
+  FillPipe(aio, pipe);
+  ASSERT_GT(writes, 0);
+  ASSERT_FALSE(pipe.write_ready()) << "the pipe was supposed to be full";
+
+  full = true;
+  for (int i = 0; i < 20; ++i) {
+    ScopedRealtime rt;
+    aio.Poll(false);
+  }
+  EXPECT_EQ(while_full, 0)
+      << "OnWritable fired for a descriptor that is not writable";
+
+  // Draining has to bring it back, or "quiet" would just be "broken".
+  for (int i = 0; i < writes; ++i) {
+    ASSERT_EQ(" ", pipe.Read(1));
+  }
+  full = false;
+  const int writes_before = writes;
+  RunAioFor(aio, std::chrono::milliseconds(500));
+  EXPECT_GT(writes, writes_before)
+      << "OnWritable never came back after the descriptor drained";
+
+  aio.DeleteFd(pipe.write_fd());
+}
+
+// Two write watches both have to get their turn.  Writability is a level, so
+// a descriptor nobody fills stays writable indefinitely -- which means a
+// backend that scans its registrations for a writable fd and stops at the
+// first match dispatches that one forever and never reaches the second.
+// Neither watch writes anything here, so both stay writable for the whole
+// test and the only thing that can starve one is the scan itself.
+TEST_P(AioTest, WritableWatchesTakeTurns) {
+  Aio aio;
+  Pipe first;
+  Pipe second;
+  int first_dispatches = 0;
+  int second_dispatches = 0;
+  aio.OnWritable(first.write_fd(), [&]() { ++first_dispatches; });
+  aio.OnWritable(second.write_fd(), [&]() { ++second_dispatches; });
+
+  for (int i = 0; i < 20; ++i) {
+    ScopedRealtime rt;
+    aio.Poll(false);
+  }
+
+  EXPECT_GT(first_dispatches, 0);
+  EXPECT_GT(second_dispatches, 0) << "one writable watch starved the other";
+
+  aio.DeleteFd(first.write_fd());
+  aio.DeleteFd(second.write_fd());
+}
+
+#if defined(_WIN32)
+// A legacy registration on a bare waitable HANDLE -- what a glib GPollFD is
+// on this platform -- is watched through a one-shot wait completion packet
+// that the backend re-arms only after the callback has returned.  It does
+// not own the handle, so it must not reset it: a manual-reset Event the
+// callback leaves set is reported again on the next Poll(), as g_poll()
+// would report it, and one the callback resets is not.
+TEST_P(AioTest, WaitableHandleIsReportedUntilConsumed) {
+  const HANDLE event = CreateEventW(nullptr, /*bManualReset=*/TRUE,
+                                    /*bInitialState=*/FALSE, nullptr);
+  ASSERT_NE(event, nullptr);
+  const FileDescriptor fd = reinterpret_cast<FileDescriptor>(event);
+  int dispatches = 0;
+  bool consume = false;
+  {
+    Aio aio;
+    aio.OnReadable(fd, [&]() {
+      ++dispatches;
+      if (consume) {
+        ABSL_PCHECK(ResetEvent(event));
+      }
+    });
+
+    // Not signaled: nothing to report.
+    EXPECT_FALSE(aio.Poll(false));
+    EXPECT_EQ(dispatches, 0);
+
+    ABSL_PCHECK(SetEvent(event));
+    EXPECT_TRUE(aio.Poll(true));
+    EXPECT_EQ(dispatches, 1);
+    // Left set by the callback, so it is still ready.
+    EXPECT_TRUE(aio.Poll(true));
+    EXPECT_EQ(dispatches, 2);
+
+    consume = true;
+    EXPECT_TRUE(aio.Poll(true));
+    EXPECT_EQ(dispatches, 3);
+    EXPECT_FALSE(aio.Poll(false)) << "a consumed handle was reported again";
+    EXPECT_EQ(dispatches, 3);
+
+    // Signaled again after being consumed: reported once more.
+    ABSL_PCHECK(SetEvent(event));
+    EXPECT_TRUE(aio.Poll(true));
+    EXPECT_EQ(dispatches, 4);
+    EXPECT_FALSE(aio.Poll(false));
+
+    // The watch goes with the registration, a signal it would have carried
+    // included.
+    aio.DeleteFd(fd);
+    ABSL_PCHECK(SetEvent(event));
+    EXPECT_FALSE(aio.Poll(false));
+    EXPECT_EQ(dispatches, 4);
+  }
+  ABSL_PCHECK(CloseHandle(event));
+}
+#endif  // _WIN32
 
 // Test that the basics of OnError work by closing the read end.
 TEST_P(AioTest, EPollLikeBasicError) {
@@ -3419,7 +3651,7 @@ TEST_P(AioTest, LegacyReadableIgnoresHangup) {
   int bytes_read = 0;
   aio.OnReadable(pipe.read_fd(), [&pipe, &bytes_read]() {
     char buf[16];
-    const ssize_t n = read(pipe.read_fd(), buf, sizeof(buf));
+    const int n = ReadSome(pipe.read_fd(), buf, sizeof(buf));
     ABSL_PCHECK(n >= 0) << "read failed";
     bytes_read += n;
   });
@@ -3458,7 +3690,7 @@ TEST_P(AioTest, LegacyReadableSurvivesPollingPastHangup) {
   int bytes_read = 0;
   aio.OnReadable(pipe.read_fd(), [&pipe, &bytes_read]() {
     char buf[16];
-    const ssize_t n = read(pipe.read_fd(), buf, sizeof(buf));
+    const int n = ReadSome(pipe.read_fd(), buf, sizeof(buf));
     if (n > 0) {
       bytes_read += n;
     }
@@ -4126,6 +4358,12 @@ TEST_P(AioTest, ForkDuringRepeatingTimerDeathTest) {
 // where the child never touches this Aio (starterd's normal pattern) is
 // enough.  CheckForParentFork() fixes it with one lazy resync at the next
 // entry point after a fork.
+//
+// POSIX-only: unlike the death tests above, which express the fork through
+// EXPECT_EXIT (and so re-exec on Windows), this one needs a bare fork() in
+// the parent's own process -- being party to the fork is the whole point --
+// and Windows has no equivalent.
+#ifndef _WIN32
 TEST_P(AioTest, ForkChildNeverTouchesAioTest) {
   // Bounds worst-case runtime if this ever regresses: the reap loop's own
   // kMaxReapAttempts bound would otherwise take on the order of a minute to
@@ -4162,6 +4400,7 @@ TEST_P(AioTest, ForkChildNeverTouchesAioTest) {
 
   // Canceling this (via ~Timer() below) must not hang.
 }
+#endif  // !_WIN32
 
 // Regression test for IoUringImpl::CheckSubmitterThread(): destroying an Aio
 // from a different thread than the one that first called Run()/Poll() on it
@@ -4284,7 +4523,7 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
   // still flow end-to-end on the rebuilt ring.
   int count = 0;
   aio->RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
-  pthread_kill(pthread_self(), aos::ipc_lib::kWakeupSignal);
+  SignalSelf();
   while (count == 0 && aio->Poll(true)) {
   }
   EXPECT_EQ(count, 1);
@@ -4342,6 +4581,10 @@ TEST_P(AioTest, CancelTimerBeforeForkDeathTest) {
 // "Out of SQEs".  Schedule more timers than the depth, fork, and require the
 // child to rebuild and fire them all.
 //
+// The --aio_queue_depth flag exists only on the submission-queue backends
+// (io_uring, kqueue), so this test is Linux/macOS-only; the Windows IOCP
+// backend has no submission queue to overflow.
+#ifndef _WIN32
 TEST_P(AioTest, ForkWithManyTimersDeathTest) {
   absl::FlagSaver flag_saver;
 
@@ -4391,6 +4634,7 @@ TEST_P(AioTest, ForkWithManyTimersDeathTest) {
     aio.Poll(false);
   }
 }
+#endif  // !_WIN32
 
 // Regression test for rescheduling an already-armed timer from an RT
 // thread: it must not block, must not allocate, and the superseded
@@ -4564,8 +4808,26 @@ TEST_P(AioTest, ForkedChildWithPendingAsyncWriteDies) {
 }
 #endif
 
-INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest,
-                         ::testing::Values("io_uring", "epoll"),
+// The backends this platform actually has.  --aio_backend is accepted and
+// ignored where there is only one, so instantiating the Linux names
+// everywhere does not select anything -- it just runs the whole suite once
+// per name against the same backend, and leaves GetParam() disagreeing with
+// the backend under test (which FailedIoErrorTest reads).
+//
+// Built as a function rather than inline in the macro call below: a
+// preprocessor directive inside a function-like macro's argument list is
+// undefined behavior, and MSVC rejects it outright.
+std::vector<std::string> Backends() {
+#if defined(__linux__)
+  return {"io_uring", "epoll"};
+#elif defined(_WIN32)
+  return {"iocp"};
+#else
+  return {"kqueue"};
+#endif
+}
+
+INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest, ::testing::ValuesIn(Backends()),
                          [](const ::testing::TestParamInfo<std::string> &info) {
                            return info.param;
                          });

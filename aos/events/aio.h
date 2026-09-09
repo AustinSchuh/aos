@@ -61,8 +61,8 @@ struct AsyncRequest {
   // Tracks if request has completed or is not currently pending.
   bool done = true;
 
-  // Internal state managed entirely by the Aio implementation.  Callers must
-  // not read or modify this field.
+  // Opaque to callers.  Each backend keeps its per-request record here and
+  // static_asserts that it fits, so this struct has one layout everywhere.
   alignas(8) uint8_t internal_state[64] = {0};
 };
 
@@ -89,7 +89,7 @@ struct AsyncRequest {
 //
 // Constraints:
 // 1. Thread Safety: Aio is designed to be driven by a single-threaded event
-//    loop.  All scheduling (e.g., AsyncRead, AsyncWrite, AsyncTimer) and
+//    loop.  All scheduling (e.g., AsyncRead, AsyncWrite, Timer::Schedule) and
 //    cancellation (Cancel) operations -- including destroying the Aio
 //    instance itself -- should be invoked from the thread that drives the
 //    loop via Poll() or Run().  Two exceptions:
@@ -414,6 +414,7 @@ class Aio {
   friend class IoUringImpl;
   friend class EpollImpl;
   friend class KqueueImpl;
+  friend class IocpImpl;
 
   std::unique_ptr<Impl> impl_;
 };

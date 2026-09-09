@@ -677,6 +677,10 @@ void KqueueImpl::RegisterThreadSignalReceiver(
       << "Duplicate ThreadSignalReceiver registration: only one receiver "
          "may be active at a time (see Aio::RegisterThreadSignalReceiver)";
 
+  // Registration runs on the polling thread, which is the thread whose
+  // wakeups this receiver serves.  Construction may not have.
+  receiver->BindToCurrentThread();
+
   signal_receiver_ = receiver;
   signal_callback_ = std::move(callback);
 
@@ -697,6 +701,9 @@ void KqueueImpl::UnregisterThreadSignalReceiver(
   // no DeleteFd() underneath to carry the check.
   aos::CheckNotRealtime();
   ABSL_CHECK(signal_receiver_ == receiver) << "ThreadSignalReceiver not found";
+  // Unbind on every path, deferred teardown included: the binding is about
+  // which thread this receiver serves, not how long its state lives on.
+  receiver->UnbindFromCurrentThread();
 
   // The knote stays armed.  EV_DELETE would take its pending count with it,
   // and aio.h promises that count to whoever registers next: a wakeup still

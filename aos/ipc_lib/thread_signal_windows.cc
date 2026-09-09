@@ -103,6 +103,46 @@ ThreadSignalReceiver::~ThreadSignalReceiver() {
   }
 }
 
+void ThreadSignalReceiver::BindToCurrentThread() {
+  // Why this platform binds at all: ThreadSignalSender addresses a (pid, tid)
+  // pair, and the only rendezvous between the two halves here is the Event's
+  // name, which embeds the tid.  A receiver constructed on one thread and
+  // polled on another would listen on a name nobody signals, and Signal()
+  // would read the resulting ERROR_FILE_NOT_FOUND as the benign
+  // thread-already-exited race and drop the wakeup silently.  The POSIX
+  // backends resolve the target when the signal is sent and do not care.
+  //
+  // Re-create the Event under the *calling* thread's name.  The constructor
+  // had to guess, and it guessed whichever thread built the receiver; this is
+  // the first point where the answer is actually known.
+  //
+  // Only when the thread actually changed.  Not to save the handle -- that
+  // costs nothing -- but because IocpImpl keys handle_states by HANDLE
+  // *value*, and a completion already queued carries the old one.  Re-creating
+  // on a re-registration of the same thread returns a fresh value for the same
+  // Event, so that queued completion arrives, find() misses, and its callback
+  // never runs.  SuccessorReceiverOwnsPendingWakeups is built around exactly
+  // such an in-flight completion and catches it.
+  const pid_t tid = static_cast<pid_t>(GetCurrentThreadId());
+  if (event_handle_ == NULL || bound_tid_ != tid) {
+    char name[64];
+    WakeupEventName(GetCurrentProcessId(), GetCurrentThreadId(), name,
+                    sizeof(name));
+    HANDLE handle = CreateEventA(NULL, TRUE, FALSE, name);  // Manual-reset.
+    ABSL_PCHECK(handle != NULL) << "CreateEventA(" << name << ") failed";
+    if (event_handle_ != NULL) {
+      ABSL_PCHECK(CloseHandle(event_handle_)) << "CloseHandle failed";
+    }
+    event_handle_ = handle;
+    bound_tid_ = tid;
+  }
+  internal::BindReceiverToThread(this);
+}
+
+void ThreadSignalReceiver::UnbindFromCurrentThread() {
+  internal::UnbindReceiverFromThread(this);
+}
+
 void ThreadSignalReceiver::ConsumeWakeup() {
   // The Event is manual-reset, so the wait which delivered the wakeup left
   // the bit set: this is the drain, not a belt-and-braces second one.  It is

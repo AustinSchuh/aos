@@ -108,6 +108,16 @@ ThreadSignalReceiver::~ThreadSignalReceiver() {
   WakeupSignalDisposition::Get().Unregister();
 }
 
+void ThreadSignalReceiver::BindToCurrentThread() {
+  // Nothing to rebind: the target thread is resolved when the signal is
+  // sent, not when the receiver is built.
+  internal::BindReceiverToThread(this);
+}
+
+void ThreadSignalReceiver::UnbindFromCurrentThread() {
+  internal::UnbindReceiverFromThread(this);
+}
+
 void ThreadSignalReceiver::ConsumeWakeup() {
   // kqueue automatically consumes the signal event when returning it.
 }
