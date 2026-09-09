@@ -219,9 +219,9 @@ TEST_P(EPollTest, RemoveWithoutEvents) {
   epoll_->DeleteFd(pipe.read_fd());
 }
 
-// The backends this platform actually has, the same way aio_test.cc picks
-// them.  --aio_backend is accepted and ignored where there is only one, so
-// naming the Linux backends everywhere selects nothing: it runs the whole
+// The backends this platform actually has, the same way aio_test_native.cc
+// picks them.  --aio_backend is accepted and ignored where there is only one,
+// so naming the Linux backends everywhere selects nothing: it runs the whole
 // suite twice against the same backend under two misleading names.
 //
 // Built as a function rather than inline in the macro call below: a
