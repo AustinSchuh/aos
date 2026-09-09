@@ -104,6 +104,16 @@ ThreadSignalReceiver::~ThreadSignalReceiver() {
   ABSL_PCHECK(close(fd_) == 0);
 }
 
+void ThreadSignalReceiver::BindToCurrentThread() {
+  // Nothing to rebind: the target thread is resolved when the signal is
+  // sent, not when the receiver is built.
+  internal::BindReceiverToThread(this);
+}
+
+void ThreadSignalReceiver::UnbindFromCurrentThread() {
+  internal::UnbindReceiverFromThread(this);
+}
+
 bool ThreadSignalReceiver::ConsumeWakeup() {
   // Batched: signalfd dequeues as many pending siginfos as fit the buffer,
   // and a short count means the queue was empty at that moment -- so the

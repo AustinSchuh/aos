@@ -104,9 +104,8 @@ cc_library(
         "aio_internal.h",
     ] + select({
         # internal::ReadinessBackend is the shared half of the readiness
-        # backends, and it reaches aio_unix.h -> sys/socket.h.  A
-        # completion-based backend does not derive from it and cannot compile
-        # it, so it goes per-platform rather than in the unconditional srcs.
+        # backends, and it reaches aio_unix.h -> sys/socket.h.  IOCP is
+        # completion-based, does not derive from it, and cannot compile it.
         "@platforms//os:linux": [
             "aio_linux.cc",
             "aio_readiness_backend.cc",
@@ -117,11 +116,21 @@ cc_library(
             "aio_readiness_backend.cc",
             "aio_readiness_backend.h",
         ],
+        "@platforms//os:windows": ["aio_windows.cc"],
     }),
     hdrs = [
         "aio.h",
         "aio_state.h",
     ],
+    linkopts = select({
+        # WSAStartup/WSAPoll/overlapped socket I/O live in ws2_32;
+        # timeBeginPeriod lives in winmm.
+        "@platforms//os:windows": [
+            "-DEFAULTLIB:ws2_32.lib",
+            "-DEFAULTLIB:winmm.lib",
+        ],
+        "//conditions:default": [],
+    }),
     # The --aio_backend default is a property of the target platform (there
     # is no runtime fallback), so it is compiled in rather than probed.  See
     # //tools/platforms/io_uring.
@@ -141,6 +150,7 @@ cc_library(
         ":socket_error",
         ":timer_queue",
         "//aos:realtime",
+        "//aos/containers:sized_array",
         "//aos/ipc_lib:thread_signal",
         "//aos/libc:aos_strerror",
         "//aos/time",
@@ -159,6 +169,7 @@ cc_library(
             ":pipe",
             "//aos/mutex",
         ],
+        "@platforms//os:windows": [":winsock_init"],
     }),
 )
 
