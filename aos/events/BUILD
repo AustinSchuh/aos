@@ -254,9 +254,14 @@ cc_test(
     ],
 )
 
-cc_test(
-    name = "aio_test",
-    srcs = ["aio_test.cc"],
+# The Aio contract suite: the bodies, compiled once.  Whoever links this says
+# which backends to run them against, which is what keeps @libuv out of a test
+# binary that has no business with it -- see aio_test_lib.h.
+cc_library(
+    name = "aio_test_lib",
+    testonly = True,
+    srcs = ["aio_test_lib.cc"],
+    hdrs = ["aio_test_lib.h"],
     deps = [
         ":aio",
         ":pipe",
@@ -269,6 +274,18 @@ cc_test(
         "@com_google_absl//absl/flags:reflection",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+    ],
+    alwayslink = True,
+)
+
+# Against the backends that own their own loop.
+cc_test(
+    name = "aio_test",
+    srcs = ["aio_test_native.cc"],
+    deps = [
+        ":aio",
+        ":aio_test_lib",
+        "//aos/testing:googletest",
     ],
 )
 
