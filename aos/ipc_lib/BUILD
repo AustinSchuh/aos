@@ -75,7 +75,7 @@ cc_library(
     deps = [
         "//aos/util:file",
         "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:absl_check",
     ],
 )
 
@@ -184,7 +184,7 @@ cc_test(
         "//aos/testing:googletest",
         "//aos/testing:test_logging",
         "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:absl_check",
     ],
 )
 
@@ -210,7 +210,7 @@ cc_test(
         ":index32",
         "//aos/testing:googletest",
         "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:absl_check",
     ],
 )
 
@@ -233,7 +233,7 @@ cc_test(
         ":index",
         "//aos/testing:googletest",
         "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:absl_check",
     ],
 )
 
@@ -285,7 +285,7 @@ cc_library(
                 "//aos/util:compiler_memory_barrier",
                 "@com_google_absl//absl/flags:flag",
                 "@com_google_absl//absl/log",
-                "@com_google_absl//absl/log:check",
+                "@com_google_absl//absl/log:absl_check",
                 "@com_google_absl//absl/strings",
                 "@com_google_absl//absl/types:span",
             ] + select({
@@ -317,7 +317,7 @@ cc_library(
                 "//aos/ipc_lib:event",
                 "//aos/testing:googletest",
                 "@com_google_absl//absl/log",
-                "@com_google_absl//absl/log:check",
+                "@com_google_absl//absl/log:absl_check",
             ],
         ),
         cc_test(
@@ -491,7 +491,7 @@ cc_library(
         "//aos/logging",
         "//aos/time",
         "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:absl_check",
     ],
 )
 
@@ -582,7 +582,7 @@ cc_library(
         "//aos/time",
         "//aos/type_traits",
         "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:absl_check",
     ],
 )
 

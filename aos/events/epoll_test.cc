@@ -11,7 +11,7 @@
 
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
-#include "absl/log/check.h"
+#include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "gtest/gtest.h"
 
@@ -46,13 +46,13 @@ class EPollTest : public ::testing::TestWithParam<std::string> {
         monotonic_clock::now() + duration,
         [](Completion, void *context) {
           QuitState *state = static_cast<QuitState *>(context);
-          CHECK(!state->did_quit);
+          ABSL_CHECK(!state->did_quit);
           state->epoll->Quit();
           state->did_quit = true;
         },
         &state);
     epoll_->Run();
-    CHECK(state.did_quit);
+    ABSL_CHECK(state.did_quit);
   }
 
   // Tests should avoid relying on ordering for events closer in time than this,

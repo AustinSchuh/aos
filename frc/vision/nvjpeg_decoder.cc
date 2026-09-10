@@ -19,6 +19,7 @@
 #include <chrono>
 
 #include "absl/flags/flag.h"
+#include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 
@@ -63,7 +64,7 @@ class NvjpegDecoder {
 
  private:
   void ProcessImage(const CameraImage &image) {
-    CHECK(image.format() == ImageFormat::MJPEG)
+    ABSL_CHECK(image.format() == ImageFormat::MJPEG)
         << ": Expected MJPEG format but got: "
         << EnumNameImageFormat(image.format());
 
@@ -146,7 +147,7 @@ class NvjpegDecoder {
     builder->set_failed_decodes(failed_decodes_);
     if (failed_decodes_ > 0) {
       auto error_fbs = builder->add_last_error_message();
-      CHECK(error_fbs->reserve(last_error_message_.size()));
+      ABSL_CHECK(error_fbs->reserve(last_error_message_.size()));
       error_fbs->SetString(std::string_view(last_error_message_.data(),
                                             last_error_message_.size()));
     }

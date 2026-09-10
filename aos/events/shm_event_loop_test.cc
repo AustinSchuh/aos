@@ -10,7 +10,7 @@
 #include <string_view>
 
 #include "absl/flags/flag.h"
-#include "absl/log/check.h"
+#include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -65,17 +65,17 @@ class ShmEventLoopTestFactory : public EventLoopTestFactory {
   }
 
   Status Run() override {
-    CHECK(primary_event_loop_ != nullptr);
+    ABSL_CHECK(primary_event_loop_ != nullptr);
     return primary_event_loop_->Run();
   }
 
   std::unique_ptr<ExitHandle> MakeExitHandle() override {
-    CHECK(primary_event_loop_ != nullptr);
+    ABSL_CHECK(primary_event_loop_ != nullptr);
     return primary_event_loop_->MakeExitHandle();
   }
 
   void Exit() override {
-    CHECK(primary_event_loop_ != nullptr);
+    ABSL_CHECK(primary_event_loop_ != nullptr);
     primary_event_loop_->Exit();
   }
 
@@ -281,7 +281,7 @@ INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestKQueue,
 bool IsRealtime() {
   int scheduler;
 #if defined(__linux__)
-  PCHECK((scheduler = sched_getscheduler(0)) != -1);
+  ABSL_PCHECK((scheduler = sched_getscheduler(0)) != -1);
 #else
   scheduler = aos::GetCurrentThreadSchedulingPolicy();
 #endif
@@ -475,9 +475,9 @@ TEST_P(ShmEventLoopTest, DelayedPhasedLoop) {
 
         // Confirm that we see the missed count when we sleep.
         if (times.size() == 0) {
-          CHECK_EQ(count, 1);
+          ABSL_CHECK_EQ(count, 1);
         } else {
-          CHECK_EQ(count, 3);
+          ABSL_CHECK_EQ(count, 3);
         }
 
         times.push_back(loop1->monotonic_now());

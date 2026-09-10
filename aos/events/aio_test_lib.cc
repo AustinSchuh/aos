@@ -34,7 +34,6 @@
 #include "absl/flags/reflection.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
-#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -1273,9 +1272,9 @@ TEST_P(AioTest, MixedRegistrationAndInvalidHookDeathTest) {
 // operational failure as "status is an error, result is the positive errno",
 // and io_uring delivers that natively because the fd is only validated when
 // the SQE runs.  epoll validates at epoll_ctl(ADD) time, where the obvious
-// spelling is a PCHECK -- and epoll is the compiled-in default on roborio and
-// linux_arm64, so that spelling turns someone else's stale descriptor into a
-// dead robot.
+// spelling is a ABSL_PCHECK -- and epoll is the compiled-in default on roborio
+// and linux_arm64, so that spelling turns someone else's stale descriptor into
+// a dead robot.
 //
 // FailedIoErrorTest above covers fd = -1, which takes a separate graceful
 // path and never reaches epoll_ctl.
@@ -1413,9 +1412,9 @@ TEST_P(AioTest, DeleteFdWithPendingAsyncReadDeathTest) {
 //
 // It did not on io_uring: the leftover raw_io made AsyncRead() skip
 // ClaimRawFd() while still arming the SQE, so the terminal completion's
-// UnlinkRawRequest() ran against a list the request was never on -- a CHECK
-// abort when raw_prev happened to be null, and writes through dangling
-// pointers into the dead instance's requests when it was not.
+// UnlinkRawRequest() ran against a list the request was never on -- a
+// ABSL_CHECK abort when raw_prev happened to be null, and writes through
+// dangling pointers into the dead instance's requests when it was not.
 //
 // ~IoUringImpl cannot scrub this on the way out: the requests are
 // caller-owned and may already be gone, which is why it deliberately does
@@ -1876,7 +1875,7 @@ TEST_P(AioTest, AsyncRegistrationPoolRecycleTest) {
 // Exceeding the pool degrades, it does not abort.  The pool is a realtime
 // optimisation -- arming must not allocate -- not a hard ceiling on how many
 // fds may be in flight, so the 17th simultaneous registration comes from the
-// heap.  A CHECK there would turn a sizing miss into a dead process.
+// heap.  A ABSL_CHECK there would turn a sizing miss into a dead process.
 //
 // Deliberately not under ScopedRealtime: the fallback allocates, which is
 // what --die_on_malloc would (correctly) abort on.  What is under realtime is
@@ -2819,7 +2818,7 @@ TEST_P(AioTest, CancelRescheduleAndDestroyPastUnobservedFirings) {
 // every timer a callback that destroys all the others.  Without the
 // unconditional UnlinkPendingDispatch() in DestroyTimerState() this fails
 // as a use-after-free under ASAN, or as the intrusive list's own "removing
-// a node that is not on this list" CHECK on a normal build.
+// a node that is not on this list" ABSL_CHECK on a normal build.
 //
 // Note the shape predates the timerfd redesign: the old backend had the
 // identical fast path, and reached it far more easily, because there a
@@ -2927,8 +2926,8 @@ TEST_P(AioTest, TimerPollsSurviveCqOverflow) {
     // Enable the ring before building the timers.  Each one arms a poll at
     // construction, and MaybeSubmit() cannot flush those until the ring is
     // enabled -- so without this, 24 constructions would queue 24 SQEs
-    // against a 4-entry submission queue and CHECK-fail before the test got
-    // anywhere near the CQ.
+    // against a 4-entry submission queue and ABSL_CHECK-fail before the test
+    // got anywhere near the CQ.
     aio.Poll(false);
     std::vector<int> fire_counts(kTimers, 0);
     std::vector<std::unique_ptr<RepeatingTimer>> timers;
@@ -3010,7 +3009,7 @@ TEST_P(AioIoUringTest, PreRunArmingExceedsQueueDepthDeathTest) {
 // dispatched, and an earlier callback in the same dispatch batch
 // unregistering the receiver.  Freeing there leaves the dispatch loop
 // holding a pointer into freed memory.  A regression fails as a
-// use-after-free under ASAN, or as the intrusive list's own CHECK on a
+// use-after-free under ASAN, or as the intrusive list's own ABSL_CHECK on a
 // normal build.
 TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
   // 28 timers against an 8-slot CQ: 8 fit as auxiliary CQEs, the other 20
@@ -3068,7 +3067,7 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
     //
     // EXPECT, not ASSERT: an early return here would leave the receiver
     // registered and turn a batching drift into ~IoUringImpl()'s
-    // still-registered CHECK -- an abort -- instead of a clean failure.
+    // still-registered ABSL_CHECK -- an abort -- instead of a clean failure.
     // The unregister below is safe in any state.
     if (Backend().is_io_uring) {
       EXPECT_EQ(fired, 25);
@@ -3148,7 +3147,7 @@ TEST_P(AioTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
       // Kernel batching drift kept the terminal dispatch (and so the
       // in-callback unregister) from happening: clean up so the failure
       // stays a clean EXPECT instead of tripping ~IoUringImpl()'s
-      // still-registered CHECK.
+      // still-registered ABSL_CHECK.
       aio.UnregisterThreadSignalReceiver(&sfd);
     }
     sfd.ConsumeWakeup();
@@ -3993,7 +3992,7 @@ TEST_P(AioTest, LegacyReadableIgnoresHangup) {
 // The same registration, polled past the hangup instead of stopping at it.
 //
 // There is no err_fn here, so a backend that reports a read-side hangup as an
-// error rather than as readability dies on the err_fn CHECK the first time
+// error rather than as readability dies on the err_fn ABSL_CHECK the first time
 // the loop comes back around.  The IOCP backend did exactly that: its
 // readiness watch is one zero-byte WSARecv standing in for both of kqueue's
 // filters, and it translated the peer's orderly shutdown to kErr regardless
@@ -4033,7 +4032,7 @@ TEST_P(AioTest, LegacyReadableSurvivesPollingPastHangup) {
 
 // Registering a before-wait function from inside one is disallowed: the
 // push_back could reallocate the vector out from under the executing
-// std::function.  Pinned as a CHECK rather than left as silent UB (which
+// std::function.  Pinned as a ABSL_CHECK rather than left as silent UB (which
 // is what EPoll's range-for did).
 TEST_P(AioTest, BeforeWaitFromBeforeWaitDeathTest) {
   ScopedDeathTestWatchdog watchdog;
@@ -4359,7 +4358,7 @@ TEST_P(AioTest, ForkOperationBeforePollDeathTest) {
         aio.AsyncRead(pipe.read_fd(), read_buf, &read_req);
 
         const char msg = 'x';
-        PCHECK(write(pipe.write_fd(), &msg, 1) == 1);
+        ABSL_PCHECK(write(pipe.write_fd(), &msg, 1) == 1);
 
         while (!read_req.done && aio.Poll(true)) {
         }
@@ -5059,7 +5058,7 @@ TEST_P(AioTest, DeleteTimerWhileRealtimeDeathTest) {
         ScopedRealtime rt;
         timer.reset();  // Destructor runs here, while marked realtime.
       },
-      // Pin the death to CheckNotRealtime()'s CHECK, not just any abort --
+      // Pin the death to CheckNotRealtime()'s ABSL_CHECK, not just any abort --
       // an empty matcher would pass on unrelated crashes.
       "GetIsRealtime");
 }
