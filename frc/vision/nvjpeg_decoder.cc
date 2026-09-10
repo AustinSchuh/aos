@@ -20,7 +20,7 @@
 
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
-#include "absl/log/log.h"
+#include "absl/log/absl_log.h"
 #include "absl/strings/str_cat.h"
 
 #include "aos/configuration.h"
@@ -83,7 +83,7 @@ class NvjpegDecoder {
       constexpr std::string_view kError = "camera image is missing dimensions";
       last_error_message_.resize(kError.size());
       memcpy(last_error_message_.data(), kError.data(), kError.size());
-      VLOG(1) << kError;
+      ABSL_VLOG(1) << kError;
       return;
     }
     const uint32_t rows = static_cast<uint32_t>(image.rows());
@@ -105,7 +105,7 @@ class NvjpegDecoder {
         constexpr std::string_view kError = "NVJPG hardware decode failed";
         last_error_message_.resize(kError.size());
         memcpy(last_error_message_.data(), kError.data(), kError.size());
-        VLOG(1) << kError;
+        ABSL_VLOG(1) << kError;
         return;
       }
     }
@@ -115,8 +115,8 @@ class NvjpegDecoder {
           "decoded dimensions do not match the camera image";
       last_error_message_.resize(kError.size());
       memcpy(last_error_message_.data(), kError.data(), kError.size());
-      VLOG(1) << kError << ": " << result.width << "x" << result.height
-              << " vs " << cols << "x" << rows;
+      ABSL_VLOG(1) << kError << ": " << result.width << "x" << result.height
+                   << " vs " << cols << "x" << rows;
       return;
     }
     ++successful_decodes_;
@@ -132,13 +132,13 @@ class NvjpegDecoder {
 
     builder.CheckOk(builder.Send(camera_image_builder.Finish()));
 
-    VLOG(1) << "NVJPG decoded " << image.data()->size() << " bytes to "
-            << result.width << "x" << result.height << " in "
-            << std::chrono::duration<double>(
-                   event_loop_->monotonic_now() -
-                   event_loop_->context().monotonic_event_time)
-                   .count()
-            << "sec";
+    ABSL_VLOG(1) << "NVJPG decoded " << image.data()->size() << " bytes to "
+                 << result.width << "x" << result.height << " in "
+                 << std::chrono::duration<double>(
+                        event_loop_->monotonic_now() -
+                        event_loop_->context().monotonic_event_time)
+                        .count()
+                 << "sec";
   }
 
   void SendStatus() {

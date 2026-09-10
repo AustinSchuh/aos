@@ -1092,7 +1092,7 @@ void IocpImpl::UpdateSocketState(FdState *state) {
           // come along to re-arm this: the fd would simply stop waking, which
           // the caller sees as a loop that goes quiet.  Die rather than
           // degrade, as EpollImpl::UpdateRegistration()'s PCHECK and
-          // KqueueImpl's PLOG(FATAL) do for the same failure.
+          // KqueueImpl's ABSL_PLOG(FATAL) do for the same failure.
           ABSL_CHECK(res == 0 || err == WSA_IO_PENDING)
               << ": failed to arm the read watch on fd " << state->fd
               << ": WSA error " << err;

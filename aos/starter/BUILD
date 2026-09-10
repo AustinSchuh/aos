@@ -49,8 +49,8 @@ cc_library(
         "//aos/util:application_name",
         "//aos/util:scoped_pipe",
         "//aos/util:top",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -71,8 +71,8 @@ cc_library(
         "//aos:configuration",
         "//aos:macros",
         "//aos/events:shm_event_loop",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -200,8 +200,8 @@ cc_binary(
     deps = [
         ":starter_rpc_lib",
         "//aos/time",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/strings:str_format",
     ],
 )
@@ -253,8 +253,8 @@ cc_library(
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
         "//aos/scoped:scoped_fd",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/strings",
     ],
 )
@@ -305,6 +305,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":starterd_lib",
-        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )

@@ -74,8 +74,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//aos/util:file",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -183,8 +183,8 @@ cc_test(
         ":signalfd",
         "//aos/testing:googletest",
         "//aos/testing:test_logging",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -209,8 +209,8 @@ cc_test(
     deps = [
         ":index32",
         "//aos/testing:googletest",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -232,8 +232,8 @@ cc_test(
     deps = [
         ":index",
         "//aos/testing:googletest",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -284,8 +284,8 @@ cc_library(
                 "//aos/time",
                 "//aos/util:compiler_memory_barrier",
                 "@com_google_absl//absl/flags:flag",
-                "@com_google_absl//absl/log",
                 "@com_google_absl//absl/log:absl_check",
+                "@com_google_absl//absl/log:absl_log",
                 "@com_google_absl//absl/strings",
                 "@com_google_absl//absl/types:span",
             ] + select({
@@ -316,8 +316,8 @@ cc_library(
                 ":lockless_queue" + suffix,
                 "//aos/ipc_lib:event",
                 "//aos/testing:googletest",
-                "@com_google_absl//absl/log",
                 "@com_google_absl//absl/log:absl_check",
+                "@com_google_absl//absl/log:absl_log",
             ],
         ),
         cc_test(
@@ -490,8 +490,8 @@ cc_library(
         "//aos:realtime",
         "//aos/logging",
         "//aos/time",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
@@ -581,8 +581,8 @@ cc_library(
         "//aos/ipc_lib:aos_sync",
         "//aos/time",
         "//aos/type_traits",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 

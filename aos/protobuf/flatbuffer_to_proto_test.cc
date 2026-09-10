@@ -324,7 +324,7 @@ TEST(FlatbufferToProtoTest, EncodesFromTheStaticApi) {
 
   ASSERT_TRUE(builder.Verify());
   // const, so span() picks the reading overload -- the mutable one is a
-  // deliberate LOG(FATAL) on a FlatbufferSpan.
+  // deliberate ABSL_LOG(FATAL) on a FlatbufferSpan.
   const auto flatbuffer = builder.AsFlatbufferSpan();
   const absl::Span<const uint8_t> span = flatbuffer.span();
 

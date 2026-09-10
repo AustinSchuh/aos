@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-#include "absl/log/log.h"
+#include "absl/log/absl_log.h"
 
 // libnvjpeg.so implements the libjpeg-8b API with NVIDIA's TEGRA_ACCELERATE
 // extensions.  TEGRA_ACCELERATE (set via local_defines in the BUILD file)
@@ -72,7 +72,7 @@ void ErrorExit(j_common_ptr cinfo) {
 void OutputMessage(j_common_ptr cinfo) {
   char message[JMSG_LENGTH_MAX];
   (*cinfo->err->format_message)(cinfo, message);
-  VLOG(1) << "libnvjpeg: " << message;
+  ABSL_VLOG(1) << "libnvjpeg: " << message;
 }
 
 }  // namespace
@@ -99,7 +99,7 @@ NvJpegDecoderLib::NvJpegDecoderLib() : impl_(new Impl()) {
   impl_->err.pub.output_message = OutputMessage;
 
   if (setjmp(impl_->err.setjmp_buffer)) {
-    LOG(FATAL) << "libnvjpeg failed to initialize: " << impl_->err.message;
+    ABSL_LOG(FATAL) << "libnvjpeg failed to initialize: " << impl_->err.message;
   }
   jpeg_create_decompress(&impl_->cinfo);
 
@@ -113,20 +113,21 @@ NvJpegDecoderLib::NvJpegDecoderLib() : impl_(new Impl()) {
     globfree(&engines);
   }
   if (engine_count == 0) {
-    LOG(FATAL) << "No NVJPG engine is bound to the tegra-nvjpg driver ("
-               << kNvjpgDriverGlob
-               << " matched nothing).  Is the tegra-drm kernel module "
-                  "loaded?  Check lsmod / 'sudo modprobe tegra-drm' on the "
-                  "Orin.  For CPU decode, switch the config template to "
-                  "turbojpeg_decoder instead.";
+    ABSL_LOG(FATAL)
+        << "No NVJPG engine is bound to the tegra-nvjpg driver ("
+        << kNvjpgDriverGlob
+        << " matched nothing).  Is the tegra-drm kernel module "
+           "loaded?  Check lsmod / 'sudo modprobe tegra-drm' on the "
+           "Orin.  For CPU decode, switch the config template to "
+           "turbojpeg_decoder instead.";
   }
   if (access("/dev/nvmap", R_OK | W_OK) != 0) {
-    LOG(FATAL) << "/dev/nvmap is not accessible: " << strerror(errno)
-               << " -- libnvjpeg needs it (does this user have the video "
-                  "group?)";
+    ABSL_LOG(FATAL) << "/dev/nvmap is not accessible: " << strerror(errno)
+                    << " -- libnvjpeg needs it (does this user have the video "
+                       "group?)";
   }
-  LOG(INFO) << engine_count
-            << " NVJPG engine(s) bound; hardware decode available";
+  ABSL_LOG(INFO) << engine_count
+                 << " NVJPG engine(s) bound; hardware decode available";
 }
 
 NvJpegDecoderLib::~NvJpegDecoderLib() {
@@ -146,7 +147,7 @@ bool NvJpegDecoderLib::DecodeToGray(const uint8_t *jpeg_data, size_t jpeg_size,
   if (setjmp(impl_->err.setjmp_buffer)) {
     // libjpeg hit a fatal decode error and longjmp'd back here.
     jpeg_abort_decompress(cinfo);
-    LOG(WARNING) << "JPEG decode failed: " << impl_->err.message;
+    ABSL_LOG(WARNING) << "JPEG decode failed: " << impl_->err.message;
     return false;
   }
 
@@ -157,20 +158,21 @@ bool NvJpegDecoderLib::DecodeToGray(const uint8_t *jpeg_data, size_t jpeg_size,
   const uint32_t width = cinfo->image_width;
   const uint32_t height = cinfo->image_height;
   if (static_cast<size_t>(width) * height > max_out_size) {
-    LOG(WARNING) << "JPEG " << width << "x" << height
-                 << " exceeds output buffer (" << max_out_size << " bytes)";
+    ABSL_LOG(WARNING) << "JPEG " << width << "x" << height
+                      << " exceeds output buffer (" << max_out_size
+                      << " bytes)";
     jpeg_abort_decompress(cinfo);
     return false;
   }
   if (cinfo->progressive_mode) {
-    LOG(WARNING) << "Progressive JPEG is not supported";
+    ABSL_LOG(WARNING) << "Progressive JPEG is not supported";
     jpeg_abort_decompress(cinfo);
     return false;
   }
   const bool grayscale_source = (cinfo->jpeg_color_space == JCS_GRAYSCALE);
   if (!grayscale_source && cinfo->jpeg_color_space != JCS_YCbCr) {
-    LOG(WARNING) << "Unsupported JPEG color space "
-                 << static_cast<int>(cinfo->jpeg_color_space);
+    ABSL_LOG(WARNING) << "Unsupported JPEG color space "
+                      << static_cast<int>(cinfo->jpeg_color_space);
     jpeg_abort_decompress(cinfo);
     return false;
   }
@@ -187,10 +189,10 @@ bool NvJpegDecoderLib::DecodeToGray(const uint8_t *jpeg_data, size_t jpeg_size,
   const int y_rows_per_group = cinfo->comp_info[0].v_samp_factor * DCTSIZE;
   const uint32_t y_padded_width = cinfo->comp_info[0].width_in_blocks * DCTSIZE;
   if (y_rows_per_group != lines_per_group || y_rows_per_group > 4 * DCTSIZE) {
-    LOG(WARNING) << "Unsupported subsampling (Y "
-                 << cinfo->comp_info[0].h_samp_factor << "x"
-                 << cinfo->comp_info[0].v_samp_factor << ", max_v "
-                 << cinfo->max_v_samp_factor << ")";
+    ABSL_LOG(WARNING) << "Unsupported subsampling (Y "
+                      << cinfo->comp_info[0].h_samp_factor << "x"
+                      << cinfo->comp_info[0].v_samp_factor << ", max_v "
+                      << cinfo->max_v_samp_factor << ")";
     jpeg_abort_decompress(cinfo);
     return false;
   }
@@ -233,7 +235,8 @@ bool NvJpegDecoderLib::DecodeToGray(const uint8_t *jpeg_data, size_t jpeg_size,
       }
     }
     if (jpeg_read_raw_data(cinfo, planes, lines_per_group) == 0) {
-      LOG(WARNING) << "jpeg_read_raw_data made no progress at row " << base;
+      ABSL_LOG(WARNING) << "jpeg_read_raw_data made no progress at row "
+                        << base;
       jpeg_abort_decompress(cinfo);
       return false;
     }
@@ -258,15 +261,16 @@ bool NvJpegDecoderLib::DecodeToGray(const uint8_t *jpeg_data, size_t jpeg_size,
   // engine being bound is not enough -- refuse to masquerade as a hardware
   // decoder while burning CPU.
   if (!hardware_used) {
-    LOG(FATAL) << "libnvjpeg decoded on the CPU even though an NVJPG engine "
-                  "is bound -- refusing to run without hardware decode.  For "
-                  "CPU decode, switch the config template to "
-                  "turbojpeg_decoder instead.";
+    ABSL_LOG(FATAL)
+        << "libnvjpeg decoded on the CPU even though an NVJPG engine "
+           "is bound -- refusing to run without hardware decode.  For "
+           "CPU decode, switch the config template to "
+           "turbojpeg_decoder instead.";
   }
   if (!impl_->logged_first_decode) {
     impl_->logged_first_decode = true;
-    LOG(INFO) << "First JPEG decoded (" << width << "x" << height
-              << ") on the NVJPG engine";
+    ABSL_LOG(INFO) << "First JPEG decoded (" << width << "x" << height
+                   << ") on the NVJPG engine";
   }
 
   result->width = width;

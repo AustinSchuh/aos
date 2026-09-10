@@ -36,7 +36,7 @@ class WPILibRobotBase {
       thread.join();
     }
 
-    LOG(ERROR) << "Exiting WPILibRobot";
+    ABSL_LOG(ERROR) << "Exiting WPILibRobot";
   }
 
  protected:
