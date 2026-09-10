@@ -65,6 +65,10 @@ struct FdRegistration {
   // Whether the platform, rather than uv_poll, is watching this descriptor;
   // see UvPlatform::Adopt().  `poll` is never initialised for one of these.
   bool platform_watched = false;
+  // Whatever the platform hung off this registration in Adopt(), so it can
+  // find it again without a lookup.  Opaque here on purpose: what it points
+  // at is the platform's business, and the core never touches it.
+  void *platform_state = nullptr;
   // Whether the registration closes its descriptor once libuv is done with
   // the handle.  Closing it any earlier would leave libuv polling a stale
   // descriptor.
@@ -119,6 +123,11 @@ class UvCore {
   // What the realtime malloc check was set to outside this turn of the loop,
   // or nullopt when nothing is holding it off; see UvAio::ScopedLoopTurn.
   virtual std::optional<bool> callback_realtime() const = 0;
+
+  // EPoll's dispatch rules for a registration the platform is watching itself,
+  // reporting `events` -- SubscribedEvents(reg), in practice.  Only a platform
+  // that classifies its own reports needs this; see DispatchReadiness().
+  virtual void DispatchEvents(FdRegistration *reg, uint32_t events) = 0;
 };
 
 // Restores the caller's realtime state around one AOS callback, so libuv's
@@ -166,10 +175,14 @@ class UvPlatform {
   // EOF.
   static int AdjustWatch(uint32_t subscribed, int wanted);
 
-  // Offered every readiness report libuv makes before the core dispatches
-  // it.  A platform whose reports need interpreting classifies one and
-  // dispatches it itself, returning true.  False leaves the report to the
-  // core, which is what a platform that can take libuv's word for it does.
+  // Offered every readiness report libuv makes, before the core acts on it.
+  //
+  // Return false to let the core handle the report, which is what every
+  // platform but Windows does.  Return true to say this platform handled it
+  // instead, having worked out the real events and passed them to
+  // UvCore::DispatchEvents().  Windows needs that because libuv's report
+  // there can be out of date by the time it arrives, and because it never
+  // says a socket hung up.
   virtual bool DispatchReadiness(FdRegistration *reg, int status,
                                  int uv_events) = 0;
 

@@ -175,6 +175,40 @@ class UvImpl : public Aio::Impl, public UvCore {
     return callback_realtime_;
   }
 
+  // EPoll's dispatch rules, message text included, for a registration the
+  // platform watches itself and reports the subscribed mask on.  The libuv
+  // path is PollCallback(); the difference is that libuv reports an error as
+  // a status rather than a bit, and a signalled object has no error to
+  // report ahead of anything.
+  void DispatchEvents(FdRegistration *reg, uint32_t events) override {
+    ScopedCallbackRealtime callback_realtime(this);
+    if (reg->events_fn != nullptr) {
+      reg->events_fn(events);
+      return;
+    }
+    if (events & kIn) {
+      ABSL_CHECK(reg->in_fn != nullptr)
+          << ": No handler registered for input events on descriptor "
+          << reg->fd;
+      reg->in_fn();
+      // The callback may have deleted this registration.
+      if (reg->closing) return;
+    }
+    if (events & kOut) {
+      ABSL_CHECK(reg->out_fn != nullptr)
+          << ": No handler registered for output events on descriptor "
+          << reg->fd;
+      reg->out_fn();
+      if (reg->closing) return;
+    }
+    if (events & kErr) {
+      ABSL_CHECK(reg->err_fn != nullptr)
+          << ": No handler registered for error events on descriptor "
+          << reg->fd;
+      reg->err_fn();
+    }
+  }
+
   bool TakeDidWork() {
     const bool result = did_work_;
     did_work_ = false;

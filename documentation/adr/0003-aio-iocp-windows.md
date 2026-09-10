@@ -161,7 +161,7 @@ None were visible from the shared tests until the suite ran on Windows — which
 - **`--aio_backend` accepts any value here and always runs IOCP**, where Linux dies on an unknown one — the portability trap Decision 10 avoids, pointing the other way. CHECKing the value against `"iocp"` would close it and has not been done.
 - **`--aio_queue_depth` is accepted and ignored.** The io_uring regression tests that set it to force an overflow still run, but with no overflow to provoke they degrade to liveness checks: a green `TimerPollsSurviveCqOverflow` on Windows is not evidence about overflow handling.
 - **`GlibMainLoop` runs on Windows.** It needed the non-socket handle path plus a type bridge in `glib_main_loop.cc`, since `GPollFD::fd` is a `gint64` holding a `HANDLE`.
-- **`aio_uv` and its tests remain incompatible on Windows**, as ADR 0004 notes — they run on Linux and macOS, and `BUILD` marks both `@platforms//:incompatible` here: libuv's loop on Windows _is_ a completion port nothing else can wait on, and `uv_poll` accepts only sockets.
+- **`aio_uv` runs on Windows too, by borrowing this backend's machinery.** libuv's loop there _is_ a completion port, and `uv_poll` accepts only sockets, so the libuv backend attaches the same wait completion packets this one uses to libuv's own port; `WaitPacket` and `DeadlineTimer` live in `aio_windows_internal.h` for both. ADR 0004 covers it.
 - **The dispatch rules have a second implementation to keep honest.** The standing cost of the design, and the first place to look when a backend disagrees.
 
 ## Alternatives considered

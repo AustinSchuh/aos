@@ -3,6 +3,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -86,15 +88,38 @@ inline int ReadSome(FileDescriptor fd, char *buffer, size_t size) {
 class ScopedDeathTestWatchdog {
  public:
   ScopedDeathTestWatchdog() {
-#ifndef _WIN32
+#ifdef _WIN32
+    // No alarm(2) here, so a thread stands in for it: it waits on an Event
+    // the destructor sets, and if the wait times out first the test has hung
+    // and this is what ends it, with a message rather than a bazel timeout.
+    done_ = CreateEventW(nullptr, /*bManualReset=*/TRUE,
+                         /*bInitialState=*/FALSE, nullptr);
+    ABSL_CHECK(done_ != nullptr);
+    thread_ = std::thread([done = done_]() {
+      if (WaitForSingleObject(done, 30000) == WAIT_TIMEOUT) {
+        ABSL_LOG(FATAL) << "Watchdog: the test has been stuck for 30s, which "
+                           "for these tests means a wait nothing will end";
+      }
+    });
+#else
     alarm(30);
 #endif
   }
   ~ScopedDeathTestWatchdog() {
-#ifndef _WIN32
+#ifdef _WIN32
+    ABSL_PCHECK(SetEvent(done_));
+    thread_.join();
+    ABSL_PCHECK(CloseHandle(done_));
+#else
     alarm(0);
 #endif
   }
+
+ private:
+#ifdef _WIN32
+  HANDLE done_ = nullptr;
+  std::thread thread_;
+#endif
 };
 
 namespace {
@@ -158,6 +183,106 @@ inline void SignalSelf() {
   aos::ipc_lib::ThreadSignalSender sender;
   sender.Signal(aos::GetProcessId(), aos::GetThreadId());
 }
+
+// Both ends of a connected loopback TCP connection, for the tests that need
+// one taken down abruptly.  Pipe is the usual way to get two connected ends,
+// but on POSIX it is pipe(2) and on Windows an AF_UNIX pair, and a reset is
+// something only a TCP connection has to send.
+class TcpPair {
+ public:
+#if defined(_WIN32)
+  using RawSocket = SOCKET;
+  using SocketLength = int;
+  static constexpr RawSocket kInvalidSocket = INVALID_SOCKET;
+#else
+  using RawSocket = int;
+  using SocketLength = socklen_t;
+  static constexpr RawSocket kInvalidSocket = -1;
+#endif
+
+  TcpPair() {
+    const RawSocket listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ABSL_CHECK(listener != kInvalidSocket);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    ABSL_CHECK_EQ(
+        bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)),
+        0);
+    SocketLength length = sizeof(address);
+    ABSL_CHECK_EQ(
+        getsockname(listener, reinterpret_cast<sockaddr *>(&address), &length),
+        0);
+    ABSL_CHECK_EQ(listen(listener, 1), 0);
+
+    // Still blocking here, so the connect and the accept can just be waited
+    // on; both ends go non-blocking once the connection is up.
+    client_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ABSL_CHECK(client_ != kInvalidSocket);
+    ABSL_CHECK_EQ(connect(client_, reinterpret_cast<sockaddr *>(&address),
+                          sizeof(address)),
+                  0);
+    server_ = accept(listener, nullptr, nullptr);
+    ABSL_CHECK(server_ != kInvalidSocket);
+    Close(listener);
+    SetNonBlocking(client_);
+    SetNonBlocking(server_);
+  }
+
+  ~TcpPair() {
+    if (client_ != kInvalidSocket) Close(client_);
+    if (server_ != kInvalidSocket) Close(server_);
+  }
+
+  TcpPair(const TcpPair &) = delete;
+  TcpPair &operator=(const TcpPair &) = delete;
+
+  FileDescriptor client_fd() const { return ToFd(client_); }
+  FileDescriptor server_fd() const { return ToFd(server_); }
+
+  // Closes the client end abruptly: a zero linger turns the close into a
+  // reset, where a plain close would be a graceful shutdown the peer sees as
+  // end-of-file.
+  void ResetClient() {
+    const struct linger abortive = {1, 0};
+    ABSL_CHECK_EQ(
+        setsockopt(client_, SOL_SOCKET, SO_LINGER,
+                   reinterpret_cast<const char *>(&abortive), sizeof(abortive)),
+        0);
+    Close(client_);
+    client_ = kInvalidSocket;
+  }
+
+ private:
+  static FileDescriptor ToFd(RawSocket s) {
+#if defined(_WIN32)
+    return reinterpret_cast<FileDescriptor>(s);
+#else
+    return s;
+#endif
+  }
+
+  static void SetNonBlocking(RawSocket s) {
+#if defined(_WIN32)
+    u_long non_blocking = 1;
+    ABSL_CHECK_EQ(ioctlsocket(s, FIONBIO, &non_blocking), 0);
+#else
+    ABSL_PCHECK(fcntl(s, F_SETFL, O_NONBLOCK) == 0);
+#endif
+  }
+
+  static void Close(RawSocket s) {
+#if defined(_WIN32)
+    ABSL_CHECK_EQ(closesocket(s), 0);
+#else
+    ABSL_PCHECK(close(s) == 0);
+#endif
+  }
+
+  RawSocket client_ = kInvalidSocket;
+  RawSocket server_ = kInvalidSocket;
+};
 
 // A repeating timer, built the way consumers have to build one now that
 // Aio::Timer is deliberately one-shot (see Aio::Timer::Schedule()):
@@ -3602,7 +3727,139 @@ TEST_P(AioTest, WaitableHandleIsReportedUntilConsumed) {
   }
   ABSL_PCHECK(CloseHandle(event));
 }
+
+// Deleting some other handle watch from inside a callback must not cost the
+// callback's own watch its re-arm.
+//
+// The libuv backend's check pass used to walk its watches by index, and a
+// deletion from a callback shifted everything after it down one, so the
+// identity check guarding the re-arm failed for the very watch being
+// dispatched and it was left disarmed.  Nothing noticed until the handle was
+// signalled again: a non-blocking Poll() still found it, because the check
+// pass asks every handle regardless, but a blocking one had nothing armed to
+// wake it and waited forever.  So the second Poll(true) below is the test,
+// and it carries its own watchdog because the failure is a hang.  Two watches,
+// registered in this order so the one deleted sits ahead of the one
+// dispatching.
+TEST_P(AioTest, DeletingAnotherWatchFromACallbackKeepsThisOneArmed) {
+  ScopedDeathTestWatchdog watchdog;
+  const HANDLE first = CreateEventW(nullptr, /*bManualReset=*/TRUE,
+                                    /*bInitialState=*/FALSE, nullptr);
+  const HANDLE second = CreateEventW(nullptr, /*bManualReset=*/TRUE,
+                                     /*bInitialState=*/FALSE, nullptr);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  const FileDescriptor first_fd = reinterpret_cast<FileDescriptor>(first);
+  const FileDescriptor second_fd = reinterpret_cast<FileDescriptor>(second);
+  int dispatches = 0;
+  {
+    TestAio aio;
+    bool first_registered = true;
+    aio.OnReadable(first_fd, []() {});
+    aio.OnReadable(second_fd, [&]() {
+      ++dispatches;
+      ABSL_PCHECK(ResetEvent(second));
+      if (first_registered) {
+        first_registered = false;
+        aio.DeleteFd(first_fd);
+      }
+    });
+
+    ABSL_PCHECK(SetEvent(second));
+    EXPECT_TRUE(aio.Poll(true));
+    EXPECT_EQ(dispatches, 1);
+    EXPECT_FALSE(first_registered);
+
+    // The watch that just dispatched has to be armed again, or this never
+    // returns.
+    ABSL_PCHECK(SetEvent(second));
+    EXPECT_TRUE(aio.Poll(true));
+    EXPECT_EQ(dispatches, 2);
+
+    aio.DeleteFd(second_fd);
+  }
+  ABSL_PCHECK(CloseHandle(first));
+  ABSL_PCHECK(CloseHandle(second));
+}
+
 #endif  // _WIN32
+
+// AOS assumes an event loop means one thread: every callback runs on the
+// thread that drives the loop.  That is free for a backend that waits in
+// Poll() itself, and worth pinning for the one that borrows libuv's loop on
+// Windows, which is the one place threads are in the picture at all: libuv
+// polls sockets from providers outside MSAFD with select() on a worker thread
+// and posts the result back to the loop.  Every kind of callback there is has
+// to come back on this thread: a legacy readiness callback, a raw completion
+// in each direction, a timer, and a thread-signal wakeup, over enough rounds
+// that anything delivered from elsewhere would have shown up.
+TEST_P(AioTest, CallbacksRunOnTheLoopThread) {
+  const std::thread::id loop_thread = std::this_thread::get_id();
+  struct Counts {
+    std::thread::id loop_thread;
+    int callbacks = 0;
+    int off_thread = 0;
+    int arrived = 0;
+    void Note() {
+      ++callbacks;
+      ++arrived;
+      if (std::this_thread::get_id() != loop_thread) ++off_thread;
+    }
+  } counts{loop_thread};
+  const auto note_completion = [](Completion, void *ctx) {
+    static_cast<Counts *>(ctx)->Note();
+  };
+
+  TestAio aio;
+  Pipe legacy;
+  Pipe raw;
+  aio.OnReadable(legacy.read_fd(), [&]() {
+    counts.Note();
+    EXPECT_EQ(legacy.Read(1), "a");
+  });
+  aos::ipc_lib::ThreadSignalReceiver receiver;
+  aio.RegisterThreadSignalReceiver(&receiver, [&]() { counts.Note(); });
+  const auto pid = aos::GetProcessId();
+  const auto tid = aos::GetThreadId();
+
+  constexpr int kRounds = 50;
+  constexpr int kPerRound = 5;
+  for (int round = 0; round < kRounds; ++round) {
+    counts.arrived = 0;
+
+    legacy.Write("a");
+
+    AsyncRequest write_req;
+    write_req.callback = note_completion;
+    write_req.context = &counts;
+    const char out[1] = {'b'};
+    aio.AsyncWrite(raw.write_fd(), out, &write_req);
+    AsyncRequest read_req;
+    read_req.callback = note_completion;
+    read_req.context = &counts;
+    char in[1];
+    aio.AsyncRead(raw.read_fd(), in, &read_req);
+
+    Aio::Timer timer(aio.get());
+    timer.Schedule(aos::monotonic_clock::now(), note_completion, &counts);
+
+    aos::ipc_lib::ThreadSignalSender sender;
+    sender.Signal(pid, tid);
+
+    int polls = 0;
+    while (counts.arrived < kPerRound && polls < 1000 && aio.Poll(true)) {
+      ++polls;
+    }
+    ASSERT_EQ(counts.arrived, kPerRound) << "round " << round;
+  }
+
+  EXPECT_EQ(counts.callbacks, kRounds * kPerRound);
+  EXPECT_EQ(counts.off_thread, 0)
+      << "a callback ran on a thread other than the one driving the loop";
+
+  aio.UnregisterThreadSignalReceiver(&receiver);
+  aio.DeleteFd(legacy.read_fd());
+}
 
 // Test that the basics of OnError work by closing the read end.
 TEST_P(AioTest, EPollLikeBasicError) {
@@ -3626,6 +3883,42 @@ TEST_P(AioTest, EPollLikeBasicError) {
   EXPECT_EQ(number_errors, 1);
 
   aio.DeleteFd(pipe.write_fd());
+}
+
+// The other half of the story above: a peer that goes away abruptly -- a
+// reset, not a close.  EPollLikeBasicError covers the graceful end, which is
+// the easy one; a reset is a different thing on the wire, and every backend
+// has to route it to a registration that only asked about errors.
+//
+// A TCP connection rather than a Pipe because a reset is something only TCP
+// has to send: pipe(2) has no such notion, and neither does the AF_UNIX pair
+// a Pipe is on Windows.
+//
+// What it pins in the libuv backend on Windows: libuv asks AFD for exactly
+// the events it was given, and an error-only subscription becomes the
+// graceful disconnect alone.  The reset is only asked for alongside
+// readability, so the backend watches an error-only registration for
+// readability too and peeks to tell the two apart.  Without that, this
+// arrives nowhere (measured).
+TEST_P(AioTest, AbortiveResetReachesAnErrorOnlyRegistration) {
+  TestAio aio;
+  TcpPair connection;
+  int errors = 0;
+  aio.OnError(connection.server_fd(), [&errors]() { ++errors; });
+
+  // Nothing yet.
+  RunAioFor(aio, std::chrono::milliseconds(20));
+  EXPECT_EQ(errors, 0);
+
+  connection.ResetClient();
+
+  int polls = 0;
+  while (errors == 0 && polls < 200 && aio.Poll(true)) {
+    ++polls;
+  }
+  EXPECT_EQ(errors, 1) << "the peer's reset never reached OnError()";
+
+  aio.DeleteFd(connection.server_fd());
 }
 
 // Tests that removing an event before scheduling any events works.
@@ -3814,6 +4107,13 @@ TEST_P(AioTest, RunDrainsQueuedEventsAfterQuit) {
 // that stops redelivering fails the EXPECT instead of the test hanging; the
 // watchdog covers the opposite regression, where nothing ever ends the drain.
 TEST_P(AioTest, RunDrainRedeliversUnconsumedReadiness) {
+  // The drain is Run()'s: a guest's Quit() stops what AOS registered, and
+  // whether the owner's loop delivers anything more first is the owner's
+  // loop's business.  libuv on Linux and macOS happens to report the pipe
+  // before the eventfd Quit() signalled through, which is ordering rather
+  // than a promise, and on Windows it goes the other way.
+  if (!Backend().drives_its_own_loop)
+    GTEST_SKIP() << "a borrowed loop has no Run() to drain";
   ScopedDeathTestWatchdog watchdog;
 
   TestAio aio;
@@ -3845,6 +4145,9 @@ TEST_P(AioTest, RunDrainRedeliversUnconsumedReadiness) {
 // someone: an idle fd is always writable, so unlike a pipe's byte there is
 // nothing to read to make it stop.  DisableWritable() is what retires it.
 TEST_P(AioTest, RunDrainRedeliversWritability) {
+  // See RunDrainRedeliversUnconsumedReadiness.
+  if (!Backend().drives_its_own_loop)
+    GTEST_SKIP() << "a borrowed loop has no Run() to drain";
   ScopedDeathTestWatchdog watchdog;
 
   TestAio aio;
