@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implemented in `aos/events/aio_uv.h` and `aos/events/aio_uv.cc`, held to the `Aio` contract by `//aos/events:aio_test_uv` and covered past what that suite can reach by `aos/events/aio_uv_backend_test.cc`. Linux only: `//aos/events:aio_uv` is `target_compatible_with @platforms//os:linux`.
+Accepted. Implemented in `aos/events/aio_uv.h` and `aos/events/aio_uv.cc`, held to the `Aio` contract by `//aos/events:aio_test_uv` and covered past what that suite can reach by `aos/events/aio_uv_backend_test.cc`. Runs on Linux and macOS. `//aos/events:aio_uv` is incompatible with Windows only, where libuv's loop is an IOCP that nothing else can wait on.
 
 ## Context
 
@@ -25,8 +25,8 @@ Add a fifth backend that is a guest rather than a host, and make the places wher
 2. **`Aio` gains a protected constructor taking an `Impl`, and a virtual destructor** so a subclass can be owned through an `Aio *`. Nothing else becomes virtual: every method still forwards to `impl_`, so a subclass supplies a backend rather than overriding behaviour.
 3. **libuv stays out of `//aos/events:aio`.** Only `//aos/events:aio_uv` depends on `@libuv`, and `aio_uv.h` forward-declares `uv_loop_s` so no consumer of it needs `<uv.h>`.
 4. **Every handle put on the loop is heap allocated and freed from its own close callback.** A handle owned as a member could not survive long enough, because that callback runs on a later turn of a loop this object does not drive.
-5. **Timers are `timerfd`s watched with `uv_poll`, not `uv_timer_t`.** The timerfd keeps the nanosecond deadline AOS schedules with and is just another descriptor to poll — the same trade `EpollImpl` makes.
-6. **The wakeup is `uv_poll` on the `ThreadSignalReceiver`'s `signalfd`**, which is what `EpollImpl` does with it too.
+5. **Timers are a descriptor carrying the deadline, watched with `uv_poll`, not `uv_timer_t`.** A `timerfd` on Linux; the descriptor keeps the nanosecond deadline AOS schedules with and is just another thing to poll — the same trade `EpollImpl` makes.
+6. **The wakeup is `uv_poll` on a descriptor the `ThreadSignalReceiver` can be observed through** — its `signalfd` on Linux, which is what `EpollImpl` does with it too.
 7. **`Quit()` stops AOS's own handles and, by default, leaves the loop running.** `UvQuitBehavior::kStopLoop` is available for when AOS is the only thing on the loop.
 8. **`AsyncRead`, `AsyncWrite` and `Cancel` are emulated on readiness**, the way `EpollImpl` does it. A completion with no descriptor left to wait on goes out through a `uv_idle_t`, so it still reaches the caller from a turn of the loop rather than from inside the call that produced it.
 9. **The realtime malloc check is the loop owner's to suspend, not this backend's to assume.** `UvAio::ScopedLoopTurn` exempts libuv's own allocations across a turn and puts the check back around AOS's callbacks. With no such scope in effect the backend leaves the caller's realtime state alone — an `ShmEventLoop` that went realtime is still realtime when its handlers run.
@@ -39,9 +39,9 @@ The refusal is the cheap half; the expensive half is what it implies about lifet
 
 So every handle this backend creates — the `uv_poll_t`s, the `uv_prepare_t` behind `BeforeWait()`, the `uv_async_t` behind `kStopLoop` — is heap allocated and deletes itself from its own close callback. Nothing libuv can still reach may be a member of `UvAio` or of a registration, and the destructor closes handles without waiting for the closes to finish. `DeleteFdDefersFreeingItsHandle` is the test that holds this down: it cycles a registration through exactly that state, and the fixture's `uv_loop_close()` is what notices a leak or a double free.
 
-### Timers: a `timerfd`, not `uv_timer_t`
+### Timers: a descriptor carrying the deadline, not `uv_timer_t`
 
-`uv_timer_t` is the obvious choice and is wrong here for one reason: it takes milliseconds. Every AOS deadline is absolute and nanosecond-exact, so routing timers through it would quietly coarsen all of them by up to a millisecond. A `timerfd` keeps the deadline intact and reduces a timer to what libuv is good at — a descriptor to poll.
+`uv_timer_t` is the obvious choice and is wrong here for one reason: it takes milliseconds. Every AOS deadline is absolute and nanosecond-exact, so routing timers through it would quietly coarsen all of them by up to a millisecond. A descriptor that carries the deadline keeps it intact and reduces a timer to what libuv is good at — something to poll. On Linux that descriptor is a `timerfd`; where the platform has none, the substitution is what the Consequences describe, and the paths above it never learn the difference.
 
 ### `Quit()` is a guest's Quit
 
@@ -74,7 +74,7 @@ What a guest cannot promise at all is in the contract suite as skips rather than
 - **The guest's refusal of `Run()` and `Poll()` is a runtime abort, not a compile error.** Driving stays on `Aio`'s base interface, so the call that aborts is writable. Why that trade is kept — and what would reopen it — is under "Taking driving out of `Aio`'s interface" below.
 - **A `UvAio` cannot be driven for testing without a real libuv loop**, since the usual `Poll()` loop is fatal. `aio_test_lib.cc`'s `TestAio` owns one and turns it over in place of `Poll()`; `aio_uv_backend_test.cc` runs `uv_run()` directly.
 - **Handles outlive their registrations by design**, so a leak here shows up as a `uv_loop_close()` failure rather than as anything closer to the mistake. The test fixture exists to make that noticeable.
-- **The backend is Linux-only for now.** libuv can only wait on descriptors, and on Linux the two things AOS needs waking for already are descriptors. That is not true elsewhere: macOS's `ThreadSignalReceiver` has no descriptor and the platform has no `timerfd`, and libuv on Windows cannot poll a descriptor at all (libuv's documentation: "on windows only sockets can be polled with poll handles").
+- **The backend runs anywhere libuv can wait on a descriptor, which is everywhere but Windows.** On Linux the two things AOS needs waking for already are descriptors, a `timerfd` per timer and the receiver's own `signalfd`. macOS has neither, and is supported anyway because a kqueue is itself a descriptor: one holding a single `EVFILT_TIMER` stands in for the timerfd and one holding a single `EVFILT_SIGNAL` for the signalfd, so below six helpers behind an `#ifdef` there is only ever an fd. ADR 0002 covers that substitution in full. Windows is the exception that stands: libuv's loop is an IOCP there, and its own documentation rules the mechanism out -- "on windows only sockets can be polled with poll handles".
 
 ## Alternatives considered
 

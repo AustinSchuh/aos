@@ -1123,9 +1123,11 @@ cc_library(
         "aio_uv.h",
     ],
     # libuv's loop is a descriptor to poll on Linux and macOS, and an IOCP on
-    # Windows that nothing else can wait on.  macOS is excluded too for now:
-    # its ThreadSignalReceiver has no descriptor, and it has no timerfd.
-    target_compatible_with = ["@platforms//os:linux"],
+    # Windows that nothing else can wait on.
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":aio",
@@ -1143,7 +1145,10 @@ cc_test(
     srcs = [
         "aio_uv_backend_test.cc",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":aio",
         ":aio_uv",
@@ -1161,7 +1166,10 @@ aos_config(
     flatbuffers = [
         ":test_message_fbs",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":aos_config",
     ],
@@ -1175,7 +1183,10 @@ cc_test(
     data = [
         ":aio_uv_test_config",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":aio_uv",
         ":shm_event_loop",

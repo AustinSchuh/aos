@@ -18,11 +18,20 @@ namespace aos {
 // do.  Quit() therefore stops AOS's own work rather than the loop, which would
 // not be AOS's to stop.
 //
-// Only what libuv can wait on is available here.  On Linux that is everything
-// AOS needs, because the wakeup an ShmEventLoop watcher uses is a signalfd and
-// its timers are timerfds -- both ordinary descriptors.  macOS has neither
-// (its ThreadSignalReceiver has no descriptor at all) and libuv on Windows
-// cannot poll a descriptor, so this target is Linux-only for now.
+// Only what libuv can wait on is available here, which means everything AOS
+// needs has to be a descriptor.  On Linux it already is: the wakeup an
+// ShmEventLoop watcher uses is a signalfd and its timers are timerfds.  macOS
+// has neither, but a kqueue is a descriptor too, so one holding a single
+// EVFILT_SIGNAL or EVFILT_TIMER stands in for each.  libuv on Windows cannot
+// poll a descriptor at all, so this target remains unavailable there.
+//
+// One macOS-only caveat: a borrowed loop does not survive fork(2).  A kqueue
+// descriptor is not inherited by the child, and libuv's loop is backed by one,
+// so every call into it there fails EBADF.  The native kqueue backend rebuilds
+// its own kqueue in the child; this one cannot, because the loop belongs to
+// whoever lent it.  Keep the UvAio in one process, or hand the child a loop it
+// made itself.
+
 // What Quit() should do to the borrowed loop.
 enum class UvQuitBehavior {
   // Stop AOS's own handles and leave the loop running.  Right for a guest:
