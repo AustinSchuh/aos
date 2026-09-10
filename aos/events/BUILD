@@ -111,7 +111,10 @@ cc_library(
             "aio_readiness_backend.cc",
             "aio_readiness_backend.h",
         ],
-        "@platforms//os:windows": ["aio_windows.cc"],
+        "@platforms//os:windows": [
+            "aio_windows.cc",
+            "aio_windows_internal.h",
+        ],
     }),
     hdrs = [
         "aio.h",

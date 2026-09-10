@@ -25,6 +25,7 @@
 #include "absl/log/absl_log.h"
 
 #include "aos/events/aio_internal.h"
+#include "aos/events/aio_windows_internal.h"
 #include "aos/events/timer_queue.h"
 #include "aos/events/winsock_init.h"
 #include "aos/ipc_lib/thread_signal.h"
@@ -114,29 +115,6 @@ int TranslateWinsockError(int err) {
     default:
       return err;
   }
-}
-
-// On Windows a FileDescriptor is an opaque handle that holds the SOCKET
-// directly (see aio.h), so no lookup table is needed to recover it.
-inline SOCKET ToSocket(FileDescriptor fd) {
-  return reinterpret_cast<SOCKET>(fd);
-}
-
-// Whether fd names a socket rather than some other waitable Win32 object.
-//
-// ToSocket() above is a bare reinterpret_cast, so nothing downstream can tell
-// the difference on its own -- which is why a non-socket handle used to reach
-// CreateIoCompletionPort() and fail with ERROR_INVALID_HANDLE on every Poll().
-// getsockopt(SO_TYPE) is the cheap, side-effect-free question: it answers for
-// any socket and fails with WSAENOTSOCK for anything that is not one.
-//
-// Cached per registration rather than asked per Poll(): the answer cannot
-// change for a given handle, and this sits on the arming path.
-inline bool IsSocket(FileDescriptor fd) {
-  int type = 0;
-  int length = sizeof(type);
-  return getsockopt(ToSocket(fd), SOL_SOCKET, SO_TYPE,
-                    reinterpret_cast<char *>(&type), &length) == 0;
 }
 
 // Whether a Winsock error describes the state of the connection rather than
@@ -291,43 +269,7 @@ constexpr uint32_t kErr = 0x08;
 struct WindowsTimerState;
 class IocpImpl;
 
-// Wait completion packets.
-//
-// The kernel's own way of turning "this object became signaled" into a
-// completion on a port: a packet is associated with (port, object, key,
-// context), and when the object signals the kernel queues that packet to the
-// port.
-//
-// Nt* rather than Win32: there is no documented Win32 wrapper.  Resolved by
-// name from ntdll at first use and CHECKed, since the alternative is silent.
-// Present since Windows 8.
-//
-// Semantics, established by probe rather than documentation:
-//   - One-shot.  A delivered packet is no longer associated; re-associate to
-//     watch again.  Associating an already-associated packet fails with
-//     STATUS_INVALID_PARAMETER_1.
-//   - Associating with an already-signaled object queues the packet at once
-//     and reports AlreadySignaled.
-//   - Cancel with RemoveSignaledPacket=TRUE also pulls a packet that is
-//     queued but not yet dequeued.  Cancel with nothing associated is
-//     STATUS_CANCELLED and otherwise harmless.
-//   - Closing the target object, or the port, while associated delivers
-//     nothing and leaves the packet cancellable and closable.
-typedef NTSTATUS(NTAPI *NtCreateWaitCompletionPacketFn)(PHANDLE, ACCESS_MASK,
-                                                        POBJECT_ATTRIBUTES);
-typedef NTSTATUS(NTAPI *NtAssociateWaitCompletionPacketFn)(
-    HANDLE WaitCompletionPacketHandle, HANDLE IoCompletionHandle,
-    HANDLE TargetObjectHandle, PVOID KeyContext, PVOID ApcContext,
-    NTSTATUS IoStatus, ULONG_PTR IoStatusInformation, PBOOLEAN AlreadySignaled);
-typedef NTSTATUS(NTAPI *NtCancelWaitCompletionPacketFn)(
-    HANDLE WaitCompletionPacketHandle, BOOLEAN RemoveSignaledPacket);
-
-struct WaitPacketApi {
-  NtCreateWaitCompletionPacketFn create;
-  NtAssociateWaitCompletionPacketFn associate;
-  NtCancelWaitCompletionPacketFn cancel;
-};
-
+// The wait completion packet API is described in aio_windows_internal.h.
 const WaitPacketApi &WaitPackets() {
   static const WaitPacketApi api = []() {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -347,8 +289,6 @@ const WaitPacketApi &WaitPackets() {
   }();
   return api;
 }
-
-inline bool NtOk(NTSTATUS status) { return status >= 0; }
 
 HANDLE CreateWaitPacket() {
   HANDLE packet = NULL;
@@ -380,144 +320,9 @@ inline bool IsInternalKey(ULONG_PTR key) {
 constexpr DWORD kWriteWatchBackstop = 100;
 
 namespace {
-// One wait completion packet -- see WaitPackets() for what the kernel
-// promises about them -- plus the one fact about it the kernel does not
-// report back: whether it is currently associated.  Owns the handle.
-class WaitPacket {
- public:
-  WaitPacket() : packet_(CreateWaitPacket()) {}
-  ~WaitPacket() {
-    Disarm();
-    ABSL_PCHECK(CloseHandle(packet_)) << "CloseHandle failed";
-  }
-  WaitPacket(const WaitPacket &) = delete;
-  WaitPacket &operator=(const WaitPacket &) = delete;
-
-  // Associates the packet with target on port, so that when target signals,
-  // Poll() dequeues key as the completion key and context as lpOverlapped.
-  // A target that is already signaled queues the packet right here.  Not
-  // legal while armed: the kernel refuses a second association.
-  void Arm(HANDLE port, HANDLE target, ULONG_PTR key, void *context) {
-    ABSL_CHECK(!armed_) << ": wait packet armed twice";
-    BOOLEAN already_signaled = FALSE;
-    const NTSTATUS status = WaitPackets().associate(
-        packet_, port, target, reinterpret_cast<PVOID>(key), context,
-        /*IoStatus=*/0, /*IoStatusInformation=*/0, &already_signaled);
-    ABSL_CHECK(NtOk(status)) << ": NtAssociateWaitCompletionPacket failed: 0x"
-                             << std::hex << static_cast<uint32_t>(status);
-    armed_ = true;
-  }
-
-  // Withdraws the association.  RemoveSignaledPacket: a packet the kernel
-  // has already queued but Poll() has not yet dequeued goes too, so nothing
-  // for this packet arrives after Disarm() returns.  That is what lets a
-  // dequeued context be used as a live pointer, and what lets ~IocpImpl()'s
-  // drain treat everything it dequeues as socket I/O.  A no-op when not
-  // armed.
-  void Disarm() {
-    if (!armed_) {
-      return;
-    }
-    WaitPackets().cancel(packet_, /*RemoveSignaledPacket=*/TRUE);
-    armed_ = false;
-  }
-
-  // Poll() dequeued this packet.  A delivered packet is no longer
-  // associated; whoever owns it decides whether to Arm() again.
-  void MarkDelivered() { armed_ = false; }
-
-  bool armed() const { return armed_; }
-
- private:
-  const HANDLE packet_;
-  bool armed_ = false;
-};
-
-// The one high-resolution kernel timer behind IocpImpl::timers_.  It is
-// armed for the head deadline and delivered to the port as a wait completion
-// packet with kTimerKey, so Poll() waits with no timeout of its own.
-//
-// Not GetQueuedCompletionStatus()'s timeout, which is whole milliseconds
-// rounded up: a 500us timer waited a full millisecond, and a repeating one
-// drifted late every cycle.  This takes its due time in 100ns units instead.
-// Measured lateness on an idle machine: floor 35-100us, median 0.2-1.0ms,
-// worst 1.2ms, down from 4.5ms.  See EnsureHighResolutionTimers() for the
-// system tick underneath all of those.
-class DeadlineTimer {
- public:
-  DeadlineTimer() {
-    // A synchronization (auto-reset) timer rather than manual-reset: the
-    // packet consumes the signal on delivery, and SetWaitableTimer() clears
-    // a fire nobody consumed, so a stale expiry cannot leak into the next
-    // arming as an immediate delivery (probed).  The high-resolution flag
-    // needs Windows 10 1803, older than anything this backend runs on;
-    // refusing to start beats quietly quantising every deadline to the
-    // tick.
-    timer_ = CreateWaitableTimerExW(
-        NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    ABSL_PCHECK(timer_ != NULL)
-        << "CreateWaitableTimerExW(HIGH_RESOLUTION) failed; this backend "
-           "needs Windows 10 1803 or later";
-  }
-  ~DeadlineTimer() {
-    // Before the timer the packet is watching goes, not after.
-    packet_.Disarm();
-    ABSL_PCHECK(CloseHandle(timer_)) << "CloseHandle failed";
-  }
-  DeadlineTimer(const DeadlineTimer &) = delete;
-  DeadlineTimer &operator=(const DeadlineTimer &) = delete;
-
-  // Arms for deadline on aos::monotonic_clock, the clock every deadline in
-  // timers_ is expressed in.  A no-op if that is what it is armed for
-  // already.
-  void Arm(HANDLE port, aos::monotonic_clock::time_point deadline,
-           aos::monotonic_clock::time_point now) {
-    if (packet_.armed() && armed_deadline_ == deadline) {
-      return;
-    }
-    // A different deadline: withdraw the old one, queued packet included, so
-    // a stale expiry cannot wake the wait.
-    Disarm();
-    // Negative because that is how SetWaitableTimer() is told a time is
-    // relative: a positive lpDueTime is an absolute FILETIME, a negative one
-    // is 100ns units from now, which is what deadline-minus-now gives us.
-    // Rounded up so the rounding can never fire it early.
-    //
-    // Set before associate, never after: setting the timer clears a fire
-    // nobody consumed, and associating with an object that is already
-    // signalled delivers at once.
-    const int64_t delta_ns = std::max<int64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
-            .count(),
-        1);
-    LARGE_INTEGER due;
-    due.QuadPart = -((delta_ns + 99) / 100);
-    ABSL_PCHECK(SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE))
-        << "SetWaitableTimer failed";
-    packet_.Arm(port, timer_, kTimerKey, /*context=*/nullptr);
-    armed_deadline_ = deadline;
-  }
-
-  void Disarm() {
-    packet_.Disarm();
-    armed_deadline_ = aos::monotonic_clock::min_time;
-  }
-
-  // Poll() dequeued the timer's packet.  Whether the head deadline is really
-  // due is Poll()'s to decide: the timer may run a little ahead of
-  // monotonic_clock, since the two are read from different clocks.
-  void OnDelivered() {
-    packet_.MarkDelivered();
-    armed_deadline_ = aos::monotonic_clock::min_time;
-  }
-
- private:
-  HANDLE timer_ = NULL;
-  WaitPacket packet_;
-  // Meaningless while the packet is not armed.
-  aos::monotonic_clock::time_point armed_deadline_ =
-      aos::monotonic_clock::min_time;
-};
+// WaitPacket and DeadlineTimer -- the packet, and the one high-resolution
+// kernel timer behind IocpImpl::timers_ that is delivered through one with
+// kTimerKey -- live in aio_windows_internal.h, shared with the libuv backend.
 
 // A legacy registration whose "fd" is a plain waitable HANDLE rather than a
 // socket: what a glib GPollFD is on this platform, and what a
@@ -553,19 +358,8 @@ class HandleWatch {
   WaitPacket packet_;
 };
 
-// The level oracle for a write watch.  FD_WRITE says when writability
-// *changed*; this says whether it holds right now, which is the question
-// EPOLLOUT answers.
-bool SocketWritable(SOCKET s) {
-  fd_set writable;
-  FD_ZERO(&writable);
-  FD_SET(s, &writable);
-  TIMEVAL immediately = {0, 0};
-  // nfds is ignored on Windows; the fd_set carries its own count.
-  return select(0, nullptr, &writable, nullptr, &immediately) == 1;
-}
-
-// The legacy write watch: where OnWritable()'s kOut comes from.
+// The legacy write watch: where OnWritable()'s kOut comes from.  The level
+// oracle it asks, SocketWritable(), is in aio_windows_internal.h.
 //
 // Not the mirror image of the read watch.  The read watch is a zero-byte
 // WSARecv, which genuinely pends until data arrives.  A zero-byte WSASend
@@ -746,8 +540,9 @@ class IocpImpl : public Aio::Impl {
   void InsertTimer(AsyncRequest *request);
 
   // Delivers the head of timers_ to the port; see DeadlineTimer.  Poll()
-  // re-arms it only when the head deadline actually changes.
-  DeadlineTimer deadline_timer_;
+  // re-arms it only when the head deadline actually changes.  Auto-reset,
+  // because Poll() sees the packet and OnDelivered() is what consumes it.
+  DeadlineTimer deadline_timer_{kTimerKey};
 
   // Everything this loop knows about one registered fd: the caller's
   // outstanding raw requests, its legacy readiness handlers, and the
