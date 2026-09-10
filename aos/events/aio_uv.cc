@@ -602,6 +602,19 @@ class UvImpl : public Aio::Impl, public UvCore {
     if (reg->events_fn != nullptr) {
       uint32_t events = EventsFromUv(uv_events);
       if (status < 0) events |= kErr;
+      // Drop readiness nobody subscribed to, the way epoll never reports an
+      // unsubscribed bit and KqueueImpl::DesiredReadiness() masks to stay a
+      // faithful mirror of it.  This only bites where AdjustWatch() widened
+      // the watch beyond what was asked: on Linux libuv is only ever asked
+      // for the subscription, and Windows leaves through DispatchReadiness()
+      // above without reaching here.  kErr is never masked out -- like epoll,
+      // an error is reported whether or not it was asked for.
+      events &= uv_internal::SubscribedEvents(reg) | kErr;
+      // Nothing left to say.  Returning without calling back is what makes
+      // the widened watch invisible rather than a stream of empty callbacks.
+      if (events == 0) {
+        return;
+      }
       reg->events_fn(events);
       return;
     }
