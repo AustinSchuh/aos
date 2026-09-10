@@ -1,5 +1,11 @@
 #include "aos/events/shm_event_loop.h"
 
+#if defined(AOS_UV_ONLY)
+#include <uv.h>
+
+#include "aos/events/aio_uv.h"
+#endif
+
 #include <filesystem>
 #include <string_view>
 
@@ -82,6 +88,115 @@ class ShmEventLoopTestFactory : public EventLoopTestFactory {
   const std::string backend_;
 };
 
+#if defined(AOS_UV_ONLY)
+
+// Drives ShmEventLoop from a libuv loop instead of from its own Run().
+//
+// This exists to prove a specific thing: that Startup() and Shutdown() around
+// a foreign loop cover everything ShmEventLoop::Run() does.  It runs the whole
+// AbstractEventLoopTest suite without ShmEventLoop::Run() ever being called,
+// so anything Run() does that those two miss shows up as a failure here.
+class UvShmEventLoopTestFactory : public EventLoopTestFactory {
+ public:
+  UvShmEventLoopTestFactory() {
+    std::string shm_dir = absl::GetFlag(FLAGS_shm_base);
+    std::error_code ec;
+    std::filesystem::remove_all(shm_dir, ec);
+  }
+
+  ~UvShmEventLoopTestFactory() {
+    absl::SetFlag(&FLAGS_override_hostname, "");
+    // Order matters: the event loops hand their handles back to the Aios, the
+    // Aios start closing them, and only then can the loops be run out and
+    // closed.
+    event_loops_.clear();
+    for (std::unique_ptr<Slot> &slot : slots_) {
+      slot->aio.reset();
+      uv_run(&slot->uv_loop, UV_RUN_DEFAULT);
+      ABSL_CHECK_EQ(uv_loop_close(&slot->uv_loop), 0);
+    }
+  }
+
+  ::std::unique_ptr<EventLoop> Make(std::string_view name) override {
+    return MakeWithAio(name, nullptr);
+  }
+
+  ::std::unique_ptr<EventLoop> MakePrimary(std::string_view name) override {
+    return MakeWithAio(name, &primary_);
+  }
+
+  Status Run() override {
+    ABSL_CHECK(primary_ != nullptr);
+    ABSL_CHECK(primary_uv_loop_ != nullptr);
+    // Deliberately not primary_->Run(): the point is that this works without
+    // it.
+    primary_->Startup();
+    uv_run(primary_uv_loop_, UV_RUN_DEFAULT);
+    return primary_->Shutdown();
+  }
+
+  std::unique_ptr<ExitHandle> MakeExitHandle() override {
+    ABSL_CHECK(primary_ != nullptr);
+    return primary_->MakeExitHandle();
+  }
+
+  void Exit() override {
+    ABSL_CHECK(primary_ != nullptr);
+    primary_->Exit();
+  }
+
+  void SleepFor(::std::chrono::nanoseconds duration) override {
+    ::std::this_thread::sleep_for(duration);
+  }
+
+ private:
+  // One libuv loop and one UvAio per event loop, mirroring how the other
+  // factory gives each ShmEventLoop its own Aio.
+  struct Slot {
+    uv_loop_t uv_loop;
+    std::unique_ptr<UvAio> aio;
+  };
+
+  ::std::unique_ptr<EventLoop> MakeWithAio(std::string_view name,
+                                           ShmEventLoop **primary_out) {
+    if (configuration()->has_nodes()) {
+      absl::SetFlag(&FLAGS_override_hostname,
+                    std::string(my_node()->hostname()->string_view()));
+    }
+    auto slot = std::make_unique<Slot>();
+    ABSL_CHECK_EQ(uv_loop_init(&slot->uv_loop), 0);
+    // kStopLoop because AOS is the only thing on these loops, so Exit() ending
+    // the run is what the tests mean by it.
+    slot->aio =
+        std::make_unique<UvAio>(&slot->uv_loop, UvQuitBehavior::kStopLoop);
+    ::std::unique_ptr<ShmEventLoop> loop(
+        new ShmEventLoop(configuration(), slot->aio.get()));
+    loop->set_name(name);
+    if (primary_out != nullptr) {
+      *primary_out = loop.get();
+      primary_uv_loop_ = &slot->uv_loop;
+    }
+    event_loops_.push_back(loop.get());
+    slots_.push_back(std::move(slot));
+    return loop;
+  }
+
+  ShmEventLoop *primary_ = nullptr;
+  uv_loop_t *primary_uv_loop_ = nullptr;
+  std::vector<ShmEventLoop *> event_loops_;
+  std::vector<std::unique_ptr<Slot>> slots_;
+};
+
+auto UvParameters() {
+  return ::testing::Combine(
+      ::testing::Values([]() { return new UvShmEventLoopTestFactory(); }),
+      ::testing::Values(ReadMethod::COPY, ReadMethod::PIN),
+      ::testing::Values(DoTimingReports::kYes, DoTimingReports::kNo));
+}
+
+#endif  // AOS_UV_ONLY
+
+#if !defined(AOS_UV_ONLY)
 auto CommonParameters(std::string backend) {
   return ::testing::Combine(
       ::testing::Values([backend = std::move(backend)]() {
@@ -90,8 +205,15 @@ auto CommonParameters(std::string backend) {
       ::testing::Values(ReadMethod::COPY, ReadMethod::PIN),
       ::testing::Values(DoTimingReports::kYes, DoTimingReports::kNo));
 }
+#endif  // !AOS_UV_ONLY
 
 #ifdef __linux__
+#if defined(AOS_UV_ONLY)
+INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestUv, AbstractEventLoopTest,
+                         UvParameters());
+INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestUv,
+                         AbstractEventLoopDeathTest, UvParameters());
+#else
 #ifndef AOS_EPOLL_ONLY
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestIoUring, AbstractEventLoopTest,
                          CommonParameters("io_uring"));
@@ -106,6 +228,7 @@ INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestEpoll, AbstractEventLoopTest,
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonDeathTestEpoll,
                          AbstractEventLoopDeathTest, CommonParameters("epoll"));
 #endif  // AOS_IO_URING_ONLY
+#endif  // AOS_UV_ONLY
 #else
 INSTANTIATE_TEST_SUITE_P(ShmEventLoopCommonTestKQueue, AbstractEventLoopTest,
                          CommonParameters("kqueue"));

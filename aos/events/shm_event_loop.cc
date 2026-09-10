@@ -76,7 +76,40 @@ ShmEventLoop::ShmEventLoop(const Configuration *configuration)
     : EventLoop(configuration, absl::GetFlag(FLAGS_application_name),
                 MaybeMyNode(configuration)),
       boot_uuid_(UUID::BootUUID()),
-      shm_base_(absl::GetFlag(FLAGS_shm_base)) {
+      shm_base_(absl::GetFlag(FLAGS_shm_base)),
+      owned_aio_(std::in_place),
+      aio_(&owned_aio_.value()) {
+  Initialize(configuration);
+}
+
+ShmEventLoop::ShmEventLoop(const Configuration *configuration, Aio *aio)
+    : EventLoop(configuration, absl::GetFlag(FLAGS_application_name),
+                MaybeMyNode(configuration)),
+      boot_uuid_(UUID::BootUUID()),
+      shm_base_(absl::GetFlag(FLAGS_shm_base)),
+      aio_(ABSL_DIE_IF_NULL(aio)) {
+  Initialize(configuration);
+  // Bring ourselves up on the first turn of whoever's loop this is, which is
+  // after the caller has finished registering -- when they would have called
+  // Startup() themselves.  A BeforeWait hook rather than anything
+  // libuv-specific, because it is the Aio's own "about to block" point and
+  // works for any borrowed backend.
+  //
+  // It fires on every turn, so the once-ness is here: this is the only caller
+  // that cannot know whether Startup() has run, and making it the only one
+  // that tolerates the question is what lets Startup() itself insist.
+  aio_->BeforeWait([this]() {
+    if (!auto_startup_pending_) {
+      return;
+    }
+    auto_startup_pending_ = false;
+    if (!started_) {
+      Startup();
+    }
+  });
+}
+
+void ShmEventLoop::Initialize(const Configuration *configuration) {
   // Ignore the wakeup signal by default. Otherwise, we have race conditions on
   // shutdown where a wakeup signal will uncleanly terminate the process.
   // See LocklessQueueWakeUpper::Wakeup() for some more information.
@@ -629,7 +662,7 @@ class ShmTimerHandler final : public TimerHandler {
       : TimerHandler(shm_event_loop, std::move(fn)),
         shm_event_loop_(shm_event_loop),
         event_(this),
-        timer_(&shm_event_loop_->aio_) {}
+        timer_(shm_event_loop_->aio_) {}
 
   ~ShmTimerHandler() {
     shm_event_loop_->CheckCurrentThread();
@@ -732,7 +765,7 @@ class ShmPhasedLoopHandler final : public PhasedLoopHandler {
       : PhasedLoopHandler(shm_event_loop, std::move(fn), interval, offset),
         shm_event_loop_(shm_event_loop),
         event_(this),
-        timer_(&shm_event_loop_->aio_) {}
+        timer_(shm_event_loop_->aio_) {}
 
   void HandleEvent() {
     event_.Invalidate();
@@ -957,7 +990,7 @@ void ShmEventLoop::HandleEvent() {
     if (next_time > checked_until) {
       // Consume all pending wakeup signals, so we don't wake up again
       // immediately to handle them.
-      aio_.ConsumeThreadSignalReceiver(signal_receiver_.get());
+      aio_->ConsumeThreadSignalReceiver(signal_receiver_.get());
       // This is the last time we can guarantee that if a message is published
       // before, we will notice it.
       now = monotonic_clock::now();
@@ -1001,7 +1034,12 @@ void ShmEventLoop::HandleEvent() {
   }
 }
 
-Status ShmEventLoop::Run() {
+void ShmEventLoop::Startup() {
+  ABSL_CHECK(!started_)
+      << ": Startup() has already run.  Run() calls it, and an event loop on a "
+         "borrowed Aio calls it from that loop's first turn, so an explicit "
+         "call is for getting in ahead of those -- not for repeating them.";
+  started_ = true;
   CheckCurrentThread();
   RegisterSignalHandler();
 
@@ -1009,92 +1047,95 @@ Status ShmEventLoop::Run() {
     signal_receiver_.reset(new ipc_lib::ThreadSignalReceiver());
     signal_receiver_->LeaveSignalBlocked();
 
-    aio_.RegisterThreadSignalReceiver(signal_receiver_.get(),
-                                      [this]() { HandleEvent(); });
+    aio_->RegisterThreadSignalReceiver(signal_receiver_.get(),
+                                       [this]() { HandleEvent(); });
   }
 
   MaybeScheduleTimingReports();
 
   ReserveEvents();
 
-  {
-    logging::ScopedLogRestorer prev_logger;
-    AosLogToFbs aos_logger;
-    if (!skip_logger_) {
-      aos_logger.Initialize(&name_, MakeSender<logging::LogMessageFbs>("/aos"));
-      prev_logger.Swap(aos_logger.implementation());
-    }
-
-    aos::SetCurrentThreadName(name_.substr(0, 16));
-    const CpuSet default_affinity = DefaultAffinity();
-    if (runtime_affinity_ != default_affinity) {
-      ::aos::SetCurrentThreadAffinity(runtime_affinity_);
-    }
-
-    // Construct the watchers, but don't update the next pointer. This also
-    // cleans up any watchers that previously died, and puts the nonrt work
-    // before going realtime.  After this happens, we will start queueing
-    // signals (which may be a bit of extra work to process, but won't cause any
-    // messages to be lost).
-    for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
-      watcher->Construct();
-    }
-
-    // Wait for the threads to start up before moving on.
-    WaitForNonIgnoredThreads();
-
-    const bool need_realtime =
-        SchedulingPolicyIsRealtime(runtime_scheduling_policy_) ||
-        (threads_ &&
-         std::ranges::any_of(*threads_, ThreadIsConfiguredToBeRealtime));
-    if (need_realtime) {
-      ::aos::InitRT();
-    }
-
-    // Tell the threads that they can start realtime configuration and start
-    // running.
-    AllowNonIgnoredThreadsToStart();
-
-    // Now, all the callbacks are setup.  Lock everything into memory and go RT.
-    if (SchedulingPolicyIsRealtime(runtime_scheduling_policy_)) {
-      const int scheduling_policy_id =
-          (runtime_scheduling_policy_ == SchedulingPolicy::SCHEDULER_FIFO)
-              ? SCHED_FIFO
-              : SCHED_RR;
-
-      ABSL_LOG(INFO) << "Setting scheduling policy to "
-                     << runtime_scheduling_policy_
-                     << " and realtime priority to " << runtime_priority_
-                     << " for " << name_;
-      ::aos::SetCurrentThreadRealtimePriority(
-          runtime_priority_, scheduling_policy_id, runtime_realtime_policy_);
-    }
-
-    set_is_running(true);
-
-    // Now that we are realtime (but before the OnRun handlers run), snap the
-    // queue index pointer to the newest message. This happens in RT so that we
-    // minimize the risk of losing messages.
-    for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
-      watcher->Startup();
-    }
-
-    // Now that we are RT, run all the OnRun handlers.
-    SetTimerContext(monotonic_clock::now());
-    for (const auto &run : on_run_) {
-      run();
-    }
-
-    // And start our main event loop which runs all the timers and handles Quit.
-    aio_.Run();
-
-    // Once epoll exits, there is no useful nonrt work left to do.
-    set_is_running(false);
-
-    // Nothing time or synchronization critical needs to happen after this
-    // point. Drop RT priority.
-    ::aos::UnsetCurrentThreadRealtimePriority();
+  // These outlive Startup() rather than being scoped locals, because the
+  // waiting they used to bracket now happens in the caller.
+  log_restorer_ = std::make_unique<logging::ScopedLogRestorer>();
+  aos_logger_ = std::make_unique<AosLogToFbs>();
+  if (!skip_logger_) {
+    aos_logger_->Initialize(&name_, MakeSender<logging::LogMessageFbs>("/aos"));
+    log_restorer_->Swap(aos_logger_->implementation());
   }
+
+  aos::SetCurrentThreadName(name_.substr(0, 16));
+  const CpuSet default_affinity = DefaultAffinity();
+  if (runtime_affinity_ != default_affinity) {
+    ::aos::SetCurrentThreadAffinity(runtime_affinity_);
+  }
+
+  // Construct the watchers, but don't update the next pointer. This also
+  // cleans up any watchers that previously died, and puts the nonrt work
+  // before going realtime.  After this happens, we will start queueing
+  // signals (which may be a bit of extra work to process, but won't cause any
+  // messages to be lost).
+  for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
+    watcher->Construct();
+  }
+
+  // Wait for the threads to start up before moving on.
+  WaitForNonIgnoredThreads();
+
+  const bool need_realtime =
+      SchedulingPolicyIsRealtime(runtime_scheduling_policy_) ||
+      (threads_ &&
+       std::ranges::any_of(*threads_, ThreadIsConfiguredToBeRealtime));
+  if (need_realtime) {
+    ::aos::InitRT();
+  }
+
+  // Tell the threads that they can start realtime configuration and start
+  // running.
+  AllowNonIgnoredThreadsToStart();
+
+  // Now, all the callbacks are setup.  Lock everything into memory and go RT.
+  if (SchedulingPolicyIsRealtime(runtime_scheduling_policy_)) {
+    const int scheduling_policy_id =
+        (runtime_scheduling_policy_ == SchedulingPolicy::SCHEDULER_FIFO)
+            ? SCHED_FIFO
+            : SCHED_RR;
+
+    ABSL_LOG(INFO) << "Setting scheduling policy to "
+                   << runtime_scheduling_policy_ << " and realtime priority to "
+                   << runtime_priority_ << " for " << name_;
+    ::aos::SetCurrentThreadRealtimePriority(
+        runtime_priority_, scheduling_policy_id, runtime_realtime_policy_);
+  }
+
+  set_is_running(true);
+
+  // Now that we are realtime (but before the OnRun handlers run), snap the
+  // queue index pointer to the newest message. This happens in RT so that we
+  // minimize the risk of losing messages.
+  for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
+    watcher->Startup();
+  }
+
+  // Now that we are RT, run all the OnRun handlers.
+  SetTimerContext(monotonic_clock::now());
+  for (const auto &run : on_run_) {
+    run();
+  }
+}
+
+Status ShmEventLoop::Shutdown() {
+  ABSL_CHECK(started_)
+      << ": Shutdown() without a Startup() to undo.  Run() pairs them, and the "
+         "destructor only calls this for an event loop that came up.";
+  ABSL_CHECK(!shut_down_) << ": Shutdown() reentered from inside itself.";
+  shut_down_ = true;
+  // Once epoll exits, there is no useful nonrt work left to do.
+  set_is_running(false);
+
+  // Nothing time or synchronization critical needs to happen after this
+  // point. Drop RT priority.
+  ::aos::UnsetCurrentThreadRealtimePriority();
 
   for (::std::unique_ptr<WatcherState> &base_watcher : watchers_) {
     ShmWatcherState *watcher =
@@ -1103,7 +1144,7 @@ Status ShmEventLoop::Run() {
   }
 
   if (watchers_.size() > 0) {
-    aio_.UnregisterThreadSignalReceiver(signal_receiver_.get());
+    aio_->UnregisterThreadSignalReceiver(signal_receiver_.get());
     signal_receiver_.reset();
   }
 
@@ -1114,6 +1155,14 @@ Status ShmEventLoop::Run() {
   // created the timing reporter.
   timing_report_sender_.reset();
   ClearContext();
+  aos_logger_.reset();
+  log_restorer_.reset();
+  // Back to the state a fresh event loop is in, because Run() may be called
+  // again on this one -- aos/starter/subprocess_test does exactly that.  The
+  // CHECKs above are about one run starting or stopping twice, not about
+  // making an event loop single-use.
+  started_ = false;
+  shut_down_ = false;
   std::unique_lock<aos::stl_mutex> locker(exit_status_mutex_);
   std::optional<Status> exit_status;
   // Clear the stored exit_status_ and extract it to be returned.
@@ -1121,11 +1170,22 @@ Status ShmEventLoop::Run() {
   return exit_status.value_or(Status{});
 }
 
+Status ShmEventLoop::Run() {
+  ABSL_CHECK(owned_aio_.has_value())
+      << ": Run() drives the Aio, so it is only for an event loop that "
+         "owns one.  This one was built on a borrowed Aio; drive that "
+         "Aio yourself, with Startup() and Shutdown() around it.";
+  Startup();
+  // Run all the timers and handle Quit.
+  aio_->Run();
+  return Shutdown();
+}
+
 void ShmEventLoop::Exit() {
   observed_exit_.test_and_set();
   // Implicitly defaults exit_status_ to success by not setting it.
 
-  aio_.Quit();
+  aio_->Quit();
 }
 
 void ShmEventLoop::ExitWithStatus(Status status) {
@@ -1145,6 +1205,12 @@ std::unique_ptr<ExitHandle> ShmEventLoop::MakeExitHandle() {
 
 ShmEventLoop::~ShmEventLoop() {
   CheckCurrentThread();
+  // An event loop on a borrowed Aio is never told when that loop is done --
+  // libuv has no teardown callback -- so this is where it stops.  Run() has
+  // already done it for an owned one, which is what clears started_.
+  if (started_) {
+    (void)Shutdown();
+  }
   // Force everything with a registered fd with epoll to be destroyed now.
   timers_.clear();
   phased_loops_.clear();

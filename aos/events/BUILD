@@ -773,6 +773,22 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "shm_event_loop_test_uv",
+    srcs = ["shm_event_loop_test.cc"],
+    flaky = True,
+    local_defines = ["AOS_UV_ONLY"],
+    shard_count = 50,
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":aio_uv",
+        ":event_loop_param_test",
+        ":shm_event_loop",
+        ":test_message_fbs",
+        "@libuv",
+    ],
+)
+
 cc_library(
     name = "event_loop_param_test",
     testonly = True,
@@ -1085,6 +1101,42 @@ cc_test(
         ":pipe",
         "//aos/testing:googletest",
         "//aos/time",
+        "@com_google_absl//absl/log:absl_check",
+        "@libuv",
+    ],
+)
+
+aos_config(
+    name = "aio_uv_test_config",
+    src = "aio_uv_test_config_source.json",
+    flatbuffers = [
+        ":test_message_fbs",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":aos_config",
+    ],
+)
+
+cc_test(
+    name = "aio_uv_test",
+    srcs = [
+        "aio_uv_test.cc",
+    ],
+    data = [
+        ":aio_uv_test_config",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":aio_uv",
+        ":shm_event_loop",
+        ":test_message_fbs",
+        ":test_message_schema",
+        "//aos:configuration",
+        "//aos/ipc_lib:shm_base",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing:tmpdir",
         "@com_google_absl//absl/log:absl_check",
         "@libuv",
     ],

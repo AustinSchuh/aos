@@ -13,6 +13,12 @@
 #include "aos/stl_mutex/stl_mutex.h"
 
 namespace aos {
+
+class AosLogToFbs;
+namespace logging {
+class ScopedLogRestorer;
+}  // namespace logging
+
 namespace shm_event_loop_internal {
 
 class ShmWatcherState;
@@ -39,6 +45,18 @@ class ShmEventLoop : public EventLoop {
   ShmEventLoop(const Flatbuffer<Configuration> &configuration)
       : ShmEventLoop(&configuration.message()) {}
   ShmEventLoop(const Configuration *configuration);
+
+  // Builds an event loop that runs on somebody else's Aio rather than its own.
+  //
+  // This is how AOS gets scheduled onto a foreign event loop: pair it with an
+  // Aio subclass backed by that loop -- UvAio, in aos/events/aio_uv.h -- and
+  // the watchers and timers here become work that loop is already waiting on.
+  //
+  // The Aio is borrowed and must outlive this.  Run() is not usable in this
+  // mode, because whoever owns the Aio is the one driving it; call Startup()
+  // and Shutdown() around their loop instead.
+  ShmEventLoop(const Configuration *configuration, Aio *aio);
+
   ShmEventLoop(const ShmEventLoop &) = delete;
   ~ShmEventLoop() override;
 
@@ -46,7 +64,26 @@ class ShmEventLoop : public EventLoop {
 
   // Runs the event loop until Exit is called, or ^C is caught.
   // TODO(james): Upgrade this to [[nodiscard]].
+  //
+  // Only for an event loop that owns its Aio.  One built on a borrowed Aio has
+  // no business driving it; use Startup() and Shutdown().
   Status Run();
+
+  // The two halves of Run() with the driving taken out of the middle, for an
+  // event loop on a borrowed Aio.  Startup() puts this event loop's work on
+  // that Aio, so driving it runs this event loop too; Shutdown() takes it back
+  // off and returns what Run() would have returned.
+  //
+  // Neither normally has to be called: the borrowed loop's first turn brings
+  // this up, and the destructor shuts it down.  Calling them explicitly moves
+  // when that happens.  Each runs once per run -- a second call is a CHECK
+  // failure rather than a no-op.
+  //
+  // Realtime priority still works, and asking for it is the embedder's call:
+  // the thread belongs to whoever owns the Aio, so going realtime takes their
+  // work with it, malloc denial included.
+  void Startup();
+  Status Shutdown();
   // Exits the event loop.  async-signal-safe (see
   // https://man7.org/linux/man-pages/man7/signal-safety.7.html).
   // Will result in Run() returning a successful result when called.
@@ -114,7 +151,7 @@ class ShmEventLoop : public EventLoop {
   const UUID &boot_uuid() const override { return boot_uuid_; }
 
   // Returns the Aio loop used to run the event loop.
-  Aio *aio() { return &aio_; }
+  Aio *aio() { return aio_; }
 
   // Returns the local mapping of the shared memory used by the watcher on the
   // specified channel. A watcher must be created on this channel before calling
@@ -262,7 +299,26 @@ class ShmEventLoop : public EventLoop {
   aos::stl_mutex *check_mutex_ = nullptr;
   std::optional<pid_t> check_tid_;
 
-  Aio aio_;
+  // Shared by both constructors.
+  void Initialize(const Configuration *configuration);
+
+  // Startup() and Shutdown() are each idempotent within a run, so that the
+  // automatic versions and an explicit call cannot both happen.  Shutdown()
+  // clears them, because an event loop may be Run() more than once.
+  bool started_ = false;
+  bool shut_down_ = false;
+  // Whether the borrowed loop's first-turn hook still owes us a Startup().
+  bool auto_startup_pending_ = true;
+
+  // Live from Startup() to Shutdown(), which is why they are not locals.
+  // Held by pointer so this header does not have to define them.
+  std::unique_ptr<logging::ScopedLogRestorer> log_restorer_;
+  std::unique_ptr<AosLogToFbs> aos_logger_;
+
+  // Engaged only when this event loop owns its Aio; aio_ points into it.
+  std::optional<Aio> owned_aio_;
+  // The Aio actually in use, owned or borrowed.  Never null.
+  Aio *const aio_;
 
   // Only set during Run().
   std::unique_ptr<ipc_lib::ThreadSignalReceiver> signal_receiver_;
