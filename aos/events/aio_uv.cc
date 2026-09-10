@@ -175,6 +175,40 @@ class UvImpl : public Aio::Impl, public UvCore {
     return callback_realtime_;
   }
 
+  // EPoll's dispatch rules, message text included, for a registration the
+  // platform watches itself and reports the subscribed mask on.  The libuv
+  // path is PollCallback(); the difference is that libuv reports an error as
+  // a status rather than a bit, and a signalled object has no error to
+  // report ahead of anything.
+  void DispatchEvents(FdRegistration *reg, uint32_t events) override {
+    ScopedCallbackRealtime callback_realtime(this);
+    if (reg->events_fn != nullptr) {
+      reg->events_fn(events);
+      return;
+    }
+    if (events & kIn) {
+      ABSL_CHECK(reg->in_fn != nullptr)
+          << ": No handler registered for input events on descriptor "
+          << reg->fd;
+      reg->in_fn();
+      // The callback may have deleted this registration.
+      if (reg->closing) return;
+    }
+    if (events & kOut) {
+      ABSL_CHECK(reg->out_fn != nullptr)
+          << ": No handler registered for output events on descriptor "
+          << reg->fd;
+      reg->out_fn();
+      if (reg->closing) return;
+    }
+    if (events & kErr) {
+      ABSL_CHECK(reg->err_fn != nullptr)
+          << ": No handler registered for error events on descriptor "
+          << reg->fd;
+      reg->err_fn();
+    }
+  }
+
   bool TakeDidWork() {
     const bool result = did_work_;
     did_work_ = false;
@@ -714,7 +748,7 @@ class UvImpl : public Aio::Impl, public UvCore {
       QueueCompletion(
           request,
           write ? kQueuedStartUnwatchedWrite : kQueuedStartUnwatchedRead,
-          static_cast<int32_t>(fd));
+          UvPlatform::FdToInt(fd));
       return;
     }
     ABSL_CHECK(reg->events_fn == nullptr)
@@ -751,7 +785,7 @@ class UvImpl : public Aio::Impl, public UvCore {
       reg->read_req = request;
     }
     QueueCompletion(request, write ? kQueuedStartWrite : kQueuedStartRead,
-                    static_cast<int32_t>(fd));
+                    UvPlatform::FdToInt(fd));
   }
 
   // A submitted request's first attempt, off the queue in submission order:
@@ -759,8 +793,7 @@ class UvImpl : public Aio::Impl, public UvCore {
   void StartRaw(AsyncRequest *request, int32_t queued) {
     const bool write =
         queued == kQueuedStartWrite || queued == kQueuedStartUnwatchedWrite;
-    const FileDescriptor fd =
-        static_cast<FileDescriptor>(State(request).link.result);
+    const FileDescriptor fd = UvPlatform::FdFromInt(State(request).link.result);
     char *const ptr = static_cast<char *>(State(request).raw.ptr);
     const size_t size = State(request).raw.size;
     // An empty buffer has nothing to wait for, so it completes with 0 and no

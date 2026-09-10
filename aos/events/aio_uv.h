@@ -22,8 +22,11 @@ namespace aos {
 // needs has to be a descriptor.  On Linux it already is: the wakeup an
 // ShmEventLoop watcher uses is a signalfd and its timers are timerfds.  macOS
 // has neither, but a kqueue is a descriptor too, so one holding a single
-// EVFILT_SIGNAL or EVFILT_TIMER stands in for each.  libuv on Windows cannot
-// poll a descriptor at all, so this target remains unavailable there.
+// EVFILT_SIGNAL or EVFILT_TIMER stands in for each.  libuv on Windows can
+// poll a socket and nothing else; there the loop is an I/O completion port,
+// and the timer and the wakeup Event reach it as wait completion packets, the
+// way the native IOCP backend delivers them to its own port.  See
+// aio_uv_windows.cc.
 //
 // One macOS-only caveat: a borrowed loop does not survive fork(2).  A kqueue
 // descriptor is not inherited by the child, and libuv's loop is backed by one,

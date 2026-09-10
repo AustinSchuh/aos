@@ -53,6 +53,10 @@ int UvPlatform::PollInit(uv_loop_t *loop, uv_poll_t *poll, FileDescriptor fd) {
 
 void UvPlatform::Close(FileDescriptor fd) { close(fd); }
 
+int32_t UvPlatform::FdToInt(FileDescriptor fd) { return fd; }
+
+FileDescriptor UvPlatform::FdFromInt(int32_t value) { return value; }
+
 // libuv's readiness is the kernel's own here, so on epoll what the core asks
 // for and what it is told both stand as they are.
 //

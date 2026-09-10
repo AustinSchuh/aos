@@ -125,7 +125,7 @@ Doing so exposed two translations that were already wrong on their own terms: `E
 
   Narrowing it is possible but does not belong in the backend: `KqueueImpl` only ever sees its own loop, so it cannot tell whether a wakeup was addressed to it. The process-wide view already exists in `WakeupSignalDisposition` (`aos/ipc_lib/thread_signal_darwin.cc`), which holds the receiver count and the `SIG_IGN` disposition; a target set recorded there by `Signal()` before the `kill(2)`, and consulted by each woken receiver, would turn the broadcast into a routed wakeup with the spurious ones suppressed. Not done, because nothing in tree runs two loops in one process yet and an unused mechanism is worse than a documented cost. `AioTest.TwoLoopsOnTwoThreadsTest` pins the behaviour either way: it requires each loop to see its own wakeup, not to see only its own.
 
-- `GlibMainLoop`, `UvAio` and `shm_event_loop_test_uv` are no longer Linux-only. `aio_uv` and its tests remain incompatible with Windows, where libuv's loop is an IOCP that nothing else can wait on.
+- `GlibMainLoop`, `UvAio` and `shm_event_loop_test_uv` are no longer Linux-only. (`aio_uv` reached Windows later, by a different route: ADR 0004 covers it.)
 
 ## Alternatives considered
 

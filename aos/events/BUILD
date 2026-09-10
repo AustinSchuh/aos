@@ -298,10 +298,6 @@ cc_test(
 cc_test(
     name = "aio_test_uv",
     srcs = ["aio_test_uv.cc"],
-    target_compatible_with = select({
-        "@platforms//os:windows": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
     deps = [
         ":aio",
         ":aio_test_lib",
@@ -830,10 +826,6 @@ cc_test(
     flaky = True,
     local_defines = ["AOS_UV_ONLY"],
     shard_count = 50,
-    target_compatible_with = select({
-        "@platforms//os:windows": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
     deps = [
         ":aio_uv",
         ":event_loop_param_test",
@@ -1122,21 +1114,23 @@ cc_library(
         "aio_internal.h",
         "aio_uv.cc",
         "aio_uv_internal.h",
-        # The platform half; see aio_uv_internal.h.
-        "aio_uv_posix.cc",
-    ],
+    ] + select({
+        # libuv can poll any descriptor on Linux and macOS, and only a socket
+        # on Windows, where its loop is an IOCP the Windows half attaches to
+        # directly; see aio_uv_internal.h.
+        "@platforms//os:windows": [
+            "aio_uv_windows.cc",
+            "aio_windows_internal.h",
+        ],
+        "//conditions:default": ["aio_uv_posix.cc"],
+    }),
     hdrs = [
         "aio_uv.h",
     ],
-    # libuv's loop is a descriptor to poll on Linux and macOS, and an IOCP on
-    # Windows that nothing else can wait on.
-    target_compatible_with = select({
-        "@platforms//os:windows": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
     visibility = ["//visibility:public"],
     deps = [
         ":aio",
+        ":timer_queue",
         "//aos:realtime",
         "//aos/ipc_lib:thread_signal",
         "@com_google_absl//absl/log:absl_check",
@@ -1151,10 +1145,6 @@ cc_test(
     srcs = [
         "aio_uv_backend_test.cc",
     ],
-    target_compatible_with = select({
-        "@platforms//os:windows": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
     deps = [
         ":aio",
         ":aio_uv",
@@ -1172,10 +1162,6 @@ aos_config(
     flatbuffers = [
         ":test_message_fbs",
     ],
-    target_compatible_with = select({
-        "@platforms//os:windows": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
     deps = [
         ":aos_config",
     ],
@@ -1189,10 +1175,6 @@ cc_test(
     data = [
         ":aio_uv_test_config",
     ],
-    target_compatible_with = select({
-        "@platforms//os:windows": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
     deps = [
         ":aio_uv",
         ":shm_event_loop",
