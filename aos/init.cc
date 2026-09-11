@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "absl/debugging/failure_signal_handler.h"
 #include "absl/debugging/symbolize.h"
@@ -57,6 +59,10 @@ void InvalidParameterHandler(const wchar_t * /*expression*/,
 #endif
 
 void InitGoogle(int *argc, char ***argv) {
+  InitGoogle(argc, argv, InitOptions{});
+}
+
+void InitGoogle(int *argc, char ***argv, const InitOptions &options) {
 #ifdef _WIN32
   // Configure Windows CRT parameter validation and assert behavior:
   // 1. Force invalid CRT parameters to fail gracefully and set errno instead of
@@ -68,19 +74,23 @@ void InitGoogle(int *argc, char ***argv) {
 #endif
   ABSL_CHECK(!IsInitialized()) << "Only initialize once.";
   absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
-  std::vector<char *> positional_arguments =
-      absl::ParseCommandLine(*argc, *argv);
+  if (options.parse_command_line) {
+    std::vector<char *> positional_arguments =
+        absl::ParseCommandLine(*argc, *argv);
 
-  ABSL_CHECK_LE(positional_arguments.size(), static_cast<size_t>(*argc));
-  for (size_t i = 0; i < positional_arguments.size(); ++i) {
-    (*argv)[i] = positional_arguments[i];
+    ABSL_CHECK_LE(positional_arguments.size(), static_cast<size_t>(*argc));
+    for (size_t i = 0; i < positional_arguments.size(); ++i) {
+      (*argv)[i] = positional_arguments[i];
+    }
+    *argc = positional_arguments.size();
   }
-  *argc = positional_arguments.size();
 
   absl::InitializeLog();
 
-  if (absl::GetFlag(FLAGS_backtrace)) {
-    absl::InitializeSymbolizer((*argv)[0]);
+  if (options.install_failure_signal_handler &&
+      absl::GetFlag(FLAGS_backtrace)) {
+    absl::InitializeSymbolizer(
+        (argv != nullptr && *argv != nullptr) ? (*argv)[0] : "");
     absl::FailureSignalHandlerOptions options;
     absl::InstallFailureSignalHandler(options);
   }
@@ -97,6 +107,17 @@ void InitGoogle(int *argc, char ***argv) {
   UUID::Random();
 
   initialized = true;
+}
+
+void InitEmbedded() {
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (IsInitialized()) {
+    return;
+  }
+  InitGoogle(nullptr, nullptr,
+             InitOptions{.parse_command_line = false,
+                         .install_failure_signal_handler = false});
 }
 
 void MarkInitialized() { initialized = true; }
