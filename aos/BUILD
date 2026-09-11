@@ -205,6 +205,16 @@ cc_library(
     ],
 )
 
+# Has its own main(), because gtest's calls InitGoogle.
+cc_test(
+    name = "init_embedded_test",
+    srcs = ["init_embedded_test.cc"],
+    deps = [
+        ":init",
+        "@com_google_absl//absl/log:absl_check",
+    ],
+)
+
 rust_bindgen_library(
     name = "init_for_rust_rs",
     bindgen_flags = [
