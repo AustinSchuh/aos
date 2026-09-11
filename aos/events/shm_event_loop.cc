@@ -1048,6 +1048,11 @@ void ShmEventLoop::HandleEvent() {
   }
 }
 
+void ShmEventLoop::set_handle_signals(bool handle_signals) {
+  ABSL_CHECK(!started_) << ": Must be called before Startup().";
+  handle_signals_ = handle_signals;
+}
+
 void ShmEventLoop::Startup() {
   ABSL_CHECK(!started_)
       << ": Startup() has already run.  Run() calls it, and an event loop on a "
@@ -1056,7 +1061,10 @@ void ShmEventLoop::Startup() {
   started_ = true;
   CheckCurrentThread();
   loop_tid_ = aos::GetThreadId();
-  RegisterSignalHandler();
+  if (handle_signals_) {
+    RegisterSignalHandler();
+    registered_signal_handler_ = true;
+  }
 
   if (watchers_.size() > 0) {
     signal_receiver_.reset(new ipc_lib::ThreadSignalReceiver());
@@ -1163,7 +1171,10 @@ Status ShmEventLoop::Shutdown() {
     signal_receiver_.reset();
   }
 
-  UnregisterSignalHandler();
+  if (registered_signal_handler_) {
+    UnregisterSignalHandler();
+    registered_signal_handler_ = false;
+  }
 
   // Trigger any remaining senders or fetchers to be cleared before destroying
   // the event loop so the book keeping matches.  Do this in the thread that
