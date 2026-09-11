@@ -6,6 +6,10 @@
 #include "aos/events/aio_uv.h"
 #endif
 
+#ifndef _WIN32
+#include <csignal>
+#endif
+
 #include <filesystem>
 #include <string_view>
 
@@ -403,6 +407,44 @@ TEST_P(ShmEventLoopTest, SendBeforeRun) {
   static_cast<ShmEventLoop *>(loop2.get())->Exit();
   loop2_thread.join();
 }
+
+#ifndef _WIN32
+namespace {
+void IgnoreSignalForTest(int) {}
+
+void (*SigtermHandler())(int) {
+  struct sigaction action{};
+  ABSL_PCHECK(sigaction(SIGTERM, nullptr, &action) == 0);
+  return action.sa_handler;
+}
+}  // namespace
+
+// Tests that Startup() replaces the SIGTERM handler only when handle_signals is
+// set, and that Shutdown() restores it.
+TEST_P(ShmEventLoopTest, HandleSignals) {
+  struct sigaction ignore{};
+  ignore.sa_handler = &IgnoreSignalForTest;
+  sigemptyset(&ignore.sa_mask);
+  struct sigaction previous{};
+  ASSERT_EQ(sigaction(SIGTERM, &ignore, &previous), 0);
+
+  for (const bool handle_signals : {true, false}) {
+    auto loop = factory()->MakePrimary("primary");
+    static_cast<ShmEventLoop *>(loop.get())->set_handle_signals(handle_signals);
+    void (*while_running)(int) = nullptr;
+    loop->OnRun([&]() {
+      while_running = SigtermHandler();
+      factory()->Exit();
+    });
+    factory()->Run();
+
+    EXPECT_EQ(while_running == &IgnoreSignalForTest, !handle_signals);
+    EXPECT_EQ(SigtermHandler(), &IgnoreSignalForTest);
+  }
+
+  ASSERT_EQ(sigaction(SIGTERM, &previous, nullptr), 0);
+}
+#endif
 
 // Tests that every handler type is realtime and runs.  There are threads
 // involved and it's easy to miss one.

@@ -84,6 +84,12 @@ class ShmEventLoop : public EventLoop {
   // work with it, malloc denial included.
   void Startup();
   Status Shutdown();
+
+  // Sets whether Startup() installs SIGINT, SIGHUP and SIGTERM handlers that
+  // exit this event loop.  Defaults to true.  Must be called before Startup().
+  void set_handle_signals(bool handle_signals);
+  bool handle_signals() const { return handle_signals_; }
+
   // Exits the event loop.  async-signal-safe (see
   // https://man7.org/linux/man-pages/man7/signal-safety.7.html).
   // Will result in Run() returning a successful result when called.
@@ -309,6 +315,9 @@ class ShmEventLoop : public EventLoop {
   bool shut_down_ = false;
   // Whether the borrowed loop's first-turn hook still owes us a Startup().
   bool auto_startup_pending_ = true;
+  // Whether Startup() installs signal handlers, and whether it did.
+  bool handle_signals_ = true;
+  bool registered_signal_handler_ = false;
 
   // Live from Startup() to Shutdown(), which is why they are not locals.
   // Held by pointer so this header does not have to define them.
