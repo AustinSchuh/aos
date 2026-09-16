@@ -14,9 +14,13 @@
 #include <unistd.h>
 #endif
 #if defined(__linux__)
+#include <linux/futex.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/syscall.h>
+
+#include <climits>
 #else
 #define EPOLLIN 0x01
 #define EPOLLOUT 0x04
@@ -41,6 +45,7 @@
 #include "absl/flags/reflection.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
+#include "absl/strings/match.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -51,6 +56,28 @@
 #include "aos/testing/tmpdir.h"
 
 ABSL_DECLARE_FLAG(std::string, aio_backend);
+#if defined(__linux__)
+ABSL_DECLARE_FLAG(std::string, io_uring_setup);
+#endif
+
+namespace aos::testing {
+namespace {
+
+// Whether the io_uring backend is on its SINGLE_ISSUER | DEFER_TASKRUN tier
+// (--io_uring_setup).  The thread binding, the automatic downgrade and the
+// created-disabled ring exist only there; the tests of those skip on the
+// other tiers, where the contract they pin does not apply.
+bool SingleIssuerRing() {
+#if defined(__linux__)
+  return absl::StartsWith(absl::GetFlag(FLAGS_io_uring_setup), "single_issuer");
+#else
+  return true;
+#endif
+}
+
+}  // namespace
+}  // namespace aos::testing
+
 // Defined only by the backends with a submission queue (io_uring, kqueue); the
 // Windows IOCP backend has no equivalent, so uses of this flag are guarded.
 ABSL_DECLARE_FLAG(uint32_t, aio_queue_depth);
@@ -172,6 +199,11 @@ namespace {
 // parameter to the fixture and to nothing else, and TestAio is built by the
 // body, so SetUp() leaves it here for the constructor to find.
 const AioBackend *current_backend = nullptr;
+
+// The wakeup kind an AioReceiverTest is running under.  Signal is what a
+// TestReceiver built outside one gets, which is what AioTest's bodies had
+// before the kind existed.
+ipc_lib::WakeupKind current_kind = ipc_lib::WakeupKind::kSignal;
 
 }  // namespace
 
@@ -421,9 +453,16 @@ void PrintTo(const AioBackend &backend, std::ostream *os) {
   *os << backend.name;
 }
 
-void AioTest::SetUp() {
+namespace {
+
+// The common half of both suites' SetUp(): everything that depends on the
+// backend and nothing that depends on the wakeup kind.
+void SetUpBackend(const AioBackend &backend,
+                  std::optional<std::string> *saved_death_test_style) {
+  // Every case of both suites, so the io_uring ones skip themselves on an
+  // old kernel rather than the whole binary dying on the first.
 #if defined(__linux__)
-  if (GetParam().is_io_uring && IoUringUnsupportedHere()) {
+  if (backend.is_io_uring && IoUringUnsupportedHere()) {
     GTEST_SKIP() << "kernel is below the io_uring backend's 6.1 floor, and "
                     "this platform defaults to epoll";
   }
@@ -431,9 +470,9 @@ void AioTest::SetUp() {
   // Pace ring creation across the whole suite, not just the ring-churning
   // tests -- see ThrottleOnKernelRingTeardown().
   ThrottleOnKernelRingTeardown();
-  current_backend = &GetParam();
-  if (GetParam().selected_by_flag) {
-    ::absl::SetFlag(&FLAGS_aio_backend, GetParam().name);
+  current_backend = &backend;
+  if (backend.selected_by_flag) {
+    ::absl::SetFlag(&FLAGS_aio_backend, backend.name);
   }
 
   // gtest's "fast" death test style forks and then runs the statement in the
@@ -451,19 +490,83 @@ void AioTest::SetUp() {
   // the fork itself -- re-execution rebuilds exactly the thing such a test
   // wanted inherited.  Those are the EXPECT_EXIT bodies, and they skip on
   // survives_fork rather than being quietly re-executed into passing.
-  if (!GetParam().survives_fork) {
-    saved_death_test_style_ = GTEST_FLAG_GET(death_test_style);
+  if (!backend.survives_fork) {
+    *saved_death_test_style = GTEST_FLAG_GET(death_test_style);
     GTEST_FLAG_SET(death_test_style, "threadsafe");
   }
+}
 
+void TearDownBackend(std::optional<std::string> *saved_death_test_style) {
+  if (saved_death_test_style->has_value()) {
+    GTEST_FLAG_SET(death_test_style, **saved_death_test_style);
+    saved_death_test_style->reset();
+  }
+}
+
+}  // namespace
+
+void AioTest::SetUp() {
+  SetUpBackend(GetParam(), &saved_death_test_style_);
   ABSL_LOG(INFO) << "Testing Aio with the " << GetParam().name << " backend.";
 }
 
-void AioTest::TearDown() {
-  if (saved_death_test_style_.has_value()) {
-    GTEST_FLAG_SET(death_test_style, *saved_death_test_style_);
-    saved_death_test_style_.reset();
+void AioTest::TearDown() { TearDownBackend(&saved_death_test_style_); }
+
+void AioReceiverTest::SetUp() {
+  SetUpBackend(GetParam().backend, &saved_death_test_style_);
+  current_kind = GetParam().kind;
+  ABSL_LOG(INFO) << "Testing Aio receivers with the " << GetParam().backend.name
+                 << " backend and " << (IsFutex() ? "futex" : "signal")
+                 << " wakeups.";
+}
+
+void AioReceiverTest::TearDown() { TearDownBackend(&saved_death_test_style_); }
+
+std::string ReceiverTestName(
+    const ::testing::TestParamInfo<AioReceiverParam> &info) {
+  return info.param.backend.name +
+         (info.param.kind == ipc_lib::WakeupKind::kFutex ? "_futex"
+                                                         : "_signal");
+}
+
+void PrintTo(const AioReceiverParam &param, std::ostream *os) {
+  *os << param.backend.name
+      << (param.kind == ipc_lib::WakeupKind::kFutex ? "/futex" : "/signal");
+}
+
+TestReceiver::TestReceiver() : TestReceiver(current_kind) {}
+
+TestReceiver::TestReceiver(ipc_lib::WakeupKind kind) : receiver_(kind) {
+  if (kind == ipc_lib::WakeupKind::kFutex) {
+    // Has to exist before the registration that arms a wait on it.
+    receiver_.AddWakeupWord(&word_);
+  } else {
+    BindHere();
   }
+}
+
+void TestReceiver::BindHere() {
+  if (receiver_.kind() == ipc_lib::WakeupKind::kFutex) return;
+  // A thread-directed signal is aimed rather than broadcast, so the wakeup
+  // has to name the thread the receiver serves.
+  pid_ = aos::GetProcessId();
+  tid_ = aos::GetThreadId();
+}
+
+void TestReceiver::Wake() {
+  if (receiver_.kind() == ipc_lib::WakeupKind::kFutex) {
+#if defined(__linux__)
+    // What LocklessQueueWakeUpper does: change the word, wake everyone on it.
+    word_.fetch_add(1);
+    ABSL_PCHECK(syscall(SYS_futex, &word_, FUTEX_WAKE, INT_MAX, nullptr,
+                        nullptr, 0) >= 0);
+#else
+    ABSL_LOG(FATAL) << "The futex kind does not exist off Linux.";
+#endif
+    return;
+  }
+  ipc_lib::ThreadSignalSender sender;
+  sender.Signal(pid_, tid_);
 }
 
 TestAio::TestAio() {
@@ -646,22 +749,18 @@ TEST_P(AioTest, AsyncTimerTest) {
 
 // Tests that ThreadSignal events trigger the registered SignalFd wakeup
 // callback in the event loop.
-TEST_P(AioTest, ThreadSignalTest) {
+TEST_P(AioReceiverTest, ThreadSignalTest) {
   TestAio aio;
 
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   bool signal_fired = false;
-  aio.RegisterThreadSignalReceiver(&sfd,
+  aio.RegisterThreadSignalReceiver(sfd.get(),
                                    [&signal_fired]() { signal_fired = true; });
 
-  const auto pid = aos::GetProcessId();
-  const auto tid = aos::GetThreadId();
-
-  std::thread signaler([pid, tid]() {
+  std::thread signaler([&sfd]() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    aos::ipc_lib::ThreadSignalSender signaler_signal;
-    signaler_signal.Signal(pid, tid);
+    sfd.Wake();
   });
 
   size_t count = 0;
@@ -678,7 +777,7 @@ TEST_P(AioTest, ThreadSignalTest) {
   EXPECT_TRUE(signal_fired);
 
   signaler.join();
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // Two independent Aio loops, each driven by its own thread, each with its own
@@ -693,28 +792,27 @@ TEST_P(AioTest, ThreadSignalTest) {
 // That is allowed (thread_signal.h documents wakeups as possibly spurious) and
 // this test is written to hold either way: it requires that each loop sees its
 // own wakeup, not that it sees only its own.
-TEST_P(AioTest, TwoLoopsOnTwoThreadsTest) {
+TEST_P(AioReceiverTest, TwoLoopsOnTwoThreadsTest) {
   ScopedDeathTestWatchdog watchdog;
 
   struct Loop {
     TestAio aio;
-    aos::ipc_lib::ThreadSignalReceiver receiver;
+    TestReceiver receiver;
     std::atomic<int> wakeups{0};
     std::atomic<pid_t> tid{0};
     std::atomic<bool> ready{false};
   };
   Loop a, b;
 
-  const auto pid = aos::GetProcessId();
-
   auto run = [](Loop *loop) {
     loop->tid.store(aos::GetThreadId());
-    loop->aio.RegisterThreadSignalReceiver(&loop->receiver,
+    loop->receiver.BindHere();
+    loop->aio.RegisterThreadSignalReceiver(loop->receiver.get(),
                                            [loop]() { ++loop->wakeups; });
     loop->ready.store(true);
     while (loop->aio.should_run() && loop->aio.Poll(true)) {
     }
-    loop->aio.UnregisterThreadSignalReceiver(&loop->receiver);
+    loop->aio.UnregisterThreadSignalReceiver(loop->receiver.get());
   };
 
   std::thread thread_a([&]() { run(&a); });
@@ -723,13 +821,12 @@ TEST_P(AioTest, TwoLoopsOnTwoThreadsTest) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  aos::ipc_lib::ThreadSignalSender sender;
   // Each loop must see its own wakeup.  Re-sending covers the startup race
-  // where a signal lands before the receiver's watch is armed.
+  // where a wakeup lands before the receiver's watch is armed.
   for (int i = 0; i < 100 && (a.wakeups.load() == 0 || b.wakeups.load() == 0);
        ++i) {
-    if (a.wakeups.load() == 0) sender.Signal(pid, a.tid.load());
-    if (b.wakeups.load() == 0) sender.Signal(pid, b.tid.load());
+    if (a.wakeups.load() == 0) a.receiver.Wake();
+    if (b.wakeups.load() == 0) b.receiver.Wake();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
@@ -752,15 +849,14 @@ TEST_P(AioTest, TwoLoopsOnTwoThreadsTest) {
 // wakeup hitting the default action.  And the kqueue backend leaves its
 // EVFILT_SIGNAL knote armed across an unregister, so the two loops' knotes have
 // to be independent rather than one being able to consume the other's.
-TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
+TEST_P(AioReceiverTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
   ScopedDeathTestWatchdog watchdog;
 
   struct Loop {
     TestAio aio;
     // Held by pointer so one can be destroyed while the other lives, which is
     // what puts the shared disposition's refcount under test.
-    std::unique_ptr<aos::ipc_lib::ThreadSignalReceiver> receiver =
-        std::make_unique<aos::ipc_lib::ThreadSignalReceiver>();
+    std::unique_ptr<TestReceiver> receiver = std::make_unique<TestReceiver>();
     std::atomic<int> wakeups{0};
     std::atomic<pid_t> tid{0};
     std::atomic<bool> ready{false};
@@ -768,16 +864,21 @@ TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
     std::atomic<bool> unregistered{false};
   };
   Loop a, b;
-  const auto pid = aos::GetProcessId();
 
   auto run = [](Loop *loop) {
     loop->tid.store(aos::GetThreadId());
-    loop->aio.RegisterThreadSignalReceiver(loop->receiver.get(),
-                                           [loop]() { ++loop->wakeups; });
+    loop->receiver->BindHere();
+    // Consume before counting, the way a real owner does before it scans its
+    // sources: a futex-kind wait stays completed until it is re-armed, so a
+    // loop that wants to be woken more than once has to.
+    loop->aio.RegisterThreadSignalReceiver(loop->receiver->get(), [loop]() {
+      loop->aio.ConsumeThreadSignalReceiver(loop->receiver->get());
+      ++loop->wakeups;
+    });
     loop->ready.store(true);
     while (loop->aio.should_run() && loop->aio.Poll(true)) {
       if (loop->unregister.load() && !loop->unregistered.load()) {
-        loop->aio.UnregisterThreadSignalReceiver(loop->receiver.get());
+        loop->aio.UnregisterThreadSignalReceiver(loop->receiver->get());
         // Destroyed, not merely unregistered: on macOS the SIG_IGN
         // disposition is process-wide and shared, and it is the receiver's
         // destructor that gives it up.  Restoring it here rather than when
@@ -788,7 +889,7 @@ TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
       }
     }
     if (!loop->unregistered.load()) {
-      loop->aio.UnregisterThreadSignalReceiver(loop->receiver.get());
+      loop->aio.UnregisterThreadSignalReceiver(loop->receiver->get());
     }
   };
 
@@ -798,13 +899,11 @@ TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  aos::ipc_lib::ThreadSignalSender sender;
-
   // Retire a's receiver.  Poll() is what performs it, so a needs a wakeup to
   // get there.
   a.unregister.store(true);
   for (int i = 0; i < 200 && !a.unregistered.load(); ++i) {
-    sender.Signal(pid, a.tid.load());
+    a.receiver->Wake();
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   ASSERT_TRUE(a.unregistered.load()) << "the first loop never unregistered";
@@ -826,7 +925,7 @@ TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
     const int before = b.wakeups.load();
     bool woke = false;
     for (int i = 0; i < 200 && !woke; ++i) {
-      sender.Signal(pid, b.tid.load());
+      b.receiver->Wake();
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
       woke = b.wakeups.load() > before;
     }
@@ -847,24 +946,26 @@ TEST_P(AioTest, SurvivingLoopStillWakesAfterPeerUnregistersTest) {
 // Tests that a registered ThreadSignalReceiver callback is successfully invoked
 // multiple times when multiple signals are sent sequentially, using multishot
 // poll.
-TEST_P(AioTest, MultiThreadSignalTest) {
+TEST_P(AioReceiverTest, MultiThreadSignalTest) {
   TestAio aio;
   // A lost wakeup leaves the main thread blocked in Poll(true) with the
   // signaler waiting on signal_count -- turn that hang into a clean death.
   ScopedDeathTestWatchdog watchdog;
 
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   std::atomic<size_t> signal_count{0};
   std::vector<aos::monotonic_clock::time_point> callback_times;
   callback_times.reserve(3);
-  aio.RegisterThreadSignalReceiver(&sfd, [&signal_count, &callback_times]() {
-    callback_times.push_back(aos::monotonic_clock::now());
-    ++signal_count;
-  });
-
-  const auto pid = aos::GetProcessId();
-  const auto tid = aos::GetThreadId();
+  aio.RegisterThreadSignalReceiver(
+      sfd.get(), [&aio, &sfd, &signal_count, &callback_times]() {
+        // Consume before counting, the way a real owner does: a futex-kind
+        // wait stays completed until re-armed, so the second wakeup of three
+        // would never arrive without this.
+        aio.ConsumeThreadSignalReceiver(sfd.get());
+        callback_times.push_back(aos::monotonic_clock::now());
+        ++signal_count;
+      });
 
   auto start = aos::monotonic_clock::now();
   // Each send waits for its callback before the next: wakeups coalesce by
@@ -874,11 +975,10 @@ TEST_P(AioTest, MultiThreadSignalTest) {
   // actually about -- the multishot registration keeps delivering, one
   // callback per wakeup, without re-arming.
   std::atomic<bool> give_up{false};
-  std::thread signaler([pid, tid, &signal_count, &give_up]() {
+  std::thread signaler([&sfd, &signal_count, &give_up]() {
     for (size_t i = 0; i < 3; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      aos::ipc_lib::ThreadSignalSender signaler_signal;
-      signaler_signal.Signal(pid, tid);
+      sfd.Wake();
       while (signal_count <= i && !give_up) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
@@ -915,7 +1015,7 @@ TEST_P(AioTest, MultiThreadSignalTest) {
   EXPECT_GE(callback_times[2], callback_times[1]);
   EXPECT_LT(callback_times[2], start + std::chrono::seconds(1));
 
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // Tests that we can cancel a timer immediately after scheduling it.
@@ -1209,7 +1309,7 @@ TEST_P(AioTest, CancelTimerAfterDelayTest) {
 
 // Tests that duplicate registrations for legacy fds and thread-signal receivers
 // die.
-TEST_P(AioTest, DuplicateRegistrationDeathTest) {
+TEST_P(AioReceiverTest, DuplicateRegistrationDeathTest) {
   TestAio aio;
   Pipe pipe;
 
@@ -1230,14 +1330,15 @@ TEST_P(AioTest, DuplicateRegistrationDeathTest) {
   EXPECT_DEATH(aio.OnError(pipe.write_fd(), []() {}),
                "Duplicate error functions for");
 
-  aos::ipc_lib::ThreadSignalReceiver sfd;
-  aio.RegisterThreadSignalReceiver(&sfd, []() {});
-  EXPECT_DEATH(aio.RegisterThreadSignalReceiver(&sfd, []() {}), "Duplicate.*");
+  TestReceiver sfd;
+  aio.RegisterThreadSignalReceiver(sfd.get(), []() {});
+  EXPECT_DEATH(aio.RegisterThreadSignalReceiver(sfd.get(), []() {}),
+               "Duplicate.*");
 
   // Clean up registered resources before loop destruction.
   aio.DeleteFd(pipe.read_fd());
   aio.DeleteFd(pipe.write_fd());
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // An enabled readiness event with no handler registered dies loudly at
@@ -1268,16 +1369,16 @@ TEST_P(AioTest, EnabledEventWithNoHandlerDeathTest) {
 
 // Tests that unregistering untracked legacy fds or thread-signal receivers
 // dies.
-TEST_P(AioTest, UntrackedUnregistrationDeathTest) {
+TEST_P(AioReceiverTest, UntrackedUnregistrationDeathTest) {
   TestAio aio;
 
   EXPECT_DEATH(aio.DeleteFd(FakeFd(999)), "fd .* not found");
-  aos::ipc_lib::ThreadSignalReceiver sfd2;
+  TestReceiver sfd2;
   // Each backend words this differently.  Match with a matcher rather than an
   // alternation regex: gtest only has POSIX regexes where <regex.h> exists, and
   // falls back to its own engine (which has no alternation) on Windows.
   EXPECT_DEATH(
-      aio.UnregisterThreadSignalReceiver(&sfd2),
+      aio.UnregisterThreadSignalReceiver(sfd2.get()),
       ::testing::AnyOf(::testing::HasSubstr("ThreadSignalReceiver not found"),
                        ::testing::ContainsRegex("fd .* not found")));
 }
@@ -4432,7 +4533,10 @@ TEST_P(AioTest, TimerPollsSurviveCqOverflow) {
 // deterministic at the arming call.  ArmSqe()'s message must name the flag
 // and the cause.  (The wakeup read and the legacy-epoll poll hold two of
 // the four slots; the third timer's poll is the one that cannot stage.)
-TEST_P(AioIoUringTest, PreRunArmingExceedsQueueDepthDeathTest) {
+TEST_P(AioIoUringReceiverTest, PreRunArmingExceedsQueueDepthDeathTest) {
+  if (!SingleIssuerRing()) {
+    GTEST_SKIP() << "only the SINGLE_ISSUER ring tier binds a thread";
+  }
   ::absl::SetFlag(&FLAGS_aio_queue_depth, 4);
   ScopedDeathTestWatchdog watchdog;
   EXPECT_DEATH(
@@ -4458,7 +4562,8 @@ TEST_P(AioIoUringTest, PreRunArmingExceedsQueueDepthDeathTest) {
 // holding a pointer into freed memory.  A regression fails as a
 // use-after-free under ASAN, or as the intrusive list's own CHECK on a
 // normal build.
-TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
+TEST_P(AioReceiverTest,
+       UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
   // 28 timers against an 8-slot CQ: 8 fit as auxiliary CQEs, the other 20
   // terminate their polls, and those 20 terminals plus the receiver's --
   // fired last, so ordered last -- land on the kernel's overflow list, 21
@@ -4475,8 +4580,8 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
     // Enable the ring before arming everything -- see the sibling tests.
     aio.Poll(false);
 
-    aos::ipc_lib::ThreadSignalReceiver sfd;
-    aio.RegisterThreadSignalReceiver(&sfd, []() {});
+    TestReceiver sfd;
+    aio.RegisterThreadSignalReceiver(sfd.get(), []() {});
 
     int fired = 0;
     std::vector<std::unique_ptr<Aio::Timer>> timers(kTimers);
@@ -4494,7 +4599,7 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
     // (Under DEFER_TASKRUN nothing posts until the next Poll() enters the
     // kernel; the CQ overflows there, in wake order.)
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    SignalSelf();
+    sfd.Wake();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Poll() dispatches one user-visible completion (one timer callback)
@@ -4523,7 +4628,7 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
     // Unregister in that window.  The fast path frees the state here; if it
     // fails to unlink the queued terminal first, the dispatch loop below
     // walks into the freed node.
-    aio.UnregisterThreadSignalReceiver(&sfd);
+    aio.UnregisterThreadSignalReceiver(sfd.get());
 
     const auto deadline_stop =
         aos::monotonic_clock::now() + std::chrono::seconds(2);
@@ -4533,7 +4638,7 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
     EXPECT_EQ(fired, kTimers);
     // The unregistered receiver never read the signal; don't leave it
     // pending.
-    sfd.ConsumeWakeup();
+    sfd->ConsumeWakeup();
   }
   ::absl::SetFlag(&FLAGS_aio_queue_depth, saved_depth);
 }
@@ -4550,7 +4655,8 @@ TEST_P(AioTest, UnregisterReceiverWithTerminatedPollAndQueuedCompletion) {
 // one, with a signal pending so the trampoline actually runs the user
 // callback.  A regression is a read of freed memory in the trampoline's
 // drain loop, which needs ASAN to fail reliably.
-TEST_P(AioTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
+TEST_P(AioReceiverTest,
+       UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
   constexpr int kTimers = 28;
   const uint32_t saved_depth = ::absl::GetFlag(FLAGS_aio_queue_depth);
   ::absl::SetFlag(&FLAGS_aio_queue_depth, 4);  // CQ = 8 slots.
@@ -4560,12 +4666,12 @@ TEST_P(AioTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
     // Enable the ring before arming everything -- see the sibling tests.
     aio.Poll(false);
 
-    aos::ipc_lib::ThreadSignalReceiver sfd;
+    TestReceiver sfd;
     bool unregistered = false;
-    aio.RegisterThreadSignalReceiver(&sfd, [&aio, &sfd, &unregistered]() {
+    aio.RegisterThreadSignalReceiver(sfd.get(), [&aio, &sfd, &unregistered]() {
       if (unregistered) return;
       unregistered = true;
-      aio.UnregisterThreadSignalReceiver(&sfd);
+      aio.UnregisterThreadSignalReceiver(sfd.get());
     });
 
     std::vector<std::unique_ptr<Aio::Timer>> timers(kTimers);
@@ -4581,7 +4687,7 @@ TEST_P(AioTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
     // its terminal completion is what makes the in-callback unregister
     // take the fast path.
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    SignalSelf();
+    sfd.Wake();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     const auto deadline_stop =
@@ -4595,9 +4701,9 @@ TEST_P(AioTest, UnregisterReceiverFromOwnCallbackDuringTerminalDispatch) {
       // in-callback unregister) from happening: clean up so the failure
       // stays a clean EXPECT instead of tripping ~IoUringImpl()'s
       // still-registered CHECK.
-      aio.UnregisterThreadSignalReceiver(&sfd);
+      aio.UnregisterThreadSignalReceiver(sfd.get());
     }
-    sfd.ConsumeWakeup();
+    sfd->ConsumeWakeup();
   }
   ::absl::SetFlag(&FLAGS_aio_queue_depth, saved_depth);
 }
@@ -4708,6 +4814,9 @@ TEST_P(AioTest, CancelOfRequestLeftOverFromDestroyedAioIsNoOp) {
 // another, every timer still fires) is contract on every backend, so the
 // test runs everywhere.
 TEST_P(AioTest, DowngradeReArmsActiveTimers) {
+  if (!SingleIssuerRing()) {
+    GTEST_SKIP() << "only the SINGLE_ISSUER ring tier binds a thread";
+  }
   ScopedDeathTestWatchdog watchdog;
 
   TestAio aio;
@@ -4768,15 +4877,15 @@ TEST_P(AioTest, DestroyWithFdRegisteredDeathTest) {
       DiesAfterMarker("before destroying the Aio"));
 }
 
-TEST_P(AioTest, DestroyWithReceiverRegisteredDeathTest) {
+TEST_P(AioReceiverTest, DestroyWithReceiverRegisteredDeathTest) {
   if (!Backend().checks_teardown)
     GTEST_SKIP() << "teardown here is bounded by the loop, not by this backend";
   ScopedDeathTestWatchdog watchdog;
   EXPECT_DEATH(
       {
-        aos::ipc_lib::ThreadSignalReceiver sfd;
+        TestReceiver sfd;
         TestAio aio;
-        aio.RegisterThreadSignalReceiver(&sfd, []() {});
+        aio.RegisterThreadSignalReceiver(sfd.get(), []() {});
         MarkFatalStatement();
       },
       DiesAfterMarker("unregistered before destroying"));
@@ -4785,7 +4894,7 @@ TEST_P(AioTest, DestroyWithReceiverRegisteredDeathTest) {
 // Completion::user_data is documented as "the opaque pointer supplied by
 // the caller", and Timer::Schedule() takes no user_data -- so a timer
 // completion must carry nullptr, not some internal state pointer.
-TEST_P(AioTest, TimerCompletionUserDataIsNull) {
+TEST_P(AioReceiverTest, TimerCompletionUserDataIsNull) {
   TestAio aio;
   Aio::Timer timer(aio.get());
 
@@ -4818,18 +4927,18 @@ TEST_P(AioTest, TimerCompletionUserDataIsNull) {
 // depth at all, so the third send finds the bit already set and does
 // nothing -- which is why a backend that re-arms before notifying reports
 // exactly two callbacks here rather than three.
-TEST_P(AioTest, PendingWakeupsCoalesceIntoOneCallback) {
+TEST_P(AioReceiverTest, PendingWakeupsCoalesceIntoOneCallback) {
   TestAio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   // Bind and enable the loop before queueing the signals, so delivery
   // happens through the armed receiver rather than at registration time.
   aio.Poll(false);
   int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&count]() { ++count; });
 
   for (int i = 0; i < 3; ++i) {
-    SignalSelf();
+    sfd.Wake();
   }
 
   while (count == 0 && aio.Poll(true)) {
@@ -4841,7 +4950,7 @@ TEST_P(AioTest, PendingWakeupsCoalesceIntoOneCallback) {
     if (!aio.Poll(false)) break;
   }
   EXPECT_EQ(count, 1);
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // Pins the contract from Aio::RegisterThreadSignalReceiver()'s docs: once
@@ -4849,27 +4958,36 @@ TEST_P(AioTest, PendingWakeupsCoalesceIntoOneCallback) {
 // again -- a wakeup that was still kernel-side at unregister time is
 // discarded without reading the fd, so a successor receiver registered on
 // the same fd owns every pending signal.
-TEST_P(AioTest, SuccessorReceiverOwnsPendingWakeups) {
+TEST_P(AioReceiverTest, SuccessorReceiverOwnsPendingWakeups) {
   TestAio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   // Enable the loop, then arm a wakeup while nothing polls: the first
   // receiver's kernel-side poll fires, but its completion is never
   // dispatched before the unregister.
   aio.Poll(false);
-  aio.RegisterThreadSignalReceiver(&sfd, []() {});
-  SignalSelf();
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.RegisterThreadSignalReceiver(sfd.get(), []() {});
+  sfd.Wake();
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 
   int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&count]() { ++count; });
   const auto deadline_stop =
       aos::monotonic_clock::now() + std::chrono::seconds(2);
   while (count == 0 && aos::monotonic_clock::now() < deadline_stop) {
     aio.Poll(false);
   }
-  EXPECT_EQ(count, 1) << "the unregistered receiver consumed the wakeup";
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  if (IsFutex()) {
+    // A futex wait is armed with the word's value at registration, so a
+    // change that landed before the successor registered is already folded
+    // into what it armed with.  There is nothing queued to redeliver and
+    // nothing lost: the owner's next scan is what finds whatever the change
+    // meant.  No callback is the right answer here, not a dropped one.
+    EXPECT_EQ(count, 0);
+  } else {
+    EXPECT_EQ(count, 1) << "the unregistered receiver consumed the wakeup";
+  }
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // The same ownership rule, but with the loop running in between.
@@ -4882,14 +5000,14 @@ TEST_P(AioTest, SuccessorReceiverOwnsPendingWakeups) {
 // dropping it there loses it just as thoroughly as consuming it early.  The
 // signalfd backends are immune by construction: an unregistered signalfd stops
 // being polled at all, so nothing can consume what is queued in it.
-TEST_P(AioTest, SuccessorReceiverOwnsWakeupObservedWhileUnregistered) {
+TEST_P(AioReceiverTest, SuccessorReceiverOwnsWakeupObservedWhileUnregistered) {
   TestAio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   aio.Poll(false);
-  aio.RegisterThreadSignalReceiver(&sfd, []() {});
-  SignalSelf();
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.RegisterThreadSignalReceiver(sfd.get(), []() {});
+  sfd.Wake();
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 
   // Poll with nothing registered.  The backend is allowed to notice the
   // wakeup here; it is not allowed to forget it.
@@ -4898,15 +5016,24 @@ TEST_P(AioTest, SuccessorReceiverOwnsWakeupObservedWhileUnregistered) {
   }
 
   int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&count]() { ++count; });
   const auto deadline_stop =
       aos::monotonic_clock::now() + std::chrono::seconds(2);
   while (count == 0 && aos::monotonic_clock::now() < deadline_stop) {
     aio.Poll(false);
   }
-  EXPECT_EQ(count, 1) << "the wakeup was dropped while no receiver was "
-                         "registered";
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  if (IsFutex()) {
+    // A futex wait is armed with the word's value at registration, so a
+    // change that landed before the successor registered is already folded
+    // into what it armed with.  There is nothing queued to redeliver and
+    // nothing lost: the owner's next scan is what finds whatever the change
+    // meant.  No callback is the right answer here, not a dropped one.
+    EXPECT_EQ(count, 0);
+  } else {
+    EXPECT_EQ(count, 1) << "the wakeup was dropped while no receiver was "
+                           "registered";
+  }
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // A receiver callback that unregisters its own receiver keeps executing
@@ -4914,21 +5041,21 @@ TEST_P(AioTest, SuccessorReceiverOwnsWakeupObservedWhileUnregistered) {
 // (and its captures) must not be destroyed out from under it.  The old
 // implementation assigned nullptr to the executing function; with a
 // heap-allocated capture this is a use-after-free ASAN catches.
-TEST_P(AioTest, ReceiverCallbackCapturesSurviveSelfUnregister) {
+TEST_P(AioReceiverTest, ReceiverCallbackCapturesSurviveSelfUnregister) {
   TestAio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   const std::string canary(64, 'x');  // Big enough to defeat SSO.
   bool checked = false;
-  aio.RegisterThreadSignalReceiver(&sfd, [&aio, &sfd, canary, &checked]() {
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&aio, &sfd, canary, &checked]() {
     if (checked) return;
     checked = true;
-    aio.UnregisterThreadSignalReceiver(&sfd);
+    aio.UnregisterThreadSignalReceiver(sfd.get());
     // The capture must still be alive after the unregister.
     EXPECT_EQ(canary, std::string(64, 'x'));
   });
 
-  SignalSelf();
+  sfd.Wake();
   while (!checked && aio.Poll(true)) {
   }
   EXPECT_TRUE(checked);
@@ -5276,7 +5403,7 @@ TEST_P(AioTest, DeletingAnotherWatchFromACallbackKeepsThisOneArmed) {
 // to come back on this thread: a legacy readiness callback, a raw completion
 // in each direction, a timer, and a thread-signal wakeup, over enough rounds
 // that anything delivered from elsewhere would have shown up.
-TEST_P(AioTest, CallbacksRunOnTheLoopThread) {
+TEST_P(AioReceiverTest, CallbacksRunOnTheLoopThread) {
   const std::thread::id loop_thread = std::this_thread::get_id();
   struct Counts {
     std::thread::id loop_thread;
@@ -5300,10 +5427,13 @@ TEST_P(AioTest, CallbacksRunOnTheLoopThread) {
     counts.Note();
     EXPECT_EQ(legacy.Read(1), "a");
   });
-  aos::ipc_lib::ThreadSignalReceiver receiver;
-  aio.RegisterThreadSignalReceiver(&receiver, [&]() { counts.Note(); });
-  const auto pid = aos::GetProcessId();
-  const auto tid = aos::GetThreadId();
+  TestReceiver receiver;
+  aio.RegisterThreadSignalReceiver(receiver.get(), [&]() {
+    // Fifty rounds of wakeups, so the wait has to be re-armed between them --
+    // consume the way a real owner does before it scans.
+    aio.ConsumeThreadSignalReceiver(receiver.get());
+    counts.Note();
+  });
 
   constexpr int kRounds = 50;
   constexpr int kPerRound = 5;
@@ -5326,8 +5456,7 @@ TEST_P(AioTest, CallbacksRunOnTheLoopThread) {
     Aio::Timer timer(aio.get());
     timer.Schedule(aos::monotonic_clock::now(), note_completion, &counts);
 
-    aos::ipc_lib::ThreadSignalSender sender;
-    sender.Signal(pid, tid);
+    receiver.Wake();
 
     int polls = 0;
     while (counts.arrived < kPerRound && polls < 1000 && aio.Poll(true)) {
@@ -5340,7 +5469,7 @@ TEST_P(AioTest, CallbacksRunOnTheLoopThread) {
   EXPECT_EQ(counts.off_thread, 0)
       << "a callback ran on a thread other than the one driving the loop";
 
-  aio.UnregisterThreadSignalReceiver(&receiver);
+  aio.UnregisterThreadSignalReceiver(receiver.get());
   aio.DeleteFd(legacy.read_fd());
 }
 
@@ -5670,7 +5799,7 @@ TEST_P(AioTest, RunDrainRedeliversWritability) {
 // clobber Quit()'s `run_ = false`, leaving quit_requested_ as the only record
 // that a shutdown was asked for.  A regression there would hang rather than
 // fail an assertion.
-TEST_P(AioTest, QuitRacingWithRunStartup) {
+TEST_P(AioReceiverTest, QuitRacingWithRunStartup) {
   // 200 iterations, deliberately not more: every fresh Aio is a kernel ring
   // whose teardown costs at least one RCU grace period on a workqueue capped
   // at 64 concurrent teardowns (io_ring_exit_work + percpu_ref_kill's
@@ -5705,19 +5834,15 @@ TEST_P(AioTest, QuitRacingWithRunStartup) {
 // Tests that unregistering a ThreadSignalReceiver correctly cancels the
 // underlying multishot poll request and prevents any use-after-free or extra
 // callbacks.
-TEST_P(AioTest, UnregisterThreadSignalReceiverTest) {
+TEST_P(AioReceiverTest, UnregisterThreadSignalReceiverTest) {
   TestAio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&count]() { ++count; });
 
-  const auto pid = aos::GetProcessId();
-  const auto tid = aos::GetThreadId();
-  aos::ipc_lib::ThreadSignalSender signaler_signal;
-
-  // Send kWakeupSignal.
-  signaler_signal.Signal(pid, tid);
+  // Wake it the way its kind is woken.
+  sfd.Wake();
 
   // Poll until the signal is handled.
   while (count == 0 && aio.Poll(true)) {
@@ -5725,13 +5850,13 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTest) {
   EXPECT_EQ(count, 1);
 
   // Unregister the ThreadSignalReceiver.
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 
-  // Send the signal again.
-  signaler_signal.Signal(pid, tid);
+  // Wake it again.
+  sfd.Wake();
 
   // Clean up the pending wakeup so it doesn't stay pending.
-  sfd.ConsumeWakeup();
+  sfd->ConsumeWakeup();
 
   // Poll non-blockingly a few times to ensure the callback is NOT invoked.
   for (int i = 0; i < 5; ++i) {
@@ -5762,7 +5887,7 @@ TEST_P(AioTest, DuplicateEventOnCancel) {
   aio.DeleteFd(pipe.write_fd());
 }
 
-TEST_P(AioTest, ForkDeathTest) {
+TEST_P(AioReceiverTest, ForkDeathTest) {
   if (!Backend().survives_fork)
     GTEST_SKIP()
         << "a borrowed loop is not this backend's to rebuild in a forked child";
@@ -5775,12 +5900,12 @@ TEST_P(AioTest, ForkDeathTest) {
   // what every death test in the tree relies on, so run it there too.
   TestAio aio;
   Pipe pipe;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
+  TestReceiver sfd;
 
   int signal_count = 0;
   int fd_count = 0;
 
-  aio.RegisterThreadSignalReceiver(&sfd, [&]() { ++signal_count; });
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&]() { ++signal_count; });
 
   aio.OnEvents(pipe.write_fd(), [&](uint32_t events) {
     EXPECT_TRUE(events & EPOLLOUT);
@@ -5792,10 +5917,11 @@ TEST_P(AioTest, ForkDeathTest) {
 
   EXPECT_EXIT(
       {
-        const auto pid = aos::GetProcessId();
-        const auto tid = aos::GetThreadId();
-        aos::ipc_lib::ThreadSignalSender signaler_signal;
-        signaler_signal.Signal(pid, tid);
+        // The child is a different process with a different thread id, so
+        // the wakeup has to be aimed here rather than at what the parent
+        // recorded.
+        sfd.BindHere();
+        sfd.Wake();
         while ((signal_count == 0 || fd_count == 0) && aio.Poll(true)) {
         }
         if (signal_count == 1 && fd_count == 1) {
@@ -5805,7 +5931,7 @@ TEST_P(AioTest, ForkDeathTest) {
       },
       ::testing::ExitedWithCode(42), "");
 
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
   aio.DeleteFd(pipe.write_fd());
 }
 
@@ -6079,7 +6205,7 @@ TEST_P(AioTest, WakeupSurvivesAChildConsumingItTest) {
 // Poll(), and only kqueue is required to deliver the replay.  Not on Windows,
 // which has no fork().
 #if !defined(_WIN32)
-TEST_P(AioTest, UnregisterReceiverFromPostForkWakeupTest) {
+TEST_P(AioReceiverTest, UnregisterReceiverFromPostForkWakeupTest) {
   if (!Backend().survives_fork)
     GTEST_SKIP()
         << "a borrowed loop is not this backend's to rebuild in a forked child";
@@ -6267,6 +6393,9 @@ TEST_P(AioTest, ForkChildNeverTouchesAioTest) {
 // must die loudly.  io_uring-specific -- IORING_SETUP_SINGLE_ISSUER is what
 // makes this a real constraint; the epoll backend has no such thing.
 TEST_P(AioIoUringTest, DestroyFromWrongThreadDeathTest) {
+  if (!SingleIssuerRing()) {
+    GTEST_SKIP() << "only the SINGLE_ISSUER ring tier binds a thread";
+  }
   EXPECT_DEATH(
       {
         // Construct and first-Poll() on the same thread (this one) -- no
@@ -6306,6 +6435,9 @@ TEST_P(AioTest, ConstructOnOneThreadRunOnAnotherTest) {
 // from.  The downgrade must refuse loudly rather than drop the request
 // silently (it would otherwise just never complete).
 TEST_P(AioIoUringTest, DowngradeWithRawRequestInFlightDeathTest) {
+  if (!SingleIssuerRing()) {
+    GTEST_SKIP() << "only the SINGLE_ISSUER ring tier binds a thread";
+  }
   ScopedDeathTestWatchdog watchdog;
   EXPECT_DEATH(
       {
@@ -6332,7 +6464,7 @@ TEST_P(AioIoUringTest, DowngradeWithRawRequestInFlightDeathTest) {
 // same way as the previous test (construct on this thread, touch the Aio
 // from a different one) specifically via DeleteFd(), to pin down that this
 // path in particular has no thread-binding dependency left at all.
-TEST_P(AioTest, DeleteFdFromDifferentThreadTest) {
+TEST_P(AioReceiverTest, DeleteFdFromDifferentThreadTest) {
   Pipe pipe;
   auto aio = std::make_unique<Aio>();
   aio->OnReadable(pipe.read_fd(), []() {});
@@ -6358,15 +6490,15 @@ TEST_P(AioTest, DeleteFdFromDifferentThreadTest) {
 // RegisterThreadSignalReceiver()'s freelist pop) and must still deliver
 // wakeups.  The scoped watchdog turns a wedge into a clean failure if this
 // regresses.
-TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
+TEST_P(AioReceiverTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
   ScopedDeathTestWatchdog watchdog;
 
   TestAio aio;
-  aos::ipc_lib::ThreadSignalReceiver sfd;
-  aio.RegisterThreadSignalReceiver(&sfd, []() {});
+  TestReceiver sfd;
+  aio.RegisterThreadSignalReceiver(sfd.get(), []() {});
 
   std::thread t([&aio, &sfd]() {
-    aio.UnregisterThreadSignalReceiver(&sfd);
+    aio.UnregisterThreadSignalReceiver(sfd.get());
     // The first drive of the loop, from a non-construction thread.  On a
     // SINGLE_ISSUER ring this is what actually reaches EnsureBound() ->
     // DowngradeFromSingleIssuer() (Unregister itself never drives the ring),
@@ -6379,12 +6511,12 @@ TEST_P(AioTest, UnregisterThreadSignalReceiverTriggersDowngradeTest) {
   // binding), so this thread may drive it now.  Re-register -- reusing the
   // recycled orphan on io_uring -- and verify wakeups still flow end to end.
   int count = 0;
-  aio.RegisterThreadSignalReceiver(&sfd, [&count]() { ++count; });
-  SignalSelf();
+  aio.RegisterThreadSignalReceiver(sfd.get(), [&count]() { ++count; });
+  sfd.Wake();
   while (count == 0 && aio.Poll(true)) {
   }
   EXPECT_EQ(count, 1);
-  aio.UnregisterThreadSignalReceiver(&sfd);
+  aio.UnregisterThreadSignalReceiver(sfd.get());
 }
 
 // A timer cancelled before a fork stays cancelled in the child, and the child
@@ -6645,7 +6777,7 @@ TEST(AioBackendFlagTest, UnknownBackendDies) {
 // loop has a problem.  EXPECT_DEATH's own fork() is the fork under test, and
 // the write is aimed at a pipe nobody drains, which keeps it outstanding.
 #ifndef _WIN32
-TEST_P(AioTest, ForkedChildWithPendingAsyncWriteDies) {
+TEST_P(AioReceiverTest, ForkedChildWithPendingAsyncWriteDies) {
   if (!Backend().survives_fork)
     GTEST_SKIP()
         << "a borrowed loop is not this backend's to rebuild in a forked child";
@@ -7037,3 +7169,220 @@ TEST_P(AioTest, ForkAfterCancelDeliveredIsFineTest) {
 }
 
 }  // namespace aos::testing
+
+#if defined(__linux__)
+// Futex-kind ThreadSignalReceivers (ipc_lib::WakeupKind::kFutex): Linux only,
+// and every backend there has them -- the io_uring backend on its own ring,
+// the others on a ring of their own whose fd they poll (futex_wait_ring.h).
+#include <linux/futex.h>
+#include <sys/syscall.h>
+
+#include <climits>
+
+namespace aos::testing {
+namespace {
+
+// What LocklessQueueWakeUpper does: change the word, wake everyone on it.
+void BumpAndWake(std::atomic<uint32_t> *word) {
+  word->fetch_add(1);
+  ABSL_PCHECK(
+      syscall(SYS_futex, word, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0) >= 0);
+}
+
+// Non-blocking polls for a while, for asserting that nothing arrives.
+void PollForAWhile(TestAio *aio) {
+  for (int i = 0; i < 20; ++i) {
+    aio->Poll(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+}  // namespace
+
+// A wake from another thread completes the wait registration armed and runs
+// the callback once; the wait then stays completed until consumed.
+TEST_P(AioTest, FutexReceiverWakesTest) {
+  TestAio aio;
+  std::atomic<uint32_t> word{0};
+  aos::ipc_lib::ThreadSignalReceiver receiver(aos::ipc_lib::WakeupKind::kFutex);
+  EXPECT_EQ(receiver.kind(), aos::ipc_lib::WakeupKind::kFutex);
+  EXPECT_EQ(receiver.fd(), -1);
+  receiver.AddWakeupWord(&word);
+  int callbacks = 0;
+  aio.RegisterThreadSignalReceiver(&receiver, [&callbacks]() { ++callbacks; });
+
+  // The word still holds what the wait was armed with: nothing fires.
+  PollForAWhile(&aio);
+  EXPECT_EQ(callbacks, 0);
+
+  std::thread waker([&word]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    BumpAndWake(&word);
+  });
+  {
+    ScopedRealtime rt;
+    while (callbacks == 0 && aio.Poll(true)) {
+    }
+  }
+  waker.join();
+  EXPECT_EQ(callbacks, 1);
+
+  // Completed stays completed: nothing re-arms behind the owner's back, so a
+  // second wake before ConsumeThreadSignalReceiver() finds no wait.
+  BumpAndWake(&word);
+  PollForAWhile(&aio);
+  EXPECT_EQ(callbacks, 1);
+
+  // Consume re-arms with the word's current value (RT-safe); the next wake
+  // fires.
+  {
+    ScopedRealtime rt;
+    aio.ConsumeThreadSignalReceiver(&receiver);
+  }
+  aio.Poll(false);
+  BumpAndWake(&word);
+  while (callbacks == 1 && aio.Poll(true)) {
+  }
+  EXPECT_EQ(callbacks, 2);
+
+  aio.UnregisterThreadSignalReceiver(&receiver);
+}
+
+// Two words completing before the loop looks produce one callback, and the
+// owner's consume-then-scan protocol from inside that callback picks up the
+// next wake as a second callback, never a lost one.
+TEST_P(AioTest, FutexReceiverCoalescesTest) {
+  TestAio aio;
+  std::atomic<uint32_t> a{0};
+  std::atomic<uint32_t> b{0};
+  aos::ipc_lib::ThreadSignalReceiver receiver(aos::ipc_lib::WakeupKind::kFutex);
+  receiver.AddWakeupWord(&a);
+  receiver.AddWakeupWord(&b);
+  int callbacks = 0;
+  aio.RegisterThreadSignalReceiver(&receiver, [&]() {
+    ++callbacks;
+    // Consume (re-arm) is RT-safe; the polling below runs realtime to hold it
+    // to that.
+    aio.ConsumeThreadSignalReceiver(&receiver);
+  });
+  // Flush the arms so the wakes below find waits rather than racing them.
+  aio.Poll(false);
+
+  BumpAndWake(&a);
+  BumpAndWake(&b);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  {
+    ScopedRealtime rt;
+    while (callbacks == 0 && aio.Poll(true)) {
+    }
+    PollForAWhile(&aio);
+  }
+  EXPECT_EQ(callbacks, 1);
+
+  BumpAndWake(&a);
+  {
+    ScopedRealtime rt;
+    while (callbacks == 1 && aio.Poll(true)) {
+    }
+  }
+  EXPECT_EQ(callbacks, 2);
+
+  aio.UnregisterThreadSignalReceiver(&receiver);
+}
+
+// Unregistering with waits in flight never fires the callback afterward,
+// even when the wake they were waiting for arrives; a successor on the same
+// word is unaffected by the predecessor's leftovers.
+TEST_P(AioTest, FutexReceiverUnregisteredWhileArmedTest) {
+  TestAio aio;
+  std::atomic<uint32_t> word{0};
+  int callbacks = 0;
+  {
+    aos::ipc_lib::ThreadSignalReceiver receiver(
+        aos::ipc_lib::WakeupKind::kFutex);
+    receiver.AddWakeupWord(&word);
+    aio.RegisterThreadSignalReceiver(&receiver,
+                                     [&callbacks]() { ++callbacks; });
+    aio.Poll(false);
+    aio.UnregisterThreadSignalReceiver(&receiver);
+  }
+  BumpAndWake(&word);
+  PollForAWhile(&aio);
+  EXPECT_EQ(callbacks, 0);
+
+  aos::ipc_lib::ThreadSignalReceiver again(aos::ipc_lib::WakeupKind::kFutex);
+  again.AddWakeupWord(&word);
+  aio.RegisterThreadSignalReceiver(&again, [&callbacks]() { ++callbacks; });
+  PollForAWhile(&aio);
+  EXPECT_EQ(callbacks, 0);
+  BumpAndWake(&word);
+  while (callbacks == 0 && aio.Poll(true)) {
+  }
+  EXPECT_EQ(callbacks, 1);
+  aio.UnregisterThreadSignalReceiver(&again);
+}
+
+TEST_P(AioTest, FutexReceiverMisuseDeathTest) {
+  aos::ipc_lib::ThreadSignalReceiver signal_receiver;
+  std::atomic<uint32_t> word{0};
+  EXPECT_DEATH(signal_receiver.AddWakeupWord(&word),
+               "Only a futex-kind ThreadSignalReceiver");
+
+  TestAio aio;
+  aos::ipc_lib::ThreadSignalReceiver receiver(aos::ipc_lib::WakeupKind::kFutex);
+  receiver.AddWakeupWord(&word);
+  aio.RegisterThreadSignalReceiver(&receiver, []() {});
+  aos::ipc_lib::ThreadSignalReceiver second(aos::ipc_lib::WakeupKind::kFutex);
+  EXPECT_DEATH(aio.RegisterThreadSignalReceiver(&second, []() {}),
+               "Duplicate.*");
+  aio.UnregisterThreadSignalReceiver(&receiver);
+}
+
+#if !defined(_WIN32)
+// A forked child's loop re-arms the parent's waits on its own kernel state
+// and on its own copy of the word, so a wake in the child completes there
+// -- and the parent's wait, on the parent's word, is untouched.
+TEST_P(AioTest, FutexReceiverSurvivesForkTest) {
+  if (!Backend().survives_fork)
+    GTEST_SKIP()
+        << "a borrowed loop is not this backend's to rebuild in a forked child";
+  TestAio aio;
+  std::atomic<uint32_t> word{0};
+  aos::ipc_lib::ThreadSignalReceiver receiver(aos::ipc_lib::WakeupKind::kFutex);
+  receiver.AddWakeupWord(&word);
+  int callbacks = 0;
+  aio.RegisterThreadSignalReceiver(&receiver, [&callbacks]() { ++callbacks; });
+  aio.Poll(false);
+
+  const pid_t child = fork();
+  ABSL_PCHECK(child >= 0);
+  if (child == 0) {
+    // The child's word is a copy-on-write copy; bumping it wakes the wait
+    // the child's rebuilt ring holds on it.
+    BumpAndWake(&word);
+    const auto deadline = aos::monotonic_clock::now() + std::chrono::seconds(2);
+    while (callbacks == 0 && aos::monotonic_clock::now() < deadline) {
+      aio.Poll(false);
+    }
+    aio.UnregisterThreadSignalReceiver(&receiver);
+    _exit(callbacks == 1 ? 42 : 1);
+  }
+  int status = 0;
+  ABSL_PCHECK(waitpid(child, &status, 0) == child);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 42) << "the child's re-armed wait never woke";
+
+  // The parent's is still armed and still wakes.
+  PollForAWhile(&aio);
+  EXPECT_EQ(callbacks, 0);
+  BumpAndWake(&word);
+  while (callbacks == 0 && aio.Poll(true)) {
+  }
+  EXPECT_EQ(callbacks, 1);
+
+  aio.UnregisterThreadSignalReceiver(&receiver);
+}
+#endif  // !_WIN32
+
+}  // namespace aos::testing
+#endif  // __linux__

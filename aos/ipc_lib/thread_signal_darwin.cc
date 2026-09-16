@@ -100,7 +100,10 @@ class WakeupSignalDisposition {
 
 // macOS doesn't have signalfd; the receiver just ignores kWakeupSignal
 // process-wide (the Aio kqueue backend watches it via EVFILT_SIGNAL).
-ThreadSignalReceiver::ThreadSignalReceiver() {
+ThreadSignalReceiver::ThreadSignalReceiver(WakeupKind kind) : kind_(kind) {
+  // Futex wakeups are Linux-only; every queue here is of the signal kind.
+  ABSL_CHECK(kind_ == WakeupKind::kSignal)
+      << ": Only signal-kind ThreadSignalReceivers exist on this platform";
   WakeupSignalDisposition::Get().Register();
 }
 

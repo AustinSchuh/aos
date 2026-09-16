@@ -110,15 +110,25 @@ cc_library(
             "aio_linux.cc",
             "aio_readiness_backend.cc",
             "aio_readiness_backend.h",
+            # The futex wakeup for backends that poll descriptors (epoll
+            # here, and the libuv guest loop, which lists the header too).
+            "futex_wait_ring.h",
+            "futex_wait_ring_linux.cc",
         ],
         "@platforms//os:macos": [
             "aio_darwin.cc",
             "aio_readiness_backend.cc",
             "aio_readiness_backend.h",
+            # No futex to wait on; just enough to name and destroy the type.
+            "futex_wait_ring.h",
+            "futex_wait_ring_unsupported.cc",
         ],
         "@platforms//os:windows": [
             "aio_windows.cc",
             "aio_windows_internal.h",
+            # No futex to wait on; just enough to name and destroy the type.
+            "futex_wait_ring.h",
+            "futex_wait_ring_unsupported.cc",
         ],
     }),
     hdrs = [
@@ -277,36 +287,105 @@ cc_library(
         "@com_google_absl//absl/flags:reflection",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
     ],
     alwayslink = True,
 )
 
-# Against the backends that own their own loop.
-cc_test(
-    name = "aio_test",
-    srcs = ["aio_test_native.cc"],
-    deps = [
-        ":aio",
-        ":aio_test_lib",
-        "//aos/testing:googletest",
-    ],
-)
+# The Aio options that change behavior, and the backends they apply to.
+# Everything below -- the Aio contract suite and the two event loop suites --
+# sweeps this one description, so an option cannot be added to one suite and
+# forgotten in the other.
+#
+# has_ring is what makes --io_uring_setup meaningful: it reaches IoUringImpl's
+# ring and nothing else.  The epoll backend has no ring of its own, and the
+# small ring behind futex waits for the fd-polling backends is deliberately
+# plain and must stay that way (futex_wait_ring.cc), so sweeping the setups
+# there would only rebuild the same test.
+#
+# Every target below names its setup, so none of them depends on which of
+# these --io_uring_setup happens to default to (single_issuer_defer_taskrun,
+# in aio_linux.cc).
+_IO_URING_SETUPS = [
+    "single_issuer_defer_taskrun",
+    "single_issuer_coop_taskrun",
+    "single_issuer",
+    "coop_taskrun",
+    "kernel_default",
+]
 
-# The same contracts, against the libuv backend.  UvAio implements the same Aio
-# interface, so the suite that documents what that interface promises is the
-# test that says whether it does.
-cc_test(
-    name = "aio_test_uv",
-    srcs = ["aio_test_uv.cc"],
-    deps = [
-        ":aio",
-        ":aio_test_lib",
-        ":aio_uv",
-        "//aos/testing:googletest",
-        "@com_google_absl//absl/log:absl_check",
-        "@libuv",
-    ],
-)
+_QUEUE_WAKEUPS = [
+    "futex",
+    "signal",
+]
+
+_AIO_BACKENDS = {
+    "epoll": {
+        "aio_test_src": "aio_test_native.cc",
+        "define": "AOS_EPOLL_ONLY",
+        "deps": [],
+        "has_ring": False,
+        "linux_only": False,
+    },
+    "io_uring": {
+        "aio_test_src": "aio_test_native.cc",
+        "define": "AOS_IO_URING_ONLY",
+        "deps": [],
+        "has_ring": True,
+        "linux_only": True,
+    },
+    "uv": {
+        # Its own source file, because it is the only one that includes uv.h
+        # and so the only binary that has to link libuv.
+        "aio_test_src": "aio_test_uv.cc",
+        "define": "AOS_UV_ONLY",
+        "deps": [
+            ":aio_uv",
+            "@com_google_absl//absl/log:absl_check",
+            "@libuv",
+        ],
+        "has_ring": False,
+        "linux_only": False,
+    },
+}
+
+# Every (backend, ring setup) pair that behaves differently.  A setup of None
+# means the backend has no ring for --io_uring_setup to reach, so its default
+# is its only configuration.
+_AIO_OPTIONS = [
+    (backend, setup)
+    for backend, config in _AIO_BACKENDS.items()
+    for setup in (_IO_URING_SETUPS if config["has_ring"] else [None])
+]
+
+# The Aio contract suite, split the same way the event loop suites below are
+# and from the same _AIO_OPTIONS list, so the parallel is visible: one target
+# per (backend, ring setup), each naming what it runs with.  The bodies live
+# once in :aio_test_lib; the source files here only instantiate them, with
+# AOS_EPOLL_ONLY / AOS_IO_URING_ONLY narrowing aio_test_native.cc to one
+# backend exactly as they narrow shm_event_loop_test.cc.
+#
+# There is no wakeup axis: at this level the kind is an argument to the
+# receiver a test builds, not a process-wide flag, so both kinds already run
+# as separate cases inside every one of these.
+[
+    cc_test(
+        name = "aio_test_%s%s" % (
+            backend,
+            ("_" + setup) if setup else "",
+        ),
+        srcs = [_AIO_BACKENDS[backend]["aio_test_src"]],
+        args = ["--io_uring_setup=" + setup] if setup else [],
+        local_defines = [_AIO_BACKENDS[backend]["define"]],
+        target_compatible_with = ["@platforms//os:linux"] if _AIO_BACKENDS[backend]["linux_only"] else [],
+        deps = [
+            ":aio",
+            ":aio_test_lib",
+            "//aos/testing:googletest",
+        ] + _AIO_BACKENDS[backend]["deps"],
+    )
+    for backend, setup in _AIO_OPTIONS
+]
 
 cc_library(
     name = "timerfd",
@@ -819,112 +898,46 @@ cc_library(
     ],
 )
 
-cc_test(
-    name = "shm_event_loop_test_epoll",
-    srcs = ["shm_event_loop_test.cc"],
-    flaky = True,
-    local_defines = ["AOS_EPOLL_ONLY"],
-    shard_count = 50,
-    deps = [
-        ":event_loop_param_test",
-        ":shm_event_loop",
-        ":test_message_fbs",
-        ":thread_event_loop",
-        "//aos/ipc_lib:process_local_queue",
-    ],
-)
+# The event loop suites -- shm_event_loop_test.cc over ShmEventLoop and over
+# ThreadEventLoop -- against every Aio backend and every option that changes
+# what a wakeup is.  Every target names its options: no test here runs
+# "whatever this host happens to default to", so a change of default cannot
+# silently move what is covered.
+#
+# --queue_wakeup exists on every platform, so the signal-kind targets build
+# everywhere their backend does.  The futex kind is Linux only, and so is
+# --io_uring_setup, which only the io_uring backend has a ring for.
+_EVENT_LOOP_DEPS = [
+    ":event_loop_param_test",
+    ":shm_event_loop",
+    ":test_message_fbs",
+    ":thread_event_loop",
+    "//aos/ipc_lib:process_local_queue",
+]
 
-cc_test(
-    name = "shm_event_loop_test_io_uring",
-    srcs = ["shm_event_loop_test.cc"],
-    flaky = True,
-    local_defines = ["AOS_IO_URING_ONLY"],
-    shard_count = 50,
-    target_compatible_with = ["@platforms//os:linux"],
-    deps = [
-        ":event_loop_param_test",
-        ":shm_event_loop",
-        ":test_message_fbs",
-        ":thread_event_loop",
-        "//aos/ipc_lib:process_local_queue",
-    ],
-)
-
-cc_test(
-    name = "shm_event_loop_test_uv",
-    srcs = ["shm_event_loop_test.cc"],
-    flaky = True,
-    local_defines = ["AOS_UV_ONLY"],
-    shard_count = 50,
-    deps = [
-        ":aio_uv",
-        ":event_loop_param_test",
-        ":shm_event_loop",
-        ":test_message_fbs",
-        ":thread_event_loop",
-        "//aos/ipc_lib:process_local_queue",
-        "@libuv",
-    ],
-)
-
-# The same suites over ThreadEventLoop, one target per backend so each stays
-# as long as it was rather than twice that.
-cc_test(
-    name = "thread_event_loop_test_epoll",
-    srcs = ["shm_event_loop_test.cc"],
-    flaky = True,
-    local_defines = [
-        "AOS_EPOLL_ONLY",
-        "AOS_THREAD_EVENT_LOOP",
-    ],
-    shard_count = 50,
-    deps = [
-        ":event_loop_param_test",
-        ":shm_event_loop",
-        ":test_message_fbs",
-        ":thread_event_loop",
-        "//aos/ipc_lib:process_local_queue",
-    ],
-)
-
-cc_test(
-    name = "thread_event_loop_test_io_uring",
-    srcs = ["shm_event_loop_test.cc"],
-    flaky = True,
-    local_defines = [
-        "AOS_IO_URING_ONLY",
-        "AOS_THREAD_EVENT_LOOP",
-    ],
-    shard_count = 50,
-    target_compatible_with = ["@platforms//os:linux"],
-    deps = [
-        ":event_loop_param_test",
-        ":shm_event_loop",
-        ":test_message_fbs",
-        ":thread_event_loop",
-        "//aos/ipc_lib:process_local_queue",
-    ],
-)
-
-cc_test(
-    name = "thread_event_loop_test_uv",
-    srcs = ["shm_event_loop_test.cc"],
-    flaky = True,
-    local_defines = [
-        "AOS_THREAD_EVENT_LOOP",
-        "AOS_UV_ONLY",
-    ],
-    shard_count = 50,
-    deps = [
-        ":aio_uv",
-        ":event_loop_param_test",
-        ":shm_event_loop",
-        ":test_message_fbs",
-        ":thread_event_loop",
-        "//aos/ipc_lib:process_local_queue",
-        "@libuv",
-    ],
-)
+[
+    cc_test(
+        name = "%s_event_loop_test_%s%s_%s" % (
+            loop,
+            backend,
+            ("_" + setup) if setup else "",
+            wakeup,
+        ),
+        srcs = ["shm_event_loop_test.cc"],
+        args = ["--queue_wakeup=" + wakeup] + (["--io_uring_setup=" + setup] if setup else []),
+        flaky = True,
+        local_defines = [_AIO_BACKENDS[backend]["define"]] + (["AOS_THREAD_EVENT_LOOP"] if loop == "thread" else []),
+        shard_count = 50,
+        target_compatible_with = ["@platforms//os:linux"] if (_AIO_BACKENDS[backend]["linux_only"] or wakeup == "futex") else [],
+        deps = _EVENT_LOOP_DEPS + _AIO_BACKENDS[backend]["deps"],
+    )
+    for loop in [
+        "shm",
+        "thread",
+    ]
+    for backend, setup in _AIO_OPTIONS
+    for wakeup in _QUEUE_WAKEUPS
+]
 
 cc_library(
     name = "event_loop_param_test",
@@ -1213,7 +1226,11 @@ cc_library(
             "aio_uv_windows.cc",
             "aio_windows_internal.h",
         ],
-        "//conditions:default": ["aio_uv_posix.cc"],
+        "//conditions:default": [
+            "aio_uv_posix.cc",
+            # Only reached on Linux; the definition is in :aio.
+            "futex_wait_ring.h",
+        ],
     }),
     hdrs = [
         "aio_uv.h",

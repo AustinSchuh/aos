@@ -289,6 +289,26 @@ TEST(PageFaultTest, ReadFaultsPages) {
 
   ASSERT_EQ(munmap(data, size), 0);
 }
+
+// --permissions is applied exactly, not through the umask: two processes with
+// different umasks create the same mode, and a group-shared queue keeps its
+// group write bit whatever the creator's umask says.
+TEST_F(ShmMappingTest, PermissionsIgnoreUmask) {
+  const mode_t old_umask = umask(077);
+  const std::string path = test_dir_ + "/queue";
+  {
+    WritableShmMapping mapping(
+        path, 4096,
+        std::filesystem::perms::owner_all | std::filesystem::perms::group_all);
+    struct stat st;
+    ASSERT_EQ(stat(path.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 07777, 0770u);
+    ASSERT_EQ(stat(test_dir_.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 0777, 0770u);
+  }
+  umask(old_umask);
+}
+
 #endif  // __linux__
 
 }  // namespace aos::ipc_lib::testing

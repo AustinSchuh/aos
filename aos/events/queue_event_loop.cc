@@ -215,6 +215,16 @@ class SimpleShmFetcher {
     watcher_ = std::nullopt;
   }
 
+  // How this channel's senders wake watchers; see ipc_lib::WakeupKind.
+  ipc_lib::WakeupKind wakeup_kind() {
+    return lockless_queue_memory_->queue().wakeup_kind();
+  }
+
+  // The word a futex-kind watcher waits on; see LocklessQueue::wakeup_word().
+  std::atomic<uint32_t> *wakeup_word() {
+    return lockless_queue_memory_->queue().wakeup_word();
+  }
+
   absl::Span<char> GetMutableSharedMemory() const {
     return lockless_queue_memory_->GetMutableSharedMemory();
   }
@@ -613,6 +623,15 @@ class ShmWatcherState : public WatcherState {
 
   void UnregisterWakeup() { return simple_shm_fetcher_.UnregisterWakeup(); }
 
+  ipc_lib::WakeupKind wakeup_kind() {
+    return simple_shm_fetcher_.wakeup_kind();
+  }
+
+  // The word a futex-kind receiver waits on for this channel.
+  std::atomic<uint32_t> *wakeup_word() {
+    return simple_shm_fetcher_.wakeup_word();
+  }
+
   absl::Span<char> GetMutableSharedMemory() const {
     return simple_shm_fetcher_.GetMutableSharedMemory();
   }
@@ -976,13 +995,19 @@ void QueueEventLoop::HandleEvent() {
 
     if (next_time > checked_until) {
       // Consume all pending wakeup signals, so we don't wake up again
-      // immediately to handle them.
+      // immediately to handle them.  For a futex-kind receiver this re-arms
+      // every completed wait with its word's current value; a send that lands
+      // after this completes the new wait, one that landed before it is what
+      // the scan below finds.
       aio_->ConsumeThreadSignalReceiver(signal_receiver_.get());
       // This is the last time we can guarantee that if a message is published
       // before, we will notice it.
       now = monotonic_clock::now();
 
-      // Check all the watchers for new events.
+      // Check all the watchers for new events.  Every watcher, always, even
+      // though a futex completion names its channel: a late wakeup for one
+      // channel says nothing about what arrived on the others meanwhile, and
+      // reading only the woken channel would deliver out of order.
       for (std::unique_ptr<WatcherState> &base_watcher : watchers_) {
         ShmWatcherState *const watcher =
             reinterpret_cast<ShmWatcherState *>(base_watcher.get());
@@ -1040,8 +1065,31 @@ void QueueEventLoop::Startup() {
   }
 
   if (watchers_.size() > 0) {
-    signal_receiver_.reset(new ipc_lib::ThreadSignalReceiver());
-    signal_receiver_->LeaveSignalBlocked();
+    // Every queue this process attaches to is of the same kind -- the kind
+    // is a process-wide flag, recorded in each queue and checked on attach
+    // -- so the first watcher speaks for all of them.
+    const ipc_lib::WakeupKind wakeup_kind =
+        reinterpret_cast<ShmWatcherState *>(watchers_[0].get())->wakeup_kind();
+    for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
+      ABSL_CHECK(
+          reinterpret_cast<ShmWatcherState *>(watcher.get())->wakeup_kind() ==
+          wakeup_kind)
+          << ": Channels of different wakeup kinds on one event loop";
+    }
+    signal_receiver_.reset(new ipc_lib::ThreadSignalReceiver(wakeup_kind));
+    switch (wakeup_kind) {
+      case ipc_lib::WakeupKind::kSignal:
+        signal_receiver_->LeaveSignalBlocked();
+        break;
+      case ipc_lib::WakeupKind::kFutex:
+        // One word per watched channel; registering arms a wait on each.
+        for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
+          signal_receiver_->AddWakeupWord(
+              reinterpret_cast<ShmWatcherState *>(watcher.get())
+                  ->wakeup_word());
+        }
+        break;
+    }
 
     aio_->RegisterThreadSignalReceiver(signal_receiver_.get(),
                                        [this]() { HandleEvent(); });
@@ -1108,7 +1156,10 @@ void QueueEventLoop::Startup() {
 
   // Now that we are realtime (but before the OnRun handlers run), snap the
   // queue index pointer to the newest message. This happens in RT so that we
-  // minimize the risk of losing messages.
+  // minimize the risk of losing messages.  (A futex-kind receiver's waits
+  // were armed at registration, before this snap: a send in between completes
+  // one and the first HandleEvent() scans, finding nothing the snap did not
+  // already skip past.)
   for (::std::unique_ptr<WatcherState> &watcher : watchers_) {
     watcher->Startup();
   }
@@ -1139,7 +1190,7 @@ Status QueueEventLoop::Shutdown() {
     watcher->UnregisterWakeup();
   }
 
-  if (watchers_.size() > 0) {
+  if (signal_receiver_) {
     aio_->UnregisterThreadSignalReceiver(signal_receiver_.get());
     signal_receiver_.reset();
   }

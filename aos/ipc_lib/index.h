@@ -179,6 +179,11 @@ struct AtomicQueueIndex {
                                           ::std::memory_order_acq_rel);
   }
 
+  // The raw storage, for use as a futex word: whoever holds it may load it and
+  // wait for it to change, but must not interpret or modify it -- see
+  // LocklessQueue::wakeup_word().
+  ::std::atomic<uint32_t> *storage() { return &index_; }
+
  private:
   ::std::atomic<uint32_t> index_;
 };

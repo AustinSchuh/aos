@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <liburing.h>
+#include <linux/futex.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -38,12 +39,20 @@
 #include "aos/events/aio_registrations.h"
 #include "aos/events/aio_state.h"
 #include "aos/events/aio_unix.h"
+#include "aos/events/futex_wait_ring.h"
 #include "aos/events/kernel_release.h"
 #include "aos/events/socket_error.h"
 #include "aos/ipc_lib/thread_signal.h"
 #include "aos/libc/aos_strerror.h"
 #include "aos/realtime.h"
 #include "aos/time/time.h"
+
+// The futex2 flag IORING_OP_FUTEX_WAIT takes (the word is 32 bits).  From
+// <linux/futex.h> since 6.7; the sysroots this builds against can be older
+// than the kernels it runs on, so define it if the header does not.
+#ifndef FUTEX2_SIZE_U32
+#define FUTEX2_SIZE_U32 0x02
+#endif
 
 ABSL_FLAG(uint32_t, aio_queue_depth, 256,
           "Depth of the io_uring submission and completion queues.");
@@ -56,6 +65,24 @@ ABSL_FLAG(uint32_t, aio_queue_depth, 256,
 #error \
     "AOS_AIO_DEFAULT_BACKEND must be set by //aos/events:aio's local_defines."
 #endif
+
+// The ring configuration, for measuring what the tiers cost against each
+// other on a given machine and for holding every test to every one of them.
+// Each value names the IORING_SETUP_ flags it sets, so the flag says what the
+// ring is rather than inventing a vocabulary for it.
+// single_issuer_defer_taskrun is the design (documentation/adr/0001-aio-io-
+// uring-single-issuer.md).
+ABSL_FLAG(std::string, io_uring_setup, "single_issuer_defer_taskrun",
+          "Which IORING_SETUP_ flags the io_uring backend creates its ring "
+          "with, named after the flags themselves: "
+          "\"single_issuer_defer_taskrun\" (SINGLE_ISSUER | DEFER_TASKRUN, "
+          "which this flag itself defaults to), "
+          "\"single_issuer_coop_taskrun\" (SINGLE_ISSUER | COOP_TASKRUN | "
+          "TASKRUN_FLAG), \"single_issuer\" (SINGLE_ISSUER alone), "
+          "\"coop_taskrun\" (COOP_TASKRUN | TASKRUN_FLAG), or "
+          "\"kernel_default\" (no setup flags at all).  Every single_issuer* "
+          "value also sets R_DISABLED and binds the ring to the thread that "
+          "first drives it; the others bind nothing.");
 
 ABSL_FLAG(std::string, aio_backend, AOS_AIO_DEFAULT_BACKEND,
           "Which Aio backend to use: \"io_uring\" (requires kernel >= 6.1, "
@@ -130,21 +157,25 @@ std::string KernelRelease() {
 
 // The oldest kernel this backend runs on, enforced at construction.
 //
-// The feature floor is 6.1: every io_uring feature this file submits
-// exists by then.  IORING_SETUP_SINGLE_ISSUER (6.0) and
-// IORING_SETUP_DEFER_TASKRUN (6.1) are the newest; everything else --
-// IORING_SETUP_R_DISABLED and io_uring_enable_rings() (5.10), multishot
-// poll (5.13), IORING_SETUP_COOP_TASKRUN | TASKRUN_FLAG (5.19), async
-// cancel (5.5) -- is older.  Checked explicitly rather than left to the
-// -EINVAL a missing flag would produce, so the failure names the actual
-// requirement instead of a bare errno.
+// The feature floor is 6.7: every io_uring feature this file submits
+// exists by then.  IORING_OP_FUTEX_WAIT (6.7, the futex wakeups of
+// documentation/adr/0006-multi-user-futex-wakeup.md) is the newest;
+// IORING_SETUP_SINGLE_ISSUER (6.0) and IORING_SETUP_DEFER_TASKRUN (6.1)
+// come next, and everything else -- IORING_SETUP_R_DISABLED and
+// io_uring_enable_rings() (5.10), multishot poll (5.13),
+// IORING_SETUP_COOP_TASKRUN | TASKRUN_FLAG (5.19), async cancel (5.5) -- is
+// older.  Checked explicitly rather than left to the -EINVAL a missing
+// feature would produce, so the failure names the actual requirement
+// instead of a bare errno.  The futex op is on a persistent registration,
+// whose error completions are fatal by this file's rule, so a floor that
+// admitted kernels it cannot work on would be a floor in name only.
 //
 // 6.12 is the *recommended* floor: the release where PREEMPT_RT was merged
 // into mainline.  A realtime robotics codebase has little reason to run
 // anything older, but nothing in this file needs it, so it is a suggestion
 // in the error message, not a check.
 constexpr int kMinimumKernelMajor = 6;
-constexpr int kMinimumKernelMinor = 1;
+constexpr int kMinimumKernelMinor = 7;
 
 void RequireMinimumKernelVersion() {
   const std::string release = KernelRelease();
@@ -157,8 +188,9 @@ void RequireMinimumKernelVersion() {
       << "Kernel " << release
       << " is too old: aos's io_uring backend requires >= "
       << kMinimumKernelMajor << "." << kMinimumKernelMinor
-      << " (IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN); >= "
-         "6.12 recommended (the release PREEMPT_RT was merged mainline).";
+      << " (IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN, and "
+         "IORING_OP_FUTEX_WAIT for queue wakeups); >= 6.12 recommended (the "
+         "release PREEMPT_RT was merged mainline).";
 }
 
 // Initializes (or reinitializes) the io_uring instance at *ring on the
@@ -181,17 +213,76 @@ void RequireMinimumKernelVersion() {
 // Requires the kernel floor RequireMinimumKernelVersion() enforces and
 // fails loudly on anything older -- there is no old-kernel fallback to
 // lose behavior the rest of this file depends on.
-void InitSingleIssuerRing(struct io_uring *ring, uint32_t depth) {
-  int ret =
-      InitOneRing(ring, depth,
-                  IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
-                      IORING_SETUP_R_DISABLED);
+// The ring tiers --io_uring_setup selects between, each named after the
+// IORING_SETUP_ flags it sets.
+enum class RingSetup {
+  kSingleIssuerDeferTaskrun,
+  kSingleIssuerCoopTaskrun,
+  kSingleIssuer,
+  kCoopTaskrun,
+  kKernelDefault
+};
+
+// The tiers with the SINGLE_ISSUER binding, created disabled and bound to a
+// thread at the first Poll().
+bool IsSingleIssuer(RingSetup setup) {
+  return setup == RingSetup::kSingleIssuerDeferTaskrun ||
+         setup == RingSetup::kSingleIssuerCoopTaskrun ||
+         setup == RingSetup::kSingleIssuer;
+}
+
+RingSetup SelectedRingSetup() {
+  const std::string setup = absl::GetFlag(FLAGS_io_uring_setup);
+  if (setup == "single_issuer_defer_taskrun") {
+    return RingSetup::kSingleIssuerDeferTaskrun;
+  }
+  if (setup == "single_issuer_coop_taskrun") {
+    return RingSetup::kSingleIssuerCoopTaskrun;
+  }
+  if (setup == "single_issuer") return RingSetup::kSingleIssuer;
+  if (setup == "coop_taskrun") return RingSetup::kCoopTaskrun;
+  if (setup == "kernel_default") return RingSetup::kKernelDefault;
+  ABSL_LOG(FATAL) << "Unknown --io_uring_setup=" << setup
+                  << "; expected single_issuer_defer_taskrun, "
+                     "single_issuer_coop_taskrun, single_issuer, coop_taskrun "
+                     "or kernel_default";
+}
+
+// Creates the ring on the tier --io_uring_setup selects and returns it.  The
+// SINGLE_ISSUER tier is created disabled and bound to a thread at the first
+// Poll() (EnsureBound()); every other tier is enabled on creation and binds
+// nothing.
+RingSetup InitRing(struct io_uring *ring, uint32_t depth) {
+  const RingSetup setup = SelectedRingSetup();
+  struct io_uring_params params;
+  std::memset(&params, 0, sizeof(params));
+  switch (setup) {
+    case RingSetup::kSingleIssuerDeferTaskrun:
+      params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+                     IORING_SETUP_R_DISABLED;
+      break;
+    case RingSetup::kSingleIssuerCoopTaskrun:
+      params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN |
+                     IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_R_DISABLED;
+      break;
+    case RingSetup::kSingleIssuer:
+      params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_R_DISABLED;
+      break;
+    case RingSetup::kCoopTaskrun:
+      params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
+      break;
+    case RingSetup::kKernelDefault:
+      break;
+  }
+  const int ret = io_uring_queue_init_params(depth, ring, &params);
   ABSL_PCHECK(ret == 0)
       << "io_uring_queue_init failed: " << aos_strerror(-ret) << " on kernel "
       << KernelRelease()
-      << " -- aos requires a Linux kernel >= 6.1 (6.12 recommended) for "
+      << " with --io_uring_setup=" << absl::GetFlag(FLAGS_io_uring_setup)
+      << " -- aos requires a Linux kernel >= 6.7 (6.12 recommended) for "
          "IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | "
          "IORING_SETUP_R_DISABLED support.";
+  return setup;
 }
 
 // RAII wrapper around eventfd file descriptors.
@@ -794,6 +885,8 @@ class IoUringImpl : public Aio::Impl {
   // gate submitter_tid_ tracking itself -- both tiers still use that for
   // EnsureBound()'s idempotency check.
   bool single_issuer_ = false;
+  // Which tier the ring was created on (--io_uring_setup).
+  RingSetup ring_setup_ = RingSetup::kSingleIssuerDeferTaskrun;
   // The thread that constructed this IoUringImpl, or, after a fork, the
   // thread running HandleFork()'s reconstruction.  EnsureBound() compares
   // this against the first caller's thread to detect the mismatch
@@ -1068,6 +1161,103 @@ class IoUringImpl : public Aio::Impl {
   OwningIntrusiveStack<ThreadSignalReceiverState, ReceiverOrphanTraits>
       free_receivers_;
   void RecycleDrainedOrphans();
+
+  // Futex wait groups -- see Aio::RegisterFutexWaitGroup().  Each waiter is
+  // one IORING_OP_FUTEX_WAIT on its word, one-shot, re-armed by the owner
+  // from the group callback.  A group is not a kernel op at all: it is an
+  // AsyncRequest that a completing waiter queues on pending_dispatch_ (once,
+  // however many waiters complete in a batch -- QueuePendingDispatch()
+  // dedupes on link.queued), whose callback runs the user's callback once.
+  // That is the coalescing contract, in the same two-phase shape as
+  // everything else here.
+  struct FutexGroupState;
+  struct FutexWaiterState : public internal::FutexWaiter {
+    FutexWaiterState(IoUringImpl *impl, FutexGroupState *group,
+                     std::atomic<uint32_t> *word);
+    // Arms the wait for *word != expected.  Arming an armed waiter is a
+    // CHECK.  RT-safe: one staged SQE.
+    void Arm(uint32_t expected);
+    // The FUTEX_WAIT op.  done between completions, like a single-shot
+    // poll.
+    AsyncRequest request;
+    IoUringImpl *const impl;
+    FutexGroupState *const group_state;
+    FutexWaiterState *prev_in_group = nullptr;
+    FutexWaiterState *next_in_group = nullptr;
+    FutexWaiterState *next_orphan = nullptr;
+    // Set by RemoveFutexWaiter().  The trampoline drops a removed waiter's
+    // completion (its terminal one, -ECANCELED or a wake that raced the
+    // cancel) instead of firing the group for a waiter that is gone.
+    bool removed = false;
+
+    // Arms the wait with expected_.  draining_ok selects
+    // GetSqeForRingReconstruction() over ArmSqe(), for
+    // ReArmPersistentRegistrations() -- see there.
+    void Submit(bool draining_ok);
+  };
+  struct FutexGroupLinkTraits {
+    static FutexWaiterState *&next(FutexWaiterState *state) {
+      return state->next_in_group;
+    }
+    static FutexWaiterState *&prev(FutexWaiterState *state) {
+      return state->prev_in_group;
+    }
+  };
+  struct FutexGroupState : public internal::FutexWaitGroup {
+    FutexGroupState(IoUringImpl *impl, std::function<void()> callback);
+    // Queued on pending_dispatch_ by a completing waiter; never a kernel
+    // op, so `done` stays true and DrainCompletions() never sees it.
+    AsyncRequest request;
+    IoUringImpl *const impl;
+    IntrusiveDoublyLinkedList<FutexWaiterState, FutexGroupLinkTraits> waiters;
+    // Whether a waiter completed since the callback last ran.  Set by the
+    // waiter trampoline, cleared by the group's, so a queued dispatch that
+    // finds nothing new (only possible after a ring rebuild) is a no-op.
+    bool fired = false;
+    // True while inside the user callback; RemoveFutexWaiter() and
+    // UnregisterFutexWaitGroup() CHECK against it rather than support the
+    // shape (nothing needs it).
+    bool in_callback = false;
+  };
+  struct FutexOrphanTraits {
+    static FutexWaiterState *&next(FutexWaiterState *state) {
+      return state->next_orphan;
+    }
+  };
+  std::vector<std::unique_ptr<FutexGroupState>> futex_groups_;
+  // The same deferral for a futex-kind receiver, whose callback belongs to a
+  // FutexGroupState rather than to the receiver state: erasing the group
+  // would free the running std::function, so UnregisterFutexGroup() parks it
+  // here and ReapCompletions() erases it once the dispatch has unwound.  One
+  // slot for the same reason -- at most one group callback can be executing.
+  FutexGroupState *deferred_futex_group_erase_ = nullptr;
+  // Removed waiters whose FUTEX_WAIT was still in flight, parked until its
+  // terminal completion drains (RecycleDrainedOrphans()), then moved to
+  // dead_futex_waiters_.
+  OwningIntrusiveStack<FutexWaiterState, FutexOrphanTraits>
+      orphaned_futex_waiters_;
+  // Waiters with nothing in flight and nothing queued, awaiting deletion.
+  // A waiter cannot be recycled the way a receiver state is -- its word and
+  // group are fixed at construction -- so this is a graveyard, not a
+  // freelist, emptied wherever this file is already non-RT
+  // (ReapDeadFutexWaiters()).
+  OwningIntrusiveStack<FutexWaiterState, FutexOrphanTraits> dead_futex_waiters_;
+  void ReapDeadFutexWaiters();
+  // Queues group's dispatch if it is not already queued.
+  void QueueFutexGroupDispatch(FutexGroupState *group);
+  // The waits behind a futex-kind ThreadSignalReceiver, which is the only
+  // thing that creates them; see RegisterThreadSignalReceiver().
+  FutexGroupState *RegisterFutexGroup(std::function<void()> callback);
+  void UnregisterFutexGroup(FutexGroupState *group);
+  FutexWaiterState *AddFutexWaiter(FutexGroupState *group,
+                                   std::atomic<uint32_t> *word);
+  void RemoveFutexWaiter(FutexWaiterState *waiter);
+  // The registered futex-kind receiver, if any, with its group and waiters
+  // (one per word, in the receiver's order).  Mutually exclusive with
+  // receiver_state_: one receiver per loop, of either kind.
+  ipc_lib::ThreadSignalReceiver *futex_receiver_ = nullptr;
+  FutexGroupState *futex_receiver_group_ = nullptr;
+  std::vector<FutexWaiterState *> futex_receiver_waiters_;
 
   // Every *live* timer -- linked by Initialize(), unlinked only when the
   // owning Timer is destroyed -- so ring rebuilds can re-arm the poll each
@@ -1410,6 +1600,9 @@ void IoUringImpl::RecycleDrainedOrphans() {
                                      [&](ThreadSignalReceiverState *state) {
                                        return drained(&state->request);
                                      });
+  orphaned_futex_waiters_.MoveMatchingTo(
+      &dead_futex_waiters_,
+      [&](FutexWaiterState *state) { return drained(&state->request); });
 }
 
 std::unique_ptr<Aio::TimerState> IoUringImpl::MakeTimerState() {
@@ -1437,11 +1630,13 @@ IoUringImpl::IoUringImpl() {
   last_parent_fork_count_ = internal::ParentForkCount();
   construction_tid_ = CachedThreadId();
   uint32_t depth = ::absl::GetFlag(FLAGS_aio_queue_depth);
-  InitSingleIssuerRing(&ring, depth);
+  ring_setup_ = InitRing(&ring, depth);
+  single_issuer_ = IsSingleIssuer(ring_setup_);
   sq_capacity_ = ring.sq.ring_entries;
-  single_issuer_ = true;
-  // Not enabled until EnsureBound() -- see IORING_SETUP_R_DISABLED above.
-  ring_enabled_ = false;
+  // A SINGLE_ISSUER ring is not enabled until EnsureBound() -- see
+  // IORING_SETUP_R_DISABLED above.  The other tiers are enabled from the
+  // start.
+  ring_enabled_ = !single_issuer_;
 
   // When wakeup event fd read completes, re-schedule it.
   event_fd.wakeup_req.callback = [](Completion completion, void *context) {
@@ -1486,9 +1681,12 @@ IoUringImpl::~IoUringImpl() {
   ABSL_CHECK(legacy_states_.empty())
       << ": All fds must be removed (DeleteFd()/ForgetClosedFd()) before "
          "destroying the Aio";
-  ABSL_CHECK(receiver_state_ == nullptr)
+  ABSL_CHECK(receiver_state_ == nullptr && futex_receiver_ == nullptr)
       << ": The ThreadSignalReceiver must be unregistered before destroying "
          "the Aio";
+  ABSL_CHECK(futex_groups_.empty())
+      << ": Every FutexWaitGroup must be unregistered before destroying the "
+         "Aio";
 
   run = false;
   // Deliberately NO walk of pending_dispatch_ here: the queued requests it
@@ -1589,9 +1787,9 @@ struct io_uring_sqe *IoUringImpl::ArmSqe() {
               : "Nothing can flush before the first Run()/Poll() call enables "
                 "the ring, so every operation armed before then holds a "
                 "staged entry; arm fewer than --aio_queue_depth operations "
-                "(timers, receivers, raw requests, plus two internal "
-                "registrations) before first driving the loop, or raise the "
-                "flag.");
+                "(timers, receivers, one futex waiter per watched channel, "
+                "raw requests, plus two internal registrations) before first "
+                "driving the loop, or raise the flag.");
   CountArmedOp();
   return sqe;
 }
@@ -1762,11 +1960,10 @@ void IoUringImpl::HandleFork() {
   // CachedThreadId() reads the child's fresh tid.
   construction_tid_ = CachedThreadId();
   uint32_t depth = ::absl::GetFlag(FLAGS_aio_queue_depth);
-  InitSingleIssuerRing(&ring, depth);
+  ring_setup_ = InitRing(&ring, depth);
+  single_issuer_ = IsSingleIssuer(ring_setup_);
   sq_capacity_ = ring.sq.ring_entries;
-  single_issuer_ = true;
-  // Not enabled until EnsureBound() -- see IORING_SETUP_R_DISABLED above.
-  ring_enabled_ = false;
+  ring_enabled_ = !single_issuer_;
   // Rebind now rather than at the next Poll(): a stale submitter_tid_ names
   // a thread that no longer exists in this process, which would make
   // EnsureBound() below a no-op -- and ReArmPersistentRegistrations()
@@ -1915,6 +2112,26 @@ void IoUringImpl::ReArmPersistentRegistrations() {
   if (receiver_state_ != nullptr) {
     receiver_state_->request.done = true;
     receiver_state_->Submit(this);
+  }
+
+  // Futex waits die with the ring like everything else, but the word they
+  // watch is in shared memory and unaffected, so each armed waiter is simply
+  // armed again with the value its owner last loaded: if a send moved the
+  // word in between, the fresh wait fails with -EAGAIN and the owner scans,
+  // which is exactly what the old wait would have told it.  A group whose
+  // dispatch was pending on the cleared list is queued again.
+  orphaned_futex_waiters_.MoveMatchingTo(
+      &dead_futex_waiters_, [](FutexWaiterState *) { return true; });
+  for (const std::unique_ptr<FutexGroupState> &group : futex_groups_) {
+    group->waiters.ForEach([](FutexWaiterState *state) {
+      if (state->armed()) {
+        state->request.done = true;
+        state->Submit(/*draining_ok=*/true);
+      }
+    });
+    if (group->fired) {
+      QueueFutexGroupDispatch(group.get());
+    }
   }
 
   // Only the *poll* is rebuilt here.  Within one process that is the whole
@@ -2498,7 +2715,7 @@ void IoUringImpl::SetEvents(FileDescriptor fd, uint32_t events) {
 void IoUringImpl::RegisterThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver, std::function<void()> callback) {
   CheckForFork();
-  ABSL_CHECK(receiver_state_ == nullptr)
+  ABSL_CHECK(receiver_state_ == nullptr && futex_receiver_ == nullptr)
       << "Duplicate ThreadSignalReceiver registration: only one receiver "
          "may be active at a time (see receiver_state_)";
   if (receiver->fd() >= 0 && legacy_states_.contains(receiver->fd())) {
@@ -2507,6 +2724,20 @@ void IoUringImpl::RegisterThreadSignalReceiver(
   // Registration runs on the polling thread, which is the thread whose
   // wakeups this receiver serves.  Construction may not have.
   receiver->BindToCurrentThread();
+
+  if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+    // No signalfd to poll: one FUTEX_WAIT per word, armed with what the word
+    // holds right now.  A change that lands after this completes the wait; one
+    // that landed before is what the owner's first scan finds.
+    futex_receiver_ = receiver;
+    futex_receiver_group_ = RegisterFutexGroup(std::move(callback));
+    for (std::atomic<uint32_t> *word : receiver->wakeup_words()) {
+      FutexWaiterState *waiter = AddFutexWaiter(futex_receiver_group_, word);
+      waiter->Arm(word->load(std::memory_order_acquire));
+      futex_receiver_waiters_.push_back(waiter);
+    }
+    return;
+  }
 
   if (ThreadSignalReceiverState *state = free_receivers_.Pop();
       state != nullptr) {
@@ -2528,6 +2759,18 @@ void IoUringImpl::RegisterThreadSignalReceiver(
 void IoUringImpl::UnregisterThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver) {
   CheckForFork();
+  if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+    ABSL_CHECK(futex_receiver_ == receiver) << "ThreadSignalReceiver not found";
+    receiver->UnbindFromCurrentThread();
+    for (FutexWaiterState *waiter : futex_receiver_waiters_) {
+      RemoveFutexWaiter(waiter);
+    }
+    futex_receiver_waiters_.clear();
+    UnregisterFutexGroup(futex_receiver_group_);
+    futex_receiver_group_ = nullptr;
+    futex_receiver_ = nullptr;
+    return;
+  }
   ABSL_CHECK(receiver_state_ != nullptr &&
              receiver_state_->receiver == receiver)
       << "ThreadSignalReceiver not found";
@@ -2594,7 +2837,192 @@ void IoUringImpl::ConsumeThreadSignalReceiver(
   // the loop thread's own dispatch of it.  (CheckForFork() enforces that
   // too -- see there.)
   CheckForFork();
+  if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+    // The futex "drain": re-arm every completed wait with its word's current
+    // value, before the owner scans.
+    ABSL_CHECK(futex_receiver_ == receiver) << "ThreadSignalReceiver not found";
+    for (FutexWaiterState *waiter : futex_receiver_waiters_) {
+      if (!waiter->armed()) {
+        waiter->Arm(waiter->word()->load(std::memory_order_acquire));
+      }
+    }
+    return;
+  }
   receiver->ConsumeWakeup();
+}
+
+IoUringImpl::FutexWaiterState::FutexWaiterState(IoUringImpl *impl,
+                                                FutexGroupState *group,
+                                                std::atomic<uint32_t> *word)
+    : internal::FutexWaiter(group, word), impl(impl), group_state(group) {
+  request.context = this;
+  request.callback = [](Completion completion, void *context) {
+    auto *state = static_cast<FutexWaiterState *>(context);
+    if (state->removed) {
+      // The terminal completion of a waiter RemoveFutexWaiter() orphaned:
+      // our own cancel's -ECANCELED, or a wake that beat the cancel.  The
+      // group must not fire on its account; RecycleDrainedOrphans() reaps
+      // the state.
+      return;
+    }
+    state->armed_ = false;
+    // 0: woken.  -EAGAIN: the word already differed from expected_ when the
+    // kernel looked.  Both mean "look again", and the owner treats them
+    // identically.  Anything else is a registration that has stopped
+    // working -- -EINVAL in particular means the kernel predates
+    // IORING_OP_FUTEX_WAIT -- and dying names it, rather than re-arming a
+    // failing op forever or silently never waking this channel again.
+    if (!aos::IsOk(completion.status) && completion.result != EAGAIN) {
+      ABSL_LOG(FATAL) << "IORING_OP_FUTEX_WAIT failed: "
+                      << aos_strerror(completion.result)
+                      << (completion.result == EINVAL
+                              ? " -- the kernel lacks io_uring futex "
+                                "operations (Linux 6.7); use "
+                                "--queue_wakeup=signal"
+                              : "");
+    }
+    state->group_state->fired = true;
+    state->impl->QueueFutexGroupDispatch(state->group_state);
+  };
+}
+
+void IoUringImpl::FutexWaiterState::Submit(bool draining_ok) {
+  struct io_uring_sqe *sqe =
+      draining_ok ? impl->GetSqeForRingReconstruction() : impl->ArmSqe();
+  // Shared, not FUTEX2_PRIVATE: the word is in a MAP_SHARED queue and the
+  // waker is another process.  The mask is "any wake", which is the only
+  // kind LocklessQueueWakeUpper sends.
+  io_uring_prep_futex_wait(sqe, reinterpret_cast<const uint32_t *>(word_),
+                           expected_, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32,
+                           0);
+  io_uring_sqe_set_data64(sqe, NewIncarnationUserData(&request));
+  request.done = false;
+  armed_ = true;
+}
+
+IoUringImpl::FutexGroupState::FutexGroupState(IoUringImpl *impl,
+                                              std::function<void()> callback)
+    : internal::FutexWaitGroup(std::move(callback)), impl(impl) {
+  request.context = this;
+  request.callback = [](Completion /*completion*/, void *context) {
+    auto *group = static_cast<FutexGroupState *>(context);
+    if (!group->fired) {
+      return;
+    }
+    // Every waiter that completed before this point is already disarmed
+    // (its trampoline ran first, from the same dispatch loop), so the
+    // callback sees the whole batch, and a completion that lands after this
+    // clears `fired` queues a fresh dispatch.
+    group->fired = false;
+    group->impl->user_dispatch_ = true;
+    group->in_callback = true;
+    group->callback_();
+    group->in_callback = false;
+  };
+}
+
+void IoUringImpl::QueueFutexGroupDispatch(FutexGroupState *group) {
+  if (!State(&group->request).link.queued) {
+    QueuePendingDispatch(&group->request, 0);
+  }
+}
+
+void IoUringImpl::ReapDeadFutexWaiters() {
+  // Only called from entry points that are already CheckNotRealtime(): the
+  // deletes below are what makes them so.
+  while (FutexWaiterState *state = dead_futex_waiters_.Pop()) {
+    delete state;
+  }
+}
+
+IoUringImpl::FutexGroupState *IoUringImpl::RegisterFutexGroup(
+    std::function<void()> callback) {
+  CheckForFork();
+  // Allocates (the group, and the std::function it stores).
+  aos::CheckNotRealtime();
+  ReapDeadFutexWaiters();
+  futex_groups_.push_back(
+      std::make_unique<FutexGroupState>(this, std::move(callback)));
+  return futex_groups_.back().get();
+}
+
+void IoUringImpl::UnregisterFutexGroup(FutexGroupState *state) {
+  CheckForFork();
+  aos::CheckNotRealtime();
+  auto it = std::find_if(futex_groups_.begin(), futex_groups_.end(),
+                         [state](const std::unique_ptr<FutexGroupState> &g) {
+                           return g.get() == state;
+                         });
+  ABSL_CHECK(it != futex_groups_.end()) << ": FutexWaitGroup not found";
+  ABSL_CHECK(state->waiters.empty())
+      << ": Remove every FutexWaiter before unregistering its group";
+  // A completion may have queued the group's dispatch and not yet run it;
+  // the dispatch loop must not walk into freed memory.
+  UnlinkPendingDispatch(&state->request);
+  if (state->in_callback) {
+    // Erasing now would free the std::function that is calling us, and the
+    // trampoline still has `group->in_callback = false` to write when it
+    // returns.  Park it for the end of the outermost dispatch, exactly as
+    // UnregisterThreadSignalReceiver() does for a signal-kind receiver's
+    // callback, so the two kinds behave the same from a user's callback.
+    ABSL_CHECK(deferred_futex_group_erase_ == nullptr)
+        << ": two FutexWaitGroups unregistered from their own callbacks";
+    deferred_futex_group_erase_ = state;
+    return;
+  }
+  futex_groups_.erase(it);
+  ReapDeadFutexWaiters();
+}
+
+IoUringImpl::FutexWaiterState *IoUringImpl::AddFutexWaiter(
+    FutexGroupState *group_state, std::atomic<uint32_t> *word) {
+  CheckForFork();
+  aos::CheckNotRealtime();
+  ReapDeadFutexWaiters();
+  auto *state = new FutexWaiterState(this, group_state, word);
+  group_state->waiters.PushBack(state);
+  return state;
+}
+
+void IoUringImpl::RemoveFutexWaiter(FutexWaiterState *state) {
+  CheckForFork();
+  // Frees (or parks for freeing); deterministically non-RT like
+  // DestroyTimerState().
+  aos::CheckNotRealtime();
+  ABSL_CHECK(!state->removed) << ": FutexWaiter removed twice";
+  // Legal from inside the group's own callback, which is what a receiver
+  // unregistering itself from its callback does.  Nothing here reads the
+  // group beyond its waiter list, and that list is not being walked: a
+  // waiter's trampoline ran before the group's and never re-enters it.
+  state->group_state->waiters.Remove(state);
+  state->removed = true;
+  // Unconditionally, for the same reason DestroyTimerState() does: a
+  // drained-but-undispatched completion may still name this request.
+  UnlinkPendingDispatch(&state->request);
+  if (state->request.done) {
+    // Nothing in flight.  Its trampoline only ever runs from the dispatch
+    // loop, and a running one would have to be this waiter's own -- which
+    // it cannot be, because that trampoline never calls user code.  Still,
+    // mid-dispatch the safe rule is the same as everywhere else: park it and
+    // let the sweep at the end of the dispatch reap it.
+    if (dispatching_) {
+      orphaned_futex_waiters_.Push(state);
+    } else {
+      dead_futex_waiters_.Push(state);
+    }
+  } else {
+    CancelRequest(&state->request);
+    orphaned_futex_waiters_.Push(state);
+  }
+  ReapDeadFutexWaiters();
+}
+
+void IoUringImpl::FutexWaiterState::Arm(uint32_t expected) {
+  impl->CheckForFork();
+  ABSL_CHECK(!removed) << ": Arming a removed FutexWaiter";
+  ABSL_CHECK(!armed_) << ": Arming a FutexWaiter that is already armed";
+  expected_ = expected;
+  Submit(/*draining_ok=*/false);
 }
 
 // Destruction is handled by IoUringImpl::DestroyTimerState(), which strips
@@ -2853,15 +3281,17 @@ bool IoUringImpl::DrainCompletions() {
       // Handled before the generation check below because acks are
       // identity-independent: the sentinel's generation never increments,
       // so every ack is "current" by construction.
-      // 0 / -EALREADY: the target's terminal completion is coming.
-      // -ENOENT: the lookup missed, which for the ops this backend still
-      // cancels (polls and raw reads/writes) means the target was already
-      // resolving -- its terminal CQE is either already drained or
-      // trailing this ack.  Either way there is nothing left to kill, so
-      // the ack is validated and counted, never retried.
+      // 0 / -EALREADY: the target's terminal completion is coming.  A
+      // positive count is the same thing from a futex wait, whose cancel
+      // reports how many waits it removed (one).  -ENOENT: the lookup
+      // missed, which for the ops this backend cancels (polls, raw
+      // reads/writes, futex waits) means the target was already resolving
+      // -- its terminal CQE is either already drained or trailing this ack.
+      // Either way there is nothing left to kill, so the ack is validated
+      // and counted, never retried.
       ABSL_CHECK_EQ(req, &cancel_ack_sentinel_)
           << "Cancel ack not submitted under the sentinel identity";
-      ABSL_CHECK(cqe->res == 0 || cqe->res == -EALREADY || cqe->res == -ENOENT)
+      ABSL_CHECK(cqe->res >= 0 || cqe->res == -EALREADY || cqe->res == -ENOENT)
           << "Unexpected async-cancel ack: " << aos_strerror(-cqe->res);
       ABSL_CHECK_GT(cancel_acks_outstanding_, 0)
           << "Cancel ack with none outstanding";
@@ -2981,6 +3411,22 @@ bool IoUringImpl::ReapCompletions() {
     aos::CheckNotRealtime();
     deferred_receiver_callback_clear_ = nullptr;
     state->callback = nullptr;
+  }
+
+  // The futex-kind equivalent: the group whose callback unregistered it.  By
+  // here the trampoline has returned, so nothing executes out of the
+  // std::function this frees.  Non-RT by the same argument.
+  if (deferred_futex_group_erase_ != nullptr) {
+    aos::CheckNotRealtime();
+    FutexGroupState *group = deferred_futex_group_erase_;
+    deferred_futex_group_erase_ = nullptr;
+    auto it = std::find_if(futex_groups_.begin(), futex_groups_.end(),
+                           [group](const std::unique_ptr<FutexGroupState> &g) {
+                             return g.get() == group;
+                           });
+    ABSL_CHECK(it != futex_groups_.end()) << ": deferred FutexWaitGroup lost";
+    futex_groups_.erase(it);
+    ReapDeadFutexWaiters();
   }
 
   // Free legacy registrations retired mid-dispatch (see DeleteFd()).  Why
@@ -3126,6 +3572,28 @@ class EpollImpl : public internal::ReadinessBackend {
   // registered at a time (see Aio::RegisterThreadSignalReceiver).
   ipc_lib::ThreadSignalReceiver *receiver_ = nullptr;
 
+  // A futex-kind receiver's waits: a small io_uring per group, whose fd is an
+  // ordinary OnReadable() registration here (see futex_wait_ring.h).  Built
+  // on first use; its destructor CHECKs every group was unregistered.
+  internal::FutexWaitGroups *futex_groups() {
+    if (futex_groups_ == nullptr) {
+      futex_groups_ = std::make_unique<internal::FutexWaitGroups>(
+          [this](FileDescriptor fd, std::function<void()> callback) {
+            if (registrations_.GetActive(fd) != nullptr) {
+              internal::DieOwnFdStillRegistered(fd, "futex wait ring");
+            }
+            OnReadable(fd, std::move(callback));
+          },
+          [this](FileDescriptor fd) { DeleteFd(fd); });
+    }
+    return futex_groups_.get();
+  }
+  std::unique_ptr<internal::FutexWaitGroups> futex_groups_;
+  // The registered receiver's group and waiters when it is of the futex
+  // kind.
+  internal::FutexWaitGroup *futex_receiver_group_ = nullptr;
+  std::vector<internal::FutexWaiter *> futex_receiver_waiters_;
+
   // Live EpollTimerStates, counted so ~EpollImpl() can CHECK none outlive
   // it -- ~EpollTimerState dereferences this impl.
   int active_timer_count_ = 0;
@@ -3179,6 +3647,9 @@ EpollImpl::~EpollImpl() {
   ABSL_CHECK(receiver_ == nullptr)
       << ": The ThreadSignalReceiver must be unregistered before destroying "
          "the Aio";
+  ABSL_CHECK(futex_groups_ == nullptr || futex_groups_->empty())
+      << ": Every FutexWaitGroup must be unregistered before destroying the "
+         "Aio";
   // Only the internal wakeup read and async-only registrations may remain:
   // aio.h's constraint 2 permits destroying the Aio with raw requests still
   // pending.  Caller fd registrations must be gone, as EPoll always
@@ -3255,6 +3726,14 @@ void EpollImpl::AfterForkReArm() {
   DeleteFd(event_fd_.fd());
   event_fd_.Recreate();
   OnInternalReadable(event_fd_.fd(), [this]() { event_fd_.Drain(); });
+
+  // A futex wait ring is an io_uring, and an inherited io_uring is the
+  // parent's -- its mappings are shared.  Each group rebuilds its ring,
+  // re-registers the new fd here and re-arms its waiters, the way
+  // IoUringImpl::HandleFork() does for its own.
+  if (futex_groups_ != nullptr) {
+    futex_groups_->AfterFork();
+  }
 }
 
 internal::ReadinessBackend::WaitResult EpollImpl::WaitForOne(bool block,
@@ -3397,6 +3876,18 @@ void EpollImpl::RegisterThreadSignalReceiver(
   // wakeups this receiver serves.  Construction may not have.
   receiver->BindToCurrentThread();
   receiver_ = receiver;
+  if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+    // One wait per word, armed with the word's current value; see the
+    // io_uring backend's registration for the ordering argument.
+    futex_receiver_group_ = futex_groups()->Register(std::move(callback));
+    for (std::atomic<uint32_t> *word : receiver->wakeup_words()) {
+      internal::FutexWaiter *waiter =
+          futex_groups()->Add(futex_receiver_group_, word);
+      futex_groups()->Arm(waiter, word->load(std::memory_order_acquire));
+      futex_receiver_waiters_.push_back(waiter);
+    }
+    return;
+  }
   OnReadable(receiver->fd(), [receiver, callback = std::move(callback)]() {
     receiver->ConsumeWakeup();
     if (callback) callback();
@@ -3408,12 +3899,31 @@ void EpollImpl::UnregisterThreadSignalReceiver(
   CheckForFork();
   ABSL_CHECK(receiver_ == receiver) << "ThreadSignalReceiver not found";
   receiver_ = nullptr;
-  DeleteFd(receiver->fd());
+  if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+    for (internal::FutexWaiter *waiter : futex_receiver_waiters_) {
+      futex_groups()->Remove(waiter);
+    }
+    futex_receiver_waiters_.clear();
+    futex_groups()->Unregister(futex_receiver_group_);
+    futex_receiver_group_ = nullptr;
+  } else {
+    DeleteFd(receiver->fd());
+  }
   receiver->UnbindFromCurrentThread();
 }
 
 void EpollImpl::ConsumeThreadSignalReceiver(
     ipc_lib::ThreadSignalReceiver *receiver) {
+  if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+    ABSL_CHECK(receiver_ == receiver) << "ThreadSignalReceiver not found";
+    for (internal::FutexWaiter *waiter : futex_receiver_waiters_) {
+      if (!waiter->armed()) {
+        futex_groups()->Arm(waiter,
+                            waiter->word()->load(std::memory_order_acquire));
+      }
+    }
+    return;
+  }
   // Nothing backend-specific here: the receiver's fd is an ordinary
   // level-triggered registration, so draining it is the receiver's own job.
   receiver->ConsumeWakeup();
@@ -3432,6 +3942,9 @@ const char *EpollImpl::OwnFdName(FileDescriptor fd) {
   if (receiver_ != nullptr && fd == receiver_->fd()) {
     return "thread-signal receiver";
   }
+  if (futex_groups_ != nullptr && futex_groups_->OwnsFd(fd)) {
+    return "futex wait ring";
+  }
   for (Aio::TimerState *state = active_timers_.front(); state != nullptr;
        state = decltype(active_timers_)::Next(state)) {
     if (fd == static_cast<EpollTimerState *>(state)->timer_fd->fd()) {
@@ -3443,6 +3956,11 @@ const char *EpollImpl::OwnFdName(FileDescriptor fd) {
 
 void EpollImpl::CheckOwnFdsOpenAfterFork() {
   internal::ReadinessBackend::CheckOwnFdsOpenAfterFork();
+  if (futex_groups_ != nullptr) {
+    futex_groups_->ForEachFd([](FileDescriptor fd) {
+      internal::CheckOwnFdOpenAfterFork(fd, "futex wait ring");
+    });
+  }
   if (receiver_ != nullptr && receiver_->fd() >= 0) {
     internal::CheckOwnFdOpenAfterFork(receiver_->fd(),
                                       "thread-signal receiver");

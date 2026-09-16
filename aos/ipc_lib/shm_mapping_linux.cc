@@ -40,6 +40,13 @@ void *MapShm(std::string_view path, size_t size,
               static_cast<mode_t>(permissions));
     if (fd != -1) {
       created = true;
+      // open() applied the process umask to the mode; apply the requested
+      // mode exactly.  With processes of more than one user on a queue, the
+      // umask of whichever one happened to create the file is not a policy,
+      // and a default umask of 0022 would strip the group write bit every
+      // other user needs.  --permissions means what it says.
+      ABSL_PCHECK(fchmod(fd, static_cast<mode_t>(permissions)) == 0)
+          << ": setting the mode of " << path_str << " failed";
     } else if (errno == EEXIST) {
       fd = open(path_str.c_str(), O_RDWR | O_CLOEXEC,
                 static_cast<mode_t>(permissions));

@@ -63,7 +63,14 @@ sigset_t WakeupSignalMask() {
 
 }  // namespace
 
-ThreadSignalReceiver::ThreadSignalReceiver() {
+ThreadSignalReceiver::ThreadSignalReceiver(WakeupKind kind) : kind_(kind) {
+  if (kind_ == WakeupKind::kFutex) {
+    // Nothing to build: the words come from AddWakeupWord(), and the Aio this
+    // is registered with owns the waits on them.  Nothing to block either --
+    // no signal is ever aimed at a futex-kind watcher, so the destructor has
+    // no disposition to put back and returns before it looks.
+    return;
+  }
   const sigset_t mask = WakeupSignalMask();
   // Block kWakeupSignal, then create the signalfd.  A signalfd is inert while
   // its signal is unblocked -- the signal still takes its default action (fatal
@@ -91,6 +98,9 @@ ThreadSignalReceiver::ThreadSignalReceiver() {
 }
 
 ThreadSignalReceiver::~ThreadSignalReceiver() {
+  if (kind_ == WakeupKind::kFutex) {
+    return;
+  }
   // Unwind the constructor.  Unblock kWakeupSignal and close the fd.
   if (should_unblock_) {
     const sigset_t mask = WakeupSignalMask();
@@ -115,6 +125,10 @@ void ThreadSignalReceiver::UnbindFromCurrentThread() {
 }
 
 bool ThreadSignalReceiver::ConsumeWakeup() {
+  if (kind_ == WakeupKind::kFutex) {
+    // The Aio re-arms the waits; there is nothing here to drain.
+    return false;
+  }
   // Batched: signalfd dequeues as many pending siginfos as fit the buffer,
   // and a short count means the queue was empty at that moment -- so the
   // common one-signal wakeup costs exactly one read(2), with no EAGAIN bounce

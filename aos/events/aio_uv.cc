@@ -20,6 +20,7 @@
 #include "aos/events/aio_internal.h"
 #include "aos/events/aio_state.h"
 #include "aos/events/aio_uv_internal.h"
+#include "aos/events/futex_wait_ring.h"
 #include "aos/ipc_lib/thread_signal.h"
 #include "aos/realtime.h"
 
@@ -501,6 +502,19 @@ class UvImpl : public Aio::Impl, public UvCore {
         << ": Duplicate ThreadSignalReceiver registration: only one receiver "
            "may be active at a time (see Aio::RegisterThreadSignalReceiver)";
     receiver_ = receiver;
+    if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+      // Futex wakeups ride whatever the platform half can wait on them
+      // through; on Linux that is a ring fd, registered like any other
+      // descriptor.  One wait per word, armed with the word's current value.
+      futex_receiver_group_ = futex_groups()->Register(std::move(callback));
+      for (std::atomic<uint32_t> *word : receiver->wakeup_words()) {
+        internal::FutexWaiter *waiter =
+            futex_groups()->Add(futex_receiver_group_, word);
+        futex_groups()->Arm(waiter, word->load(std::memory_order_acquire));
+        futex_receiver_waiters_.push_back(waiter);
+      }
+      return;
+    }
     platform_->RegisterReceiver(receiver, std::move(callback));
   }
 
@@ -508,6 +522,15 @@ class UvImpl : public Aio::Impl, public UvCore {
       ipc_lib::ThreadSignalReceiver *receiver) override {
     ABSL_CHECK(receiver_ == receiver) << ": ThreadSignalReceiver not found";
     receiver_ = nullptr;
+    if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+      for (internal::FutexWaiter *waiter : futex_receiver_waiters_) {
+        futex_groups()->Remove(waiter);
+      }
+      futex_receiver_waiters_.clear();
+      futex_groups()->Unregister(futex_receiver_group_);
+      futex_receiver_group_ = nullptr;
+      return;
+    }
     platform_->UnregisterReceiver(receiver);
   }
 
@@ -518,10 +541,30 @@ class UvImpl : public Aio::Impl, public UvCore {
       return;
     }
     ABSL_CHECK(receiver_ == receiver) << ": ThreadSignalReceiver not found";
+    if (receiver->kind() == ipc_lib::WakeupKind::kFutex) {
+      for (internal::FutexWaiter *waiter : futex_receiver_waiters_) {
+        if (!waiter->armed()) {
+          futex_groups()->Arm(waiter,
+                              waiter->word()->load(std::memory_order_acquire));
+        }
+      }
+      return;
+    }
     platform_->ConsumeReceiver(receiver);
   }
 
  private:
+  internal::FutexWaitGroups *futex_groups() {
+    if (futex_groups_ == nullptr) {
+      futex_groups_ = platform_->MakeFutexWaitGroups();
+      ABSL_CHECK(futex_groups_ != nullptr)
+          << ": Futex wakeups are not available on this platform's libuv "
+             "backend; queues here must be of the signal kind "
+             "(--queue_wakeup=signal).";
+    }
+    return futex_groups_.get();
+  }
+
   FdRegistration *Get(FileDescriptor fd) {
     auto it = registrations_.find(fd);
     ABSL_CHECK(it != registrations_.end()) << "fd " << fd << " not found";
@@ -1036,6 +1079,12 @@ class UvImpl : public Aio::Impl, public UvCore {
   AsyncRequest *pending_head_ = nullptr;
   AsyncRequest *pending_tail_ = nullptr;
   ipc_lib::ThreadSignalReceiver *receiver_ = nullptr;
+  // Built on first use from the platform half; its destructor CHECKs every
+  // group was unregistered.  Before platform_ so it is destroyed after the
+  // registrations it may still hold have been released.
+  std::unique_ptr<internal::FutexWaitGroups> futex_groups_;
+  internal::FutexWaitGroup *futex_receiver_group_ = nullptr;
+  std::vector<internal::FutexWaiter *> futex_receiver_waiters_;
   // The other half; see aio_uv_internal.h.  Last, so it is destroyed first.
   std::unique_ptr<UvPlatform> platform_;
 };

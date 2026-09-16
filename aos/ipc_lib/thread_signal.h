@@ -1,8 +1,11 @@
 #ifndef AOS_IPC_LIB_THREAD_SIGNAL_H_
 #define AOS_IPC_LIB_THREAD_SIGNAL_H_
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include "aos/realtime.h"
 
@@ -39,6 +42,22 @@ const static unsigned int kWakeupSignal = SIGUSR1;
 const static unsigned int kWakeupSignal = SIGRTMIN + 2;
 #endif
 
+// How senders wake a queue's watchers.  Recorded in the queue's shared memory
+// the first time it is initialized (from --queue_wakeup), so every process on
+// a queue uses the same mechanism; a process of the other kind refuses to
+// attach.  See documentation/adr/0006-multi-user-futex-wakeup.md.
+enum class WakeupKind : uint32_t {
+  // One thread-directed realtime signal per watcher (ThreadSignalSender).  The
+  // kernel delivers it only between matching uids, so every process on the
+  // queue has to resolve to one GetUserId() -- or hold CAP_KILL.
+  kSignal = 1,
+  // One FUTEX_WAKE on the channel's next_queue_index per send; watchers wait
+  // on that word through their Aio (a ThreadSignalReceiver of this kind
+  // carries the words).  Nothing in it is about users, so processes of
+  // different users can share the queue.  Linux 6.7 and later only.
+  kFutex = 2,
+};
+
 // Sends a wakeup to a specific thread in a (possibly different) process.
 class ThreadSignalSender {
  public:
@@ -73,20 +92,37 @@ class ThreadSignalSender {
 
 // The receiving half of the thread wakeup mechanism.
 //
-// This wraps the platform primitive used to receive kWakeupSignal (a signalfd
-// on Linux, an ignored signal + kqueue EVFILT_SIGNAL on macOS, a named Event on
-// Windows) and exposes it to the event loop, so callers can watch it with their
-// event loop (e.g. via Aio::RegisterThreadSignalReceiver).  It replaces the old
-// separate SignalFd class -- if raw signalfd-of-arbitrary-signals behavior is
-// ever needed again, add a dedicated (Linux-only) class for it rather than
-// generalizing this one.
+// For WakeupKind::kSignal this wraps the platform primitive used to receive
+// kWakeupSignal (a signalfd on Linux, an ignored signal + kqueue EVFILT_SIGNAL
+// on macOS, a named Event on Windows) and exposes it to the event loop, so
+// callers can watch it with their event loop (e.g. via
+// Aio::RegisterThreadSignalReceiver).  It replaces the old separate SignalFd
+// class -- if raw signalfd-of-arbitrary-signals behavior is ever needed again,
+// add a dedicated (Linux-only) class for it rather than generalizing this one.
+//
+// For WakeupKind::kFutex (Linux only) it owns no kernel object at all.  It
+// carries the words the owner's watchers are woken through (AddWakeupWord(),
+// one per channel), and the Aio it is registered with does the waiting: it
+// arms a futex wait on every word at registration and re-arms whichever
+// completed on ConsumeThreadSignalReceiver().  Same registration, same
+// callback, same consume-then-scan shape as the signal kind; only what the
+// Aio waits on differs.
 class ThreadSignalReceiver {
  public:
-  ThreadSignalReceiver();
+  explicit ThreadSignalReceiver(WakeupKind kind = WakeupKind::kSignal);
   ~ThreadSignalReceiver();
 
   ThreadSignalReceiver(const ThreadSignalReceiver &) = delete;
   ThreadSignalReceiver &operator=(const ThreadSignalReceiver &) = delete;
+
+  WakeupKind kind() const { return kind_; }
+
+  // kFutex only, before registration with an Aio: adds a word for the Aio to
+  // wait on.  The word must stay mapped for as long as this is registered.
+  void AddWakeupWord(std::atomic<uint32_t> *word);
+  const std::vector<std::atomic<uint32_t> *> &wakeup_words() const {
+    return wakeup_words_;
+  }
 
 #ifdef _WIN32
   // The Event which ThreadSignalSender::Signal() signals.  Windows has no
@@ -98,6 +134,8 @@ class ThreadSignalReceiver {
   // the receiver with an fd (macOS).
   int fd() const { return -1; }
 #else
+  // The signalfd's file descriptor for a kSignal receiver; -1 for a kFutex
+  // one, which has no descriptor of its own.
   int fd() const { return fd_; }
 #endif
 
@@ -144,6 +182,10 @@ class ThreadSignalReceiver {
   // blocked before we got here, or if LeaveSignalBlocked() was called.
   bool should_unblock_ = true;
 #endif
+
+  const WakeupKind kind_;
+  // kFutex only; see AddWakeupWord().
+  std::vector<std::atomic<uint32_t> *> wakeup_words_;
 };
 
 }  // namespace aos::ipc_lib

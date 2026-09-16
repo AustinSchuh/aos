@@ -1,6 +1,7 @@
 #ifndef AOS_EVENTS_AIO_INTERNAL_H_
 #define AOS_EVENTS_AIO_INTERNAL_H_
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <span>
@@ -375,6 +376,55 @@ struct Aio::Impl {
   virtual void ConsumeThreadSignalReceiver(
       ipc_lib::ThreadSignalReceiver *receiver) = 0;
 };
+
+namespace internal {
+
+// How a backend holds the futex waits of one futex-kind
+// ThreadSignalReceiver.
+//
+// A FutexWaitGroup holds the receiver's callback, and is made when the
+// receiver registers.  A FutexWaiter holds one of the receiver's 32-bit
+// wakeup words (ThreadSignalReceiver::AddWakeupWord()), and the group holds
+// one waiter per word.
+//
+// A FutexWaiter is armed with the value its word holds at the time and waits
+// for the word to change -- because a FUTEX_WAKE arrived, or because the word
+// already differed when the wait was armed.  The backend disarms a waiter
+// whose wait completed and runs the group's callback once in that Poll(),
+// however many of the group's waiters completed.
+// Aio::ConsumeThreadSignalReceiver() re-arms the disarmed waiters with their
+// words' current values, which is how it consumes delivered wakeups: a change
+// that lands after the re-arm completes the new wait, and one that landed
+// before it is what the owner's following scan finds.
+class FutexWaitGroup {
+ public:
+  explicit FutexWaitGroup(std::function<void()> callback)
+      : callback_(std::move(callback)) {}
+  virtual ~FutexWaitGroup() = default;
+
+ protected:
+  std::function<void()> callback_;
+};
+
+class FutexWaiter {
+ public:
+  FutexWaiter(FutexWaitGroup *group, std::atomic<uint32_t> *word)
+      : group_(group), word_(word) {}
+  virtual ~FutexWaiter() = default;
+
+  bool armed() const { return armed_; }
+  std::atomic<uint32_t> *word() const { return word_; }
+
+ protected:
+  FutexWaitGroup *const group_;
+  std::atomic<uint32_t> *const word_;
+  bool armed_ = false;
+  // The value the current or last wait was armed with, so a backend that
+  // rebuilds its kernel state (fork, ring rebuild) can re-arm it.
+  uint32_t expected_ = 0;
+};
+
+}  // namespace internal
 
 }  // namespace aos
 

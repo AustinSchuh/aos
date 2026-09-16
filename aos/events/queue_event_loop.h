@@ -352,7 +352,9 @@ class QueueEventLoop : public EventLoop {
   // The Aio actually in use, owned or borrowed.  Never null.
   Aio *const aio_;
 
-  // Only set during Run().
+  // The wakeup, live from Startup() to Shutdown() and null with no watchers.
+  // Its kind is the kind of the queues this loop watches
+  // (ipc_lib::WakeupKind): a signalfd, or one futex word per watcher.
   std::unique_ptr<ipc_lib::ThreadSignalReceiver> signal_receiver_;
 
   // Calls to Exit() are guaranteed to be thread-safe, so the exit_status_mutex_

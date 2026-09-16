@@ -70,18 +70,26 @@ class MemoryEstimationTest : public ::testing::Test {
 TEST_F(MemoryEstimationTest, TotalMemoryUsage) {
   // Just hard-code these; we want to be able to visually check that they look
   // sane, and they can be updated when needed.
+  //
+  // The header's wakeup_kind (v9) pushed LocklessQueueMemory::data from
+  // offset 80 to 84, which rounds up to the data alignment: 16 more bytes
+  // per channel where max_align_t is 16 (Linux), 8 where it is 8 (the MSVC
+  // ABI, and Apple arm64, where long double is double).  node1 has three
+  // channels, node2 one.
 #ifdef _WIN32
-  EXPECT_EQ(110000120720, TotalSharedMemoryUsage(config_, node1_));
+  EXPECT_EQ(110000120744, TotalSharedMemoryUsage(config_, node1_));
 #elif defined(__APPLE__)
-  EXPECT_EQ(110000121680, TotalSharedMemoryUsage(config_, node1_));
+  EXPECT_EQ(110000121704, TotalSharedMemoryUsage(config_, node1_));
 #else
-  EXPECT_EQ(110000121200, TotalSharedMemoryUsage(config_, node1_));
+  EXPECT_EQ(110000121248, TotalSharedMemoryUsage(config_, node1_));
 #endif
 
 #ifdef __APPLE__
-  EXPECT_EQ(65440, TotalSharedMemoryUsage(config_, node2_));
+  EXPECT_EQ(65448, TotalSharedMemoryUsage(config_, node2_));
+#elif defined(_WIN32)
+  EXPECT_EQ(65128, TotalSharedMemoryUsage(config_, node2_));
 #else
-  EXPECT_EQ(65120, TotalSharedMemoryUsage(config_, node2_));
+  EXPECT_EQ(65136, TotalSharedMemoryUsage(config_, node2_));
 #endif
 }
 

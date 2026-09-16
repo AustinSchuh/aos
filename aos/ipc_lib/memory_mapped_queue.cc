@@ -20,7 +20,11 @@ std::string ShmFolder(std::string_view shm_base, const Channel *channel) {
 
 std::string ShmPath(std::string_view shm_base, const Channel *channel) {
   ABSL_CHECK(channel->has_type());
-  return ShmFolder(shm_base, channel) + channel->type()->str() + ".v8";
+  // The suffix is the queue memory layout's version.  Bump it with every
+  // change to LocklessQueueMemory, so an old binary and a new one on the same
+  // --shm_base never map each other's files: they each see no file, not a
+  // file whose header means something else.  v9 added wakeup_kind.
+  return ShmFolder(shm_base, channel) + channel->type()->str() + ".v9";
 }
 
 LocklessQueueConfiguration MakeQueueConfiguration(

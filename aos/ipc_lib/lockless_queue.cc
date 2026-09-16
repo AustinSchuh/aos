@@ -21,6 +21,43 @@
 #include "aos/ipc_lib/thread_signal.h"
 #include "aos/util/compiler_memory_barrier.h"
 
+#ifdef __linux__
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <climits>
+
+#include "aos/util/proc_stat.h"
+#endif
+
+#ifndef AOS_QUEUE_WAKEUP_DEFAULT
+#error \
+    "AOS_QUEUE_WAKEUP_DEFAULT must be set by //aos/ipc_lib:lockless_queue's local_defines."
+#endif
+
+// The default is compiled in (//aos/ipc_lib:lockless_queue's local_defines)
+// rather than probed: there is no runtime fallback, and "futex" on a kernel
+// without io_uring's futex operations is a loud failure when the first
+// watcher registers.  It is "signal" everywhere for now -- the kind a
+// deployment gets should not change just because it was built for a newer
+// kernel, and the futex kind stays opt-in until it has real-world mileage.
+ABSL_FLAG(std::string, queue_wakeup, AOS_QUEUE_WAKEUP_DEFAULT,
+          "How senders wake watchers: \"futex\" (a futex wait on the "
+          "channel's queue index through io_uring; works across users; Linux "
+          ">= 6.7) or \"signal\" (a realtime signal per watcher; every process "
+          "on a queue must share one uid).  Recorded in each queue the first "
+          "time it is initialized; every process on a queue must use the same "
+          "kind.");
+
+ABSL_FLAG(bool, skip_queue_uid_check, false,
+          "Skip the check that every process on a signal-wakeup queue resolves "
+          "to the same uid.  The check is only an early diagnostic for the "
+          "kernel's signal permission rule; a deployment that satisfies that "
+          "rule another way (CAP_KILL on the senders, the real-uid trick for "
+          "the other direction) can turn it off.  A send the kernel refuses "
+          "still dies loudly.");
+
 ABSL_FLAG(bool, dump_lockless_queue_data, false,
           "If true, print the data out when dumping the queue.");
 ABSL_DECLARE_FLAG(bool, skip_realtime_scheduler);
@@ -594,13 +631,87 @@ void FillRedzone(LocklessQueueMemory *memory, absl::Span<char> redzone) {
   ABSL_CHECK(!CheckRedzone(memory, redzone));
 }
 
+WakeupKind DefaultWakeupKind() {
+  const std::string kind = absl::GetFlag(FLAGS_queue_wakeup);
+  if (kind == "futex") {
+#ifdef __linux__
+    return WakeupKind::kFutex;
+#else
+    ABSL_LOG(FATAL) << "--queue_wakeup=futex is only available on Linux; this "
+                       "platform wakes watchers with signals.";
+#endif
+  }
+  if (kind == "signal") {
+    return WakeupKind::kSignal;
+  }
+  ABSL_LOG(FATAL) << "Unknown --queue_wakeup=" << kind
+                  << "; expected \"futex\" or \"signal\".";
+}
+
+namespace {
+
+const char *WakeupKindName(uint32_t kind) {
+  switch (static_cast<WakeupKind>(kind)) {
+    case WakeupKind::kSignal:
+      return "signal";
+    case WakeupKind::kFutex:
+      return "futex";
+  }
+  return "unknown";
+}
+
+#ifdef __linux__
+// Wakes every waiter on the futex word at *word, leaving the word alone.
+// FUTEX_WAKE needs only read access to the page, so this works through the
+// read-only mapping a LocklessQueueWakeUpper holds, and the kernel wakes
+// waiters in priority order.
+int FutexWakeAll(const std::atomic<uint32_t> *word) {
+  const long woken =
+      syscall(SYS_futex, word, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
+  ABSL_PCHECK(woken >= 0) << ": FUTEX_WAKE(" << word << ") failed";
+  return static_cast<int>(woken);
+}
+
+// Whether /proc hides other users' processes (mounted with hidepid).  A
+// kFutex queue's death detection reads /proc/<pid>/task/<tid>/stat for
+// watchers that may belong to other users, and a hidden entry is
+// indistinguishable from a dead one -- so it would reclaim a live watcher's
+// slot.  Checked once; /proc's mount options do not change under a running
+// process in any way worth polling for.
+bool ProcHidesPids() {
+  static const bool hides = aos::util::ProcHidesPids();
+  return hides;
+}
+#endif
+
+}  // namespace
+
 LocklessQueueMemory *InitializeLocklessQueueMemory(
     LocklessQueueMemory *memory, LocklessQueueConfiguration config) {
   // Everything should be zero initialized already.  So we just need to fill
   // everything out properly.
 
+  // How this process wakes watchers, and expects to be woken.  The first
+  // process to initialize a queue records it, every later one has to match:
+  // a futex-kind sender's FUTEX_WAKE reaches no signal-kind watcher, and
+  // vice versa, so mixing them would be a queue whose watchers silently
+  // never wake.
+  const WakeupKind wakeup_kind = DefaultWakeupKind();
+#ifdef __linux__
+  if (wakeup_kind == WakeupKind::kFutex) {
+    ABSL_CHECK(!ProcHidesPids())
+        << ": /proc is mounted with hidepid, which hides other users' "
+           "processes.  A futex-wakeup queue's death detection would then "
+           "mistake a live watcher of another user for a dead one and reclaim "
+           "its slot.  Remount /proc without hidepid, or use "
+           "--queue_wakeup=signal (single-user).";
+  }
+#endif
+
   // This is the UID we will use for checking signal-sending permission
-  // compatibility.
+  // compatibility on a kSignal queue.  A kFutex queue records it too, for
+  // the print tool, but never checks it: a FUTEX_WAKE has no permission rule
+  // beyond being able to map the page.
   //
   // The manpage says:
   //   For a process to have permission to send a signal, it must either be
@@ -673,6 +784,7 @@ LocklessQueueMemory *InitializeLocklessQueueMemory(
 
     memory->next_queue_index.Invalidate();
     memory->uid = uid;
+    memory->wakeup_kind = static_cast<uint32_t>(wakeup_kind);
 
     for (size_t i = 0; i < memory->num_senders(); ++i) {
       ::aos::ipc_lib::Sender *s = memory->GetSender(i);
@@ -698,7 +810,21 @@ LocklessQueueMemory *InitializeLocklessQueueMemory(
     // redo initialization.
     memory->initialized = true;
   } else {
-    if (memory->uid != uid) {
+    if (memory->wakeup_kind != static_cast<uint32_t>(wakeup_kind)) {
+      ABSL_LOG(FATAL) << "This process wakes watchers with --queue_wakeup="
+                      << WakeupKindName(static_cast<uint32_t>(wakeup_kind))
+                      << ", but the shared memory queue was initialized by a "
+                         "process using "
+                      << WakeupKindName(memory->wakeup_kind)
+                      << ".  The two cannot share a queue; run every process "
+                         "on this --shm_base with the same --queue_wakeup, or "
+                         "purge the queues.";
+    }
+    // The signal permission rule is the kernel's, checked at every send;
+    // this is only the readable version of it, at attach time.  A futex
+    // wake has no such rule.
+    if (wakeup_kind == WakeupKind::kSignal &&
+        !absl::GetFlag(FLAGS_skip_queue_uid_check) && memory->uid != uid) {
       const std::string user_username =
           aos::GetUsername(uid).value_or(std::to_string(uid));
       const std::string memory_username =
@@ -708,11 +834,22 @@ LocklessQueueMemory *InitializeLocklessQueueMemory(
                       << "doesn't match shared memory user " << memory_username
                       << " (uid:" << memory->uid << "). "
                       << "Log in as " << memory_username
-                      << " user to access this channel.";
+                      << " user to access this channel, use "
+                         "--queue_wakeup=futex on every process, or pass "
+                         "--skip_queue_uid_check if the deployment satisfies "
+                         "the kernel's signal permission rule some other way.";
     }
   }
 
   return memory;
+}
+
+WakeupKind LocklessQueue::wakeup_kind() const {
+  return static_cast<WakeupKind>(const_memory_->wakeup_kind);
+}
+
+std::atomic<uint32_t> *LocklessQueue::wakeup_word() {
+  return memory_->next_queue_index.storage();
 }
 
 void LocklessQueue::Initialize() {
@@ -815,6 +952,23 @@ LocklessQueueWakeUpper::LocklessQueueWakeUpper(LocklessQueue queue)
 }
 
 int LocklessQueueWakeUpper::Wakeup(const int current_priority) {
+  if (memory_->wakeup_kind == static_cast<uint32_t>(WakeupKind::kFutex)) {
+#ifdef __linux__
+    // The message is published and next_queue_index has moved past it (both
+    // done by Send() before this is called), so a watcher that loaded the old
+    // value either fails its arm with -EAGAIN or is sitting in the kernel
+    // waiting for exactly this.  One syscall, unconditionally: a wake with
+    // nobody waiting is cheap, and the kernel wakes every waiter in priority
+    // order from this one call, so there is no watcher-by-watcher gap for a
+    // priority inversion to open in and nothing to boost.  Neither the
+    // Watcher slots nor current_priority are consulted.
+    return FutexWakeAll(
+        const_cast<LocklessQueueMemory *>(memory_)->next_queue_index.storage());
+#else
+    ABSL_LOG(FATAL) << "Futex wakeups are only available on Linux";
+#endif
+  }
+
   const size_t num_watchers = memory_->num_watchers();
 
   ABSL_CHECK_EQ(watcher_copy_.size(), num_watchers);

@@ -75,7 +75,10 @@ void WakeupEventName(pid_t pid, pid_t tid, char *name, size_t size) {
 
 }  // namespace
 
-ThreadSignalReceiver::ThreadSignalReceiver() {
+ThreadSignalReceiver::ThreadSignalReceiver(WakeupKind kind) : kind_(kind) {
+  // Futex wakeups are Linux-only; every queue here is of the signal kind.
+  ABSL_CHECK(kind_ == WakeupKind::kSignal)
+      << ": Only signal-kind ThreadSignalReceivers exist on this platform";
   char name[64];
   WakeupEventName(GetCurrentProcessId(), GetCurrentThreadId(), name,
                   sizeof(name));

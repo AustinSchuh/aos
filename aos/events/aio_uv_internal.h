@@ -11,6 +11,7 @@
 
 #include "aos/events/aio.h"
 #include "aos/events/aio_internal.h"
+#include "aos/events/futex_wait_ring.h"
 #include "aos/ipc_lib/thread_signal.h"
 
 // The seam between the two halves of the libuv backend.
@@ -217,6 +218,15 @@ class UvPlatform {
                                 std::function<void()> callback) = 0;
   virtual void UnregisterReceiver(ipc_lib::ThreadSignalReceiver *receiver) = 0;
   virtual void ConsumeReceiver(ipc_lib::ThreadSignalReceiver *receiver) = 0;
+
+  // The futex wakeup (a futex-kind ThreadSignalReceiver), on the platforms
+  // that have one: Linux, where a small io_uring holds the waits and its fd
+  // is just another descriptor libuv polls.  Null where there is no futex to
+  // wait on; the core dies with a message if such a receiver is registered
+  // there.
+  virtual std::unique_ptr<internal::FutexWaitGroups> MakeFutexWaitGroups() {
+    return nullptr;
+  }
 };
 
 std::unique_ptr<UvPlatform> MakeUvPlatform(UvCore *core);

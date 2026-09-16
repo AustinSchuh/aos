@@ -141,7 +141,7 @@ Doing so exposed two translations that were already wrong on their own terms: `E
 
 - `//aos/events:timer_queue_test` covers the queue with no kqueue in the way: ordering, FIFO among ties, insert/remove from every position, a randomized cross-check against `std::stable_sort` on the same key, and 20000 interleaved inserts and removes against a queue kept deep enough to reach the delete fixup's harder branches.
 - Because in-order traversal is correct even when the tree is badly shaped, that test validates the **tree**, not just the order: parent links, search order, no red node with a red child, and equal black heights on every path, re-checked after every single operation. The checker was itself checked, by confirming it fails when the root is left red, when a new node is coloured black, and when a recolour is skipped.
-- `//aos/events:aio_test` covers the contract across backends, including `OneCompletionPerPollTest` as the control that pins down the window the same-batch tests rely on.
+- The `//aos/events:aio_test_*` targets cover the contract across backends, including `OneCompletionPerPollTest` as the control that pins down the window the same-batch tests rely on.
 - kqueue's stack ordering, its `EVFILT_READ`-nestability, and the non-inheritance of a kqueue fd across `fork(2)` were each established with a standalone probe before any code was written against them, rather than inferred from documentation.
 
 ## Lessons learned

@@ -47,7 +47,17 @@ LocklessQueueTest::LocklessQueueTest() {
 
 void LocklessQueueTest::RunUntilWakeup(Event *ready, int priority) {
   Aio aio;
-  ThreadSignalReceiver signalfd;
+  queue().Initialize();
+
+  // A receiver of the queue's kind.  For the futex kind that is one wait on
+  // the queue's word, armed at registration with its current value.  Nobody
+  // sends a message in this test, so the word never moves and only the
+  // sender's FUTEX_WAKE can end the wait -- which is what makes Wakeup()'s
+  // return value count the waiters.
+  ThreadSignalReceiver signalfd(queue().wakeup_kind());
+  if (queue().wakeup_kind() == WakeupKind::kFutex) {
+    signalfd.AddWakeupWord(queue().wakeup_word());
+  }
 
   aio.RegisterThreadSignalReceiver(&signalfd, [&aio]() {
     fprintf(stderr, "Got signal\n");
@@ -58,6 +68,11 @@ void LocklessQueueTest::RunUntilWakeup(Event *ready, int priority) {
     // Register to be woken up *after* the signalfd is catching the signals.
     LocklessQueueWatcher watcher =
         LocklessQueueWatcher::Make(queue(), priority).value();
+
+    // A non-blocking Poll() flushes a futex-kind receiver's arm to the
+    // kernel, which queues the wait inline.  Only then is a wake guaranteed
+    // to find it.
+    aio.Poll(false);
 
     // And signal we are now ready.
     ready->Set();

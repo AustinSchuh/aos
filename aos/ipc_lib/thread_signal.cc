@@ -34,3 +34,14 @@ void UnbindReceiverFromThread(const void *receiver) {
 }
 
 }  // namespace aos::ipc_lib::internal
+
+namespace aos::ipc_lib {
+
+void ThreadSignalReceiver::AddWakeupWord(std::atomic<uint32_t> *word) {
+  ABSL_CHECK(kind_ == WakeupKind::kFutex)
+      << ": Only a futex-kind ThreadSignalReceiver carries wakeup words";
+  ABSL_CHECK(word != nullptr);
+  wakeup_words_.push_back(word);
+}
+
+}  // namespace aos::ipc_lib

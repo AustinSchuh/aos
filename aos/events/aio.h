@@ -472,6 +472,12 @@ class Aio {
   // during (or after) a callback always produces another callback on a
   // later Poll(); a consumed wakeup is never the one that got away.
   //
+  // A receiver of ipc_lib::WakeupKind::kFutex gets that same contract,
+  // coalescing and ordering both, through a different kernel object.
+  // Registering one where it cannot be carried is fatal rather than quiet.
+  // See internal::FutexWaitGroups and
+  // documentation/adr/0006-multi-user-futex-wakeup.md.
+  //
   // Lifetime: the receiver must stay valid while registered.  Once
   // UnregisterThreadSignalReceiver() returns, the Aio never touches the
   // receiver again -- the caller may destroy it immediately, and a new
@@ -482,8 +488,10 @@ class Aio {
                                     std::function<void()> callback);
   void UnregisterThreadSignalReceiver(ipc_lib::ThreadSignalReceiver *receiver);
 
-  // Consumes/drains all pending signals for the registered
-  // ThreadSignalReceiver.
+  // Consumes every wakeup already delivered to the registered
+  // ThreadSignalReceiver, so that anything arriving from here on produces
+  // another callback.  The owner calls this before it scans its sources,
+  // which is what makes the ordering above hold.  RT-safe.
   void ConsumeThreadSignalReceiver(ipc_lib::ThreadSignalReceiver *receiver);
 
  protected:

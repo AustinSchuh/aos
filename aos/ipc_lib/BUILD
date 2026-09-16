@@ -271,6 +271,16 @@ cc_library(
                 "robust_ownership_tracker.h",
             ],
             defines = ["AOS_IPC_LIB_LOCKLESS_QUEUE_HAS_ATOMIC_TIME_POINT"] if suffix != "_no_atomic_times" else [],
+            # Signals everywhere, for now: the futex kind is opt-in until it
+            # has real-world mileage, so nothing changes wakeup mechanism
+            # just by being built for a newer kernel.  Still compiled in
+            # rather than probed -- there is no runtime fallback -- so making
+            # it the platform's choice again is a select() on
+            # //tools/platforms/io_uring:has_support, the way
+            # --aio_backend's default is.
+            local_defines = [
+                "AOS_QUEUE_WAKEUP_DEFAULT=\\\"signal\\\"",
+            ],
             deps = [
                 ":aos_sync",
                 ":data_alignment",

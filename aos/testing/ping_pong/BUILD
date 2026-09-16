@@ -170,6 +170,63 @@ cc_library(
     ],
 )
 
+# The ping and pong programs themselves, for running the pair as two
+# processes -- the shape the ADR 0006 benchmark measures.  ping prints the
+# round-trip distribution when it stops.
+cc_binary(
+    name = "ping",
+    srcs = ["ping.cc"],
+    data = [":pingpong_config"],
+    deps = [
+        ":ping_lib",
+        "//aos:configuration",
+        "//aos:init",
+        "//aos/events:shm_event_loop",
+        "@com_google_absl//absl/flags:flag",
+    ],
+)
+
+cc_binary(
+    name = "pong",
+    srcs = ["pong.cc"],
+    data = [":pingpong_config"],
+    deps = [
+        ":ping_fbs",
+        ":pong_fbs",
+        ":pong_lib",
+        "//aos:configuration",
+        "//aos:init",
+        "//aos/events:shm_event_loop",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
+# The same two programs as guests on a libuv loop they own and drive, for an
+# application that already has one.  Also the ADR 0006 benchmark's libuv rows.
+[
+    cc_binary(
+        name = name + "_uv",
+        srcs = [name + "_uv.cc"],
+        data = [":pingpong_config"],
+        deps = [
+            ":" + name + "_lib",
+            "//aos:configuration",
+            "//aos:init",
+            "//aos/events:aio_uv",
+            "//aos/events:shm_event_loop",
+            "@com_google_absl//absl/flags:flag",
+            "@com_google_absl//absl/log:absl_check",
+            "@libuv",
+        ],
+    )
+    for name in [
+        "ping",
+        "pong",
+    ]
+]
+
 cc_test(
     name = "pingpong_test",
     srcs = ["pingpong_test.cc"],
@@ -185,5 +242,26 @@ cc_test(
         "//aos/events:simulated_event_loop",
         "//aos/testing:googletest",
         "//aos/testing:path",
+    ],
+)
+
+# Skips itself unless run as root; see the file.
+cc_test(
+    name = "multi_user_pingpong_test",
+    srcs = ["multi_user_pingpong_test.cc"],
+    data = [":pingpong_config"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":ping_lib",
+        ":pong_lib",
+        "//aos:configuration",
+        "//aos:flatbuffers",
+        "//aos/events:shm_event_loop",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing:tmpdir",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )

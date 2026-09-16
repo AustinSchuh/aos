@@ -18,6 +18,8 @@
 #else
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+
+#include "aos/events/futex_wait_ring.h"
 #endif
 
 #include <algorithm>
@@ -381,6 +383,19 @@ class PosixPlatform : public UvPlatform {
     }
     DrainWakeupFd(wakeup_fd_);
   }
+
+#if !defined(__APPLE__)
+  // A futex wait ring's fd is a descriptor like the others here, and the
+  // core polls it the same way.  macOS has no futex to wait on and keeps the
+  // base's null.
+  std::unique_ptr<internal::FutexWaitGroups> MakeFutexWaitGroups() override {
+    return std::make_unique<internal::FutexWaitGroups>(
+        [this](FileDescriptor fd, std::function<void()> callback) {
+          core_->OnReadable(fd, std::move(callback));
+        },
+        [this](FileDescriptor fd) { core_->DeleteFd(fd); });
+  }
+#endif
 
  private:
   UvCore *const core_;

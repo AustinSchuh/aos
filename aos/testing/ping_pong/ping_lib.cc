@@ -1,5 +1,7 @@
 #include "aos/testing/ping_pong/ping_lib.h"
 
+#include <algorithm>
+
 #include "absl/flags/flag.h"
 #include "absl/log/absl_log.h"
 #include "absl/log/absl_vlog_is_on.h"
@@ -18,6 +20,7 @@ namespace chrono = std::chrono;
 Ping::Ping(EventLoop *event_loop, std::string_view channel_name)
     : event_loop_(event_loop),
       sender_(event_loop_->MakeSender<examples::PingStatic>(channel_name)) {
+  round_trips_.reserve(kMaxRecordedRoundTrips);
   timer_handle_ = event_loop_->AddTimer([this]() { SendPing(); });
   timer_handle_->set_name("ping");
 
@@ -58,6 +61,11 @@ void Ping::HandlePong(const examples::Pong &pong) {
 
   const chrono::nanoseconds round_trip_time =
       monotonic_now - monotonic_send_time;
+  // Within the reserved capacity, so this never allocates on the RT loop.
+  if (round_trips_.size() < round_trips_.capacity()) {
+    round_trips_.push_back(round_trip_time);
+  }
+  ++pongs_received_;
 
   if (last_pong_value_ + 1 != pong.value() && (!quiet_ || ABSL_VLOG_IS_ON(1))) {
     ABSL_LOG(WARNING) << "Unexpected pong value, wanted "
@@ -74,6 +82,23 @@ void Ping::HandlePong(const examples::Pong &pong) {
   }
 
   last_pong_value_ = pong.value();
+}
+
+void Ping::LogRoundTripStatistics() const {
+  if (round_trips_.empty()) {
+    ABSL_LOG(INFO) << "No pongs received";
+    return;
+  }
+  std::vector<chrono::nanoseconds> sorted = round_trips_;
+  std::sort(sorted.begin(), sorted.end());
+  const auto at = [&sorted](double fraction) {
+    const size_t index = std::min(
+        sorted.size() - 1, static_cast<size_t>(fraction * sorted.size()));
+    return sorted[index].count();
+  };
+  ABSL_LOG(INFO) << "Round trips: " << sorted.size() << " recorded, median "
+                 << at(0.5) << " ns, p90 " << at(0.9) << " ns, p99 " << at(0.99)
+                 << " ns, max " << sorted.back().count() << " ns";
 }
 
 }  // namespace aos

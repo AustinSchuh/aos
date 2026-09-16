@@ -27,6 +27,9 @@
 
 namespace aos::ipc_lib {
 
+// The kind a queue gets when it is first initialized, from --queue_wakeup.
+WakeupKind DefaultWakeupKind();
+
 // Structure to hold the state required to wake a watcher.
 struct Watcher {
   // Mutex that the watcher locks.  If the futex is 0 (or FUTEX_OWNER_DIED),
@@ -295,6 +298,18 @@ class LocklessQueue {
   const LocklessQueueMemory *const_memory() { return const_memory_; }
   LocklessQueueMemory *memory() { return memory_; }
 
+  // The wakeup mechanism recorded in this queue's memory.  Only meaningful
+  // after Initialize().
+  WakeupKind wakeup_kind() const;
+
+  // The word a watcher of a kFutex queue waits on: the raw storage of
+  // next_queue_index.  It changes once per send, after the message is
+  // visible, which is exactly what a futex protocol needs.  A waiter loads it,
+  // scans the queue, then arms a wait with the loaded value; the kernel only
+  // ever compares it for equality, so QueueIndex's wrapping never reaches the
+  // futex.  Valid for as long as the queue memory is.
+  std::atomic<uint32_t> *wakeup_word();
+
  private:
   const LocklessQueueMemory *const_memory_;
   LocklessQueueMemory *memory_;
@@ -320,9 +335,11 @@ class LocklessQueueWatcher {
 
   ~LocklessQueueWatcher();
 
-  // Registers this thread to receive the kWakeupSignal signal when
-  // LocklessQueueWakeUpper::Wakeup is called. Returns nullopt if there was an
-  // error in registration.
+  // Claims a watcher slot for this thread.  On a kSignal queue that is what
+  // makes LocklessQueueWakeUpper::Wakeup() send it kWakeupSignal; on a kFutex
+  // queue the slot is bookkeeping only, and the waiting itself is an
+  // Aio::FutexWaiter on the queue's wakeup_word().  Returns nullopt if there
+  // was an error in registration.
   // TODO(austin): Change the API if we find ourselves with more errors.
   static std::optional<LocklessQueueWatcher> Make(LocklessQueue queue,
                                                   int priority);
@@ -343,10 +360,16 @@ class LocklessQueueWakeUpper {
  public:
   LocklessQueueWakeUpper(LocklessQueue queue);
 
-  // Sends the kWakeupSignal to all threads which have called RegisterWakeup.
+  // Wakes every watcher of the queue.
   //
-  // priority of 0 means nonrt.  nonrt could have issues, so we don't PI boost
-  // if nonrt.
+  // On a kFutex queue this is one FUTEX_WAKE on next_queue_index, which wakes
+  // every waiter in priority order in one syscall; it returns the number the
+  // kernel woke.  current_priority is unused there: with one syscall there is
+  // no gap between two watchers' wakeups for a priority inversion to open in.
+  //
+  // On a kSignal queue this sends kWakeupSignal to every registered watcher,
+  // highest priority first, and returns how many it signaled.  priority of 0
+  // means nonrt.  nonrt could have issues, so we don't PI boost if nonrt.
   int Wakeup(int current_priority);
 
  private:

@@ -57,8 +57,15 @@ bool MkdirPIfSpace(std::string_view path, std::filesystem::perms mode,
 
   if (std::filesystem::create_directory(folder, ec)) {
     ABSL_VLOG(1) << "Created " << folder;
-    std::filesystem::permissions(folder,
-                                 static_cast<std::filesystem::perms>(mode), ec);
+    // A directory created under a setgid parent inherits the setgid bit, and
+    // with it the group every file created inside it gets.  Keep that bit
+    // when applying the requested mode: it is what keeps a group-shared tree
+    // (a multi-user --shm_base) group-shared below its top level.
+    const std::filesystem::perms inherited =
+        std::filesystem::status(folder, ec).permissions() &
+        std::filesystem::perms::set_gid;
+    std::filesystem::permissions(
+        folder, static_cast<std::filesystem::perms>(mode) | inherited, ec);
     if (ec) {
       ABSL_LOG(FATAL) << "Error setting permissions on " << folder << ": "
                       << ec.message();

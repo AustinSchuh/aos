@@ -492,6 +492,17 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "proc_stat_test",
+    size = "small",
+    srcs = ["proc_stat_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":proc_stat",
+        "//aos/testing:googletest",
+    ],
+)
+
 cc_library(
     name = "top",
     srcs = ["top.cc"],

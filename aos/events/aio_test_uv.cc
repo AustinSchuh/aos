@@ -8,6 +8,7 @@
 #include <uv.h>
 
 #include <memory>
+#include <vector>
 
 #include "absl/log/absl_check.h"
 #include "gtest/gtest.h"
@@ -93,20 +94,36 @@ std::unique_ptr<TestAioDriver> MakeUv() {
 
 }  // namespace
 
-INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest,
-                         ::testing::Values(AioBackend{
-                             .name = "uv",
-                             .make = &MakeUv,
-                             // A borrowed loop is somebody else's to
-                             // drive, to rebuild after fork(), and to
-                             // bound the lifetime of.
-                             .drives_its_own_loop = false,
-                             .survives_fork = false,
-                             .checks_teardown = false,
-                             .selected_by_flag = false}),
+const AioBackend kUvBackend{.name = "uv",
+                            .make = &MakeUv,
+                            // A borrowed loop is somebody else's to
+                            // drive, to rebuild after fork(), and to
+                            // bound the lifetime of.
+                            .drives_its_own_loop = false,
+                            .survives_fork = false,
+                            .checks_teardown = false,
+                            .selected_by_flag = false};
+
+INSTANTIATE_TEST_SUITE_P(AioBackends, AioTest, ::testing::Values(kUvBackend),
                          &BackendTestName);
+
+std::vector<AioReceiverParam> ReceiverParams() {
+  std::vector<AioReceiverParam> result;
+  result.push_back(AioReceiverParam{.backend = kUvBackend,
+                                    .kind = ipc_lib::WakeupKind::kSignal});
+#if defined(__linux__)
+  result.push_back(AioReceiverParam{.backend = kUvBackend,
+                                    .kind = ipc_lib::WakeupKind::kFutex});
+#endif
+  return result;
+}
+
+INSTANTIATE_TEST_SUITE_P(AioBackends, AioReceiverTest,
+                         ::testing::ValuesIn(ReceiverParams()),
+                         &ReceiverTestName);
 
 // io_uring's own contract, which this backend has nothing to do with.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(AioIoUringTest);
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(AioIoUringReceiverTest);
 
 }  // namespace aos::testing

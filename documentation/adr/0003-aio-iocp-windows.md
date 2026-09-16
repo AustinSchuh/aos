@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implemented in `aos/events/aio_windows.cc`, with `aos/events/pipe_windows.cc`, `aos/ipc_lib/thread_signal_windows.cc` and `aos/events/winsock_init.h` supplying what the platform lacks. `//aos/events:aio_test` runs against it with every case that does not need `fork(2)`, less one real gap recorded under Consequences; see Verification.
+Accepted. Implemented in `aos/events/aio_windows.cc`, with `aos/events/pipe_windows.cc`, `aos/ipc_lib/thread_signal_windows.cc` and `aos/events/winsock_init.h` supplying what the platform lacks. The `//aos/events:aio_test_*` targets run against it with every case that does not need `fork(2)`, less one real gap recorded under Consequences; see Verification.
 
 ## Context
 
@@ -185,7 +185,7 @@ None were visible from the shared tests until the suite ran on Windows — which
 
 ## Verification
 
-- `//aos/events:aio_test` on `iocp`, at the time of writing: 96 of 105 `TEST_P` cases instantiated, 91 pass, 5 skipped as io_uring-specific (as on epoll and kqueue), stable over 60 consecutive runs. Not instantiated: five that `fork(2)`, `RegularFileAsyncReadWriteTest`, one macOS-only case, and the Linux-only pair. Everything else is shared with the other three backends, which is the point: the contract is the test.
+- The `aio_test` suite on `iocp`, at the time of writing: 96 of 105 `TEST_P` cases instantiated, 91 pass, 5 skipped as io_uring-specific (as on epoll and kqueue), stable over 60 consecutive runs. Not instantiated: five that `fork(2)`, `RegularFileAsyncReadWriteTest`, one macOS-only case, and the Linux-only pair. Everything else is shared with the other three backends, which is the point: the contract is the test.
 - The permanent association, IOCP's support for regular files, auto- versus manual-reset under a kernel wait, wait-completion-packet semantics, high-resolution timer latency, and FIFO ordering among equal deadlines were each established by standalone probe before anything was written against them.
 - The thread-pool wait's use-after-free, before it was designed out, was confirmed by instrumentation: it presented as `EPollLikeBasicWritable/iocp` dying in about 7% of full-suite runs with `0xC0000005` and no gtest output, clean in isolation. Poisoning the wait context at teardown instead of freeing it, and aborting in the callback on the poison, fired on **40 of 40 runs** — the race was constant; only allocator reuse decided whether it crashed, which is why it surfaced in an unrelated later test.
 - `LegacyReadableSurvivesPollingPastHangup` was checked to fail without its fix: `Check failed: state.has_err_fn && state.err_fn … Received events = 0x8`.

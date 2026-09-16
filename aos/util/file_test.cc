@@ -367,3 +367,38 @@ TEST(FileTest, GetExecutablePath) {
 }
 
 }  // namespace aos::util::testing
+
+#ifndef _WIN32
+namespace aos::util::testing {
+
+// A directory MkdirP creates under a setgid parent keeps the setgid bit the
+// kernel gave it, so a group-shared tree stays group-shared below its top.
+TEST(FileTest, MkdirPKeepsInheritedSetgid) {
+  const std::string base = aos::testing::TestTmpDir() + "/setgid_base";
+  std::filesystem::remove_all(base);
+  ASSERT_TRUE(std::filesystem::create_directory(base));
+  ASSERT_EQ(chmod(base.c_str(), 02770), 0);
+  {
+    // chmod(2) silently drops the setgid bit for a caller that is not in
+    // the directory's group, which a sandbox with a mapped-away group can
+    // arrange.  Nothing to test then.
+    struct stat st;
+    ASSERT_EQ(stat(base.c_str(), &st), 0);
+    if ((st.st_mode & S_ISGID) == 0) {
+      GTEST_SKIP() << "cannot set the setgid bit on " << base << " here";
+    }
+  }
+
+  MkdirP(base + "/a/b/file",
+         std::filesystem::perms::owner_all | std::filesystem::perms::group_all);
+
+  for (const std::string &dir : {base + "/a", base + "/a/b"}) {
+    struct stat st;
+    ASSERT_EQ(stat(dir.c_str(), &st), 0) << dir;
+    EXPECT_EQ(st.st_mode & 07777, 02770u) << dir;
+  }
+  std::filesystem::remove_all(base);
+}
+
+}  // namespace aos::util::testing
+#endif  // !_WIN32

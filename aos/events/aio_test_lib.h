@@ -1,6 +1,7 @@
 #ifndef AOS_EVENTS_AIO_TEST_LIB_H_
 #define AOS_EVENTS_AIO_TEST_LIB_H_
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -126,6 +127,88 @@ class AioTest : public ::testing::TestWithParam<AioBackend> {
 // rather than a skip inside the portable one: these are not contracts other
 // backends fail to meet, they are a different contract.
 class AioIoUringTest : public AioTest {};
+
+// A backend, and the kind of ThreadSignalReceiver to hold it to.
+struct AioReceiverParam {
+  AioBackend backend;
+  ipc_lib::WakeupKind kind = ipc_lib::WakeupKind::kSignal;
+};
+
+std::string ReceiverTestName(
+    const ::testing::TestParamInfo<AioReceiverParam> &info);
+void PrintTo(const AioReceiverParam &param, std::ostream *os);
+
+// Everything Aio promises about a registered ThreadSignalReceiver, over both
+// kinds of one.
+//
+// A suite of its own rather than a second dimension on AioTest: the kind is
+// nothing to the hundred-odd tests that never register a receiver, and running
+// those twice would buy nothing.  What the kind changes is how a wakeup is
+// made, which TestReceiver below hides, so the bodies here are shared rather
+// than duplicated per kind -- the same choice AioBackend makes for backends.
+class AioReceiverTest : public ::testing::TestWithParam<AioReceiverParam> {
+ protected:
+  void SetUp() override;
+  void TearDown() override;
+
+  static const AioBackend &Backend() { return GetParam().backend; }
+  static std::string BackendName() { return GetParam().backend.name; }
+  static ipc_lib::WakeupKind Kind() { return GetParam().kind; }
+  static bool IsFutex() {
+    return GetParam().kind == ipc_lib::WakeupKind::kFutex;
+  }
+
+  absl::FlagSaver flag_saver_;
+  std::optional<std::string> saved_death_test_style_;
+};
+
+// io_uring's own receiver behavior, the way AioIoUringTest is to AioTest.
+class AioIoUringReceiverTest : public AioReceiverTest {};
+
+// A ThreadSignalReceiver of the kind the running test is parameterized on,
+// plus whatever waking one of that kind takes: the futex kind waits on a word,
+// which has to exist before registration and be bumped to wake it, and the
+// signal kind is aimed at a thread by id.
+//
+// Wake() is the seam.  A body says "wake this receiver" without saying how,
+// which is what lets one body hold both kinds to the same contract.
+class TestReceiver {
+ public:
+  // Uses the kind of the test currently running.
+  TestReceiver();
+  explicit TestReceiver(ipc_lib::WakeupKind kind);
+
+  TestReceiver(const TestReceiver &) = delete;
+  TestReceiver &operator=(const TestReceiver &) = delete;
+
+  ipc_lib::ThreadSignalReceiver *get() { return &receiver_; }
+  ipc_lib::ThreadSignalReceiver &operator*() { return receiver_; }
+  ipc_lib::ThreadSignalReceiver *operator->() { return &receiver_; }
+
+  ipc_lib::WakeupKind kind() const { return receiver_.kind(); }
+
+  // Wakes this receiver the way its kind is woken.  Safe to call from any
+  // thread, which is what the wake tests need.
+  void Wake();
+
+  // Aims a signal-kind wakeup at the calling thread.  Done at construction,
+  // which is right whenever the thread that builds a receiver is the one that
+  // registers it; a body that hands its receiver to another thread to drive
+  // calls this from there instead.  Nothing for the futex kind, whose wakeup
+  // is aimed at a word rather than at a thread.
+  void BindHere();
+
+ private:
+  ipc_lib::ThreadSignalReceiver receiver_;
+
+  // Futex kind only: the word the wait is armed on.  Never read by a test
+  // directly -- Wake() is the only thing that touches it.
+  std::atomic<uint32_t> word_{0};
+
+  // Signal kind only, captured where the receiver was built.
+  pid_t pid_ = 0;
+  pid_t tid_ = 0;
+};
 
 // What every body constructs instead of an Aio.
 //

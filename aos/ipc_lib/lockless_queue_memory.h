@@ -52,10 +52,17 @@ struct LocklessQueueMemory {
   // A message is valid iff its internal index matches the index in the queue.
   AtomicQueueIndex next_queue_index;
 
-  // All processes using a queue need to be able to send messages to each other.
-  // We're going to require they have matching UIDs, which is sufficient to do
-  // that.
+  // Processes on a WakeupKind::kSignal queue need to be able to signal each
+  // other, and the kernel only delivers a signal between matching uids.  We
+  // require they all resolve to one uid, which is sufficient for that, and
+  // record it here to turn a mismatch into an error at attach time rather than
+  // a watcher that never wakes.  Unused by a kFutex queue.
   uid_t uid;
+
+  // The WakeupKind (as its integer) every process on this queue uses.  Set
+  // with uid when the queue is first initialized and checked by every later
+  // process: the two kinds cannot share a queue.
+  uint32_t wakeup_kind;
 
   // There is then memory allocated after this structure.  That memory is used
   // to store the messages, queue, watchers, and senders.  This is equivalent to

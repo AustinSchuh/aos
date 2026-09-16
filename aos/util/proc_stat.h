@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace aos::util {
 // ProcStat is a struct to hold all the fields available in /proc/[pid]/stat.
@@ -81,5 +82,16 @@ struct ProcStat {
 // file.
 std::optional<ProcStat> ReadProcStat(pid_t pid,
                                      std::optional<pid_t> tid = std::nullopt);
+
+// Whether the /proc mount described by the given /proc/self/mountinfo contents
+// hides other users' processes (mounted with hidepid=1, 2, invisible, or
+// ptraceable).  Under such a mount, another user's /proc/<pid> entry is
+// indistinguishable from a dead process's.
+bool MountinfoHidesPids(std::string_view mountinfo);
+
+// MountinfoHidesPids() for this process's /proc.  False if /proc/self/mountinfo
+// cannot be read, since nothing would be hidden from a process that cannot
+// read its own mount table either.
+bool ProcHidesPids();
 }  // namespace aos::util
 #endif  // AOS_UTIL_PROC_STAT_H_
