@@ -722,12 +722,12 @@ cc_test(
 )
 
 cc_library(
-    name = "shm_event_loop",
-    srcs = ["shm_event_loop.cc"] + select({
-        "@platforms//os:windows": ["shm_event_loop_windows.cc"],
-        "//conditions:default": ["shm_event_loop_posix.cc"],
+    name = "queue_event_loop",
+    srcs = ["queue_event_loop.cc"] + select({
+        "@platforms//os:windows": ["queue_event_loop_windows.cc"],
+        "//conditions:default": ["queue_event_loop_posix.cc"],
     }),
-    hdrs = ["shm_event_loop.h"],
+    hdrs = ["queue_event_loop.h"],
     visibility = ["//visibility:public"],
     deps = [
         ":aio",
@@ -740,7 +740,7 @@ cc_library(
         "//aos:realtime",
         "//aos/ipc_lib:lockless_queue",
         "//aos/ipc_lib:memory_mapped_queue",
-        "//aos/ipc_lib:shm_base",
+        "//aos/ipc_lib:queue_memory",
         "//aos/ipc_lib:thread_signal",
         "//aos/stl_mutex",
         "//aos/util:application_name",
@@ -749,6 +749,32 @@ cc_library(
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/log:die_if_null",
+    ],
+)
+
+cc_library(
+    name = "shm_event_loop",
+    srcs = ["shm_event_loop.cc"],
+    hdrs = ["shm_event_loop.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":queue_event_loop",
+        "//aos/ipc_lib:memory_mapped_queue",
+        "//aos/ipc_lib:queue_memory",
+        "//aos/ipc_lib:shm_base",
+        "@com_google_absl//absl/flags:flag",
+    ],
+)
+
+cc_library(
+    name = "thread_event_loop",
+    srcs = ["thread_event_loop.cc"],
+    hdrs = ["thread_event_loop.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":queue_event_loop",
+        "//aos/ipc_lib:process_local_queue",
+        "//aos/ipc_lib:queue_memory",
     ],
 )
 
@@ -762,6 +788,8 @@ cc_test(
         ":event_loop_param_test",
         ":shm_event_loop",
         ":test_message_fbs",
+        ":thread_event_loop",
+        "//aos/ipc_lib:process_local_queue",
     ],
 )
 
@@ -776,6 +804,8 @@ cc_test(
         ":event_loop_param_test",
         ":shm_event_loop",
         ":test_message_fbs",
+        ":thread_event_loop",
+        "//aos/ipc_lib:process_local_queue",
     ],
 )
 
@@ -790,6 +820,67 @@ cc_test(
         ":event_loop_param_test",
         ":shm_event_loop",
         ":test_message_fbs",
+        ":thread_event_loop",
+        "//aos/ipc_lib:process_local_queue",
+        "@libuv",
+    ],
+)
+
+# The same suites over ThreadEventLoop, one target per backend so each stays
+# as long as it was rather than twice that.
+cc_test(
+    name = "thread_event_loop_test_epoll",
+    srcs = ["shm_event_loop_test.cc"],
+    flaky = True,
+    local_defines = [
+        "AOS_EPOLL_ONLY",
+        "AOS_THREAD_EVENT_LOOP",
+    ],
+    shard_count = 50,
+    deps = [
+        ":event_loop_param_test",
+        ":shm_event_loop",
+        ":test_message_fbs",
+        ":thread_event_loop",
+        "//aos/ipc_lib:process_local_queue",
+    ],
+)
+
+cc_test(
+    name = "thread_event_loop_test_io_uring",
+    srcs = ["shm_event_loop_test.cc"],
+    flaky = True,
+    local_defines = [
+        "AOS_IO_URING_ONLY",
+        "AOS_THREAD_EVENT_LOOP",
+    ],
+    shard_count = 50,
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":event_loop_param_test",
+        ":shm_event_loop",
+        ":test_message_fbs",
+        ":thread_event_loop",
+        "//aos/ipc_lib:process_local_queue",
+    ],
+)
+
+cc_test(
+    name = "thread_event_loop_test_uv",
+    srcs = ["shm_event_loop_test.cc"],
+    flaky = True,
+    local_defines = [
+        "AOS_THREAD_EVENT_LOOP",
+        "AOS_UV_ONLY",
+    ],
+    shard_count = 50,
+    deps = [
+        ":aio_uv",
+        ":event_loop_param_test",
+        ":shm_event_loop",
+        ":test_message_fbs",
+        ":thread_event_loop",
+        "//aos/ipc_lib:process_local_queue",
         "@libuv",
     ],
 )
