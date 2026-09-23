@@ -1167,7 +1167,8 @@ void SimulatedWatcher::HandleEvent() noexcept {
 }
 
 void SimulatedWatcher::Handle() noexcept {
-  ABSL_DCHECK(token_ != scheduler_->InvalidToken());
+  // The scheduler erased token_ from its list before calling us, so it is
+  // dangling and may not be compared against InvalidToken().
   token_ = scheduler_->InvalidToken();
   simulated_event_loop_->HandleEvent();
 }
@@ -1537,7 +1538,8 @@ void SimulatedTimerHandler::Schedule(monotonic_clock::time_point base,
 }
 
 void SimulatedTimerHandler::Handle() noexcept {
-  ABSL_DCHECK(token_ != scheduler_->InvalidToken());
+  // The scheduler erased token_ from its list before calling us, so it is
+  // dangling and may not be compared against InvalidToken().
   token_ = scheduler_->InvalidToken();
   simulated_event_loop_->HandleEvent();
 }
@@ -1633,7 +1635,8 @@ void SimulatedPhasedLoopHandler::HandleEvent() noexcept {
 }
 
 void SimulatedPhasedLoopHandler::Handle() noexcept {
-  ABSL_DCHECK(token_ != scheduler_->InvalidToken());
+  // The scheduler erased token_ from its list before calling us, so it is
+  // dangling and may not be compared against InvalidToken().
   token_ = scheduler_->InvalidToken();
   simulated_event_loop_->HandleEvent();
 }
