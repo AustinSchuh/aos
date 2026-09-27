@@ -2691,6 +2691,145 @@ TEST_P(AioTest, SelfRearmingRegularFileReadDoesNotStarveTimers) {
 }
 #endif  // !_WIN32
 
+// Two readers that each re-arm a regular-file read from their own callback
+// keep the loop's ready work permanently non-empty: every Poll() resolves or
+// delivers a read, and each delivered read queues another.  A single reader
+// cannot show this (SelfRearmingRegularFileReadDoesNotStarveTimers), because
+// its one read in flight leaves a moment with nothing queued.  With two,
+// whether a timer that comes due while they run ever gets its turn depends on
+// how each backend interleaves going back to the kernel with draining what it
+// already holds.
+//
+// The timer has to fire, and promptly, on every backend.  The run is bounded
+// at kMaxReads so a backend that starves the timer outright fails instead of
+// hanging.  The measurement (whether it fired, how many reads ran after its
+// deadline, how late it was) is logged either way.
+//
+// io_uring with SINGLE_ISSUER|DEFER_TASKRUN starved it: the kernel runs its
+// deferred task work, which is how a timer's completion reaches the CQ, only
+// on an enter with GETEVENTS.  Poll() flushed a callback's re-armed reads
+// with a bare submit while its dispatch queue was non-empty, and two readers
+// keep that queue from ever emptying.
+//
+// POSIX-only: regular files from mkstemp()/unlink() on integer descriptors.
+#ifndef _WIN32
+TEST_P(AioTest, TwoRearmingRegularFileReadersVersusTimer) {
+  TestAio aio;
+  constexpr int kReaders = 2;
+  constexpr int kMaxReads = 100000;
+  constexpr size_t kFileSize = 1 << 20;
+
+  struct Shared {
+    int total_reads = 0;
+    int reads_after_deadline = 0;
+    bool stop = false;
+    aos::monotonic_clock::time_point deadline;
+  } shared;
+
+  struct Reader {
+    TestAio *aio;
+    Shared *shared;
+    int fd;
+    char byte;
+    AsyncRequest req;
+  };
+  std::array<Reader, kReaders> readers;
+  for (Reader &reader : readers) {
+    std::string path = aos::testing::TestTmpDir() + "/aio_starve2_XXXXXX";
+    reader.fd = mkstemp(path.data());
+    ASSERT_GE(reader.fd, 0);
+    ASSERT_EQ(unlink(path.c_str()), 0);
+    const std::string contents(kFileSize, 'x');
+    ASSERT_EQ(write(reader.fd, contents.data(), contents.size()),
+              static_cast<ssize_t>(contents.size()));
+    ASSERT_EQ(lseek(reader.fd, 0, SEEK_SET), 0);
+    reader.aio = &aio;
+    reader.shared = &shared;
+    reader.req.context = &reader;
+    reader.req.callback = [](Completion completion, void *ctx) {
+      auto *self = static_cast<Reader *>(ctx);
+      ASSERT_TRUE(aos::IsOk(completion.status));
+      if (completion.result == 0) return;  // EOF
+      ++self->shared->total_reads;
+      if (aos::monotonic_clock::now() >= self->shared->deadline) {
+        ++self->shared->reads_after_deadline;
+      }
+      if (self->shared->stop) return;
+      self->aio->AsyncRead(self->fd, std::span<char>(&self->byte, 1),
+                           &self->req);
+    };
+  }
+
+  struct TimerResult {
+    Shared *shared = nullptr;
+    int reads_after_deadline = -1;
+    aos::monotonic_clock::time_point fired_at;
+  } result;
+  result.shared = &shared;
+
+  Aio::Timer timer(aio.get());
+  // Due while the readers are already running, not before they start: a
+  // timer already expired at the first Poll() is found on the way in.
+  shared.deadline = aos::monotonic_clock::now() + std::chrono::milliseconds(2);
+  timer.Schedule(
+      shared.deadline,
+      [](Completion, void *ctx) {
+        auto *self = static_cast<TimerResult *>(ctx);
+        self->reads_after_deadline = self->shared->reads_after_deadline;
+        self->fired_at = aos::monotonic_clock::now();
+        self->shared->stop = true;
+      },
+      &result);
+
+  for (Reader &reader : readers) {
+    aio.AsyncRead(reader.fd, std::span<char>(&reader.byte, 1), &reader.req);
+  }
+  while (result.reads_after_deadline < 0 && shared.total_reads < kMaxReads &&
+         aio.Poll(true)) {
+  }
+  const bool fired = result.reads_after_deadline >= 0;
+  const double late_ms =
+      std::chrono::duration<double, std::milli>(
+          (fired ? result.fired_at : aos::monotonic_clock::now()) -
+          shared.deadline)
+          .count();
+  const int reads_late =
+      fired ? result.reads_after_deadline : shared.reads_after_deadline;
+  ABSL_LOG(INFO) << Backend().name << ": timer "
+                 << (fired ? "fired" : "never fired") << "; " << reads_late
+                 << " reads ran after its deadline, " << late_ms << " ms late ("
+                 << shared.total_reads << " reads in all)";
+  RecordProperty("timer_fired", fired ? 1 : 0);
+  RecordProperty("reads_after_deadline", reads_late);
+  RecordProperty("us_late", static_cast<int>(late_ms * 1000));
+
+  // Stop re-arming and let whatever is still in flight finish.  Drained
+  // rather than canceled, as in the single-reader test.
+  shared.stop = true;
+  for (Reader &reader : readers) {
+    while (!reader.req.done) {
+      aio.Poll(true);
+    }
+  }
+  while (aio.Poll(false)) {
+  }
+  if (!fired) {
+    timer.Cancel();
+  }
+  for (Reader &reader : readers) {
+    close(reader.fd);
+  }
+
+  ASSERT_TRUE(fired) << "the timer never fired in " << kMaxReads << " reads";
+  // Loose on purpose.  A read here is a fraction of a microsecond and the
+  // kernel's timer expiry is not, so a few dozen reads normally slip in
+  // between the deadline and the timerfd becoming readable (measured: 2 to
+  // ~50, 0.01 ms late).  Starvation is tens of thousands.
+  EXPECT_LT(result.reads_after_deadline, 2000)
+      << "the timer waited behind the re-arming reads";
+}
+#endif  // !_WIN32
+
 // A request is in flight until its callback has run, and that includes a
 // Cancel()ed one whose Canceled completion has not been delivered yet.
 // Re-arming it then used to give two callbacks for one request on the
