@@ -427,6 +427,11 @@ class GpuDetector {
   GpuMemory<uint8_t> color_image_device_;
   // Full size gray scale image.
   GpuMemory<uint8_t> gray_image_device_;
+  // decimated_image_device_ and thresholded_image_device_ are attached to
+  // stream_.  Every kernel that touches them runs on stream_, and the CPU
+  // touches them only while stream_ is idle: the NEON threshold at the start of
+  // Detect() and the Copy*To methods after it returns.
+  //
   // Half resolution, gray, decimated image.
   UnifiedMemory<uint8_t> decimated_image_device_;
   // Intermediates for thresholding.

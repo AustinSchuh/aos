@@ -192,6 +192,16 @@ GpuDetector::GpuDetector(size_t width, size_t height,
              image_format == vision::ImageFormat::MONO8)
       << ": --use_neon only supports MONO8 images";
 
+  // The Orin has no concurrent managed access, so the CPU may only touch
+  // globally attached managed memory while no stream in the process has work
+  // in flight, and memset_stream_ can while NEON writes these.  Attached to
+  // stream_, they only need stream_ to be idle.
+  CHECK_CUDA(cudaStreamAttachMemAsync(
+      stream_.get(), decimated_image_device_.get(), 0, cudaMemAttachSingle));
+  CHECK_CUDA(cudaStreamAttachMemAsync(
+      stream_.get(), thresholded_image_device_.get(), 0, cudaMemAttachSingle));
+  CHECK_CUDA(cudaStreamSynchronize(stream_.get()));
+
   for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
     apriltag_family_t *family;
     zarray_get(tag_detector_->tag_families, i, &family);
