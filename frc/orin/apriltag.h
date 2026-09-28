@@ -355,17 +355,21 @@ class GpuDetector {
   CudaEvent after_bounds_;
   CudaEvent after_bounds_memcpy_;
   CudaEvent after_transform_extents_;
-  CudaEvent after_filter_;
+  // The host waits on the cudaEventBlockingSync events below before reading a
+  // pinned copy.  Sleeping there instead of spinning frees the core while the
+  // GPU is busy, which matters most when other processes hold the GPU.
+  CudaEvent after_filter_{cudaEventBlockingSync};
   CudaEvent after_filtered_sort_;
   CudaEvent after_line_fit_;
   CudaEvent after_line_filter_;
   CudaEvent after_peak_compression_;
-  CudaEvent after_peak_count_memcpy_;
+  CudaEvent after_peak_count_memcpy_{cudaEventBlockingSync};
   CudaEvent after_peak_sort_;
   CudaEvent after_filtered_peak_reduce_;
-  CudaEvent after_filtered_peak_host_memcpy_;
+  CudaEvent after_filtered_peak_host_memcpy_{cudaEventBlockingSync};
   CudaEvent after_quad_fit_;
-  CudaEvent after_quad_fit_memcpy_{cudaEventDisableTiming};
+  CudaEvent after_quad_fit_memcpy_{cudaEventDisableTiming |
+                                   cudaEventBlockingSync};
 
   // A stage's time is from begin to end.
   struct Stage {
@@ -447,6 +451,7 @@ class GpuDetector {
 
   // Number of keys in selected_blobs_device_.
   GpuMemory<int> num_selected_blobs_device_{/* allocate 1 integer...*/ 1};
+  HostMemory<int> num_selected_blobs_host_{/* allocate 1 integer...*/ 1};
 
   // Compacted blobs which pass our threshold.
   GpuMemory<IndexPoint> selected_blobs_device_;
@@ -460,10 +465,12 @@ class GpuDetector {
   GpuMemory<double> filtered_errs_device_;
   GpuMemory<Peak> filtered_is_local_peak_device_;
   GpuMemory<int> num_compressed_peaks_device_{/* allocate 1 integer...*/ 1};
+  HostMemory<int> num_compressed_peaks_host_{/* allocate 1 integer...*/ 1};
   GpuMemory<Peak> compressed_peaks_device_;
   GpuMemory<Peak> sorted_compressed_peaks_device_;
 
   GpuMemory<int> num_quad_peaked_quads_device_{/* allocate 1 integer...*/ 1};
+  HostMemory<int> num_quad_peaked_quads_host_{/* allocate 1 integer...*/ 1};
   GpuMemory<PeakExtents> peak_extents_device_;
 
   CameraMatrix camera_matrix_;
@@ -471,7 +478,10 @@ class GpuDetector {
 
   GpuMemory<FitQuad> fit_quads_device_;
 
-  std::vector<FitQuad> fit_quads_host_;
+  // Pinned so the copy from fit_quads_device_ is a real async DMA instead of a
+  // staged, blocking copy.  Only the first num_fit_quads_host_ are valid.
+  HostMemory<FitQuad> fit_quads_host_{kMaxBlobs};
+  size_t num_fit_quads_host_ = 0;
   std::vector<QuadCorners> quad_corners_host_;
 
   // Temporary storage for each of the steps.

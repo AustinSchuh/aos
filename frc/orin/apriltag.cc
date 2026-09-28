@@ -183,7 +183,6 @@ GpuDetector::GpuDetector(size_t width, size_t height,
                      ? MakeNeonThreshold(image_format, width, height)
                      : MakeThreshold(image_format, width, height)),
       image_format_(image_format) {
-  fit_quads_host_.reserve(kMaxBlobs);
   quad_corners_host_.reserve(kMaxBlobs);
 
   ABSL_CHECK_EQ(tag_detector_->quad_decimate, 2);
@@ -971,10 +970,11 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
 
-    num_selected_blobs_device_.MemcpyAsyncTo(&num_selected_blobs_host,
+    num_selected_blobs_device_.MemcpyAsyncTo(&num_selected_blobs_host_,
                                              &stream_);
     after_filter_.Record(&stream_);
     after_filter_.Synchronize();
+    num_selected_blobs_host = *num_selected_blobs_host_.get();
   }
 
   {
@@ -1049,10 +1049,11 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     record_stage(after_peak_compression_, &stream_);
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
-    num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host,
+    num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host_,
                                                &stream_);
     after_peak_count_memcpy_.Record(&stream_);
     after_peak_count_memcpy_.Synchronize();
+    num_compressed_peaks_host = *num_compressed_peaks_host_.get();
   }
 
   {
@@ -1105,11 +1106,12 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     record_stage(after_filtered_peak_reduce_, &stream_);
 
-    num_quad_peaked_quads_device_.MemcpyAsyncTo(&num_quad_peaked_quads_host,
+    num_quad_peaked_quads_device_.MemcpyAsyncTo(&num_quad_peaked_quads_host_,
                                                 &stream_);
     MaybeCheckAndSynchronize("num_quad_peaked_quads_device_.MemcpyTo");
     after_filtered_peak_host_memcpy_.Record(&stream_);
     after_filtered_peak_host_memcpy_.Synchronize();
+    num_quad_peaked_quads_host = *num_quad_peaked_quads_host_.get();
   }
 
   {
@@ -1124,9 +1126,9 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   after_quad_fit_.Record(&stream_);
 
   {
-    fit_quads_host_.resize(num_quad_peaked_quads_host);
-    fit_quads_device_.MemcpyAsyncTo(fit_quads_host_.data(),
-                                    num_quad_peaked_quads_host, &stream_);
+    num_fit_quads_host_ = num_quad_peaked_quads_host;
+    fit_quads_device_.MemcpyAsyncTo(fit_quads_host_.get(), num_fit_quads_host_,
+                                    &stream_);
     after_quad_fit_memcpy_.Record(&stream_);
     after_quad_fit_memcpy_.Synchronize();
   }

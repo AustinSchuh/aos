@@ -10,6 +10,7 @@
 #include <cub/device/device_select.cuh>
 #include <cub/iterator/discard_output_iterator.cuh>
 #include <cub/iterator/transform_input_iterator.cuh>
+#include <span>
 #include <vector>
 
 #include "absl/flags/flag.h"
@@ -101,8 +102,9 @@ const std::vector<QuadCorners> &GpuDetector::FitQuads() const {
 
 void GpuDetector::UpdateFitQuads() {
   quad_corners_host_.resize(0);
-  ABSL_VLOG(1) << "Considering " << fit_quads_host_.size();
-  for (const FitQuad &quad : fit_quads_host_) {
+  ABSL_VLOG(1) << "Considering " << num_fit_quads_host_;
+  for (const FitQuad &quad :
+       std::span(fit_quads_host_.get(), num_fit_quads_host_)) {
     bool print = quad.blob_index == absl::GetFlag(FLAGS_debug_blob_index);
     if (!quad.valid) {
       continue;
