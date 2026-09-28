@@ -12,6 +12,7 @@
 #include "frc/orin/line_fit_filter.h"
 #include "frc/orin/points.h"
 #include "frc/orin/threshold.h"
+#include "frc/vision/calibration_generated.h"
 #include "frc/vision/vision_generated.h"
 
 namespace frc::apriltag {
@@ -81,6 +82,35 @@ struct DistCoeffs {
   // Are we using 5 or 8 parameter model?
   int num_params;
 };
+
+// Returns calibration's intrinsics in the forms the detector takes.
+// gpu_apriltag and apriltag_benchmark both use these, so the benchmark
+// undistorts the way the robot does.
+inline CameraMatrix GetCameraMatrix(
+    const frc::vision::calibration::CameraCalibration *calibration) {
+  auto intrinsics = calibration->intrinsics();
+  return CameraMatrix{
+      .fx = intrinsics->Get(0),
+      .cx = intrinsics->Get(2),
+      .fy = intrinsics->Get(4),
+      .cy = intrinsics->Get(5),
+  };
+}
+
+inline DistCoeffs GetDistCoeffs(
+    const frc::vision::calibration::CameraCalibration *calibration) {
+  auto dist_coeffs = calibration->dist_coeffs();
+  int num_params = dist_coeffs->size();
+  return DistCoeffs{.k1 = dist_coeffs->Get(0),
+                    .k2 = dist_coeffs->Get(1),
+                    .p1 = dist_coeffs->Get(2),
+                    .p2 = dist_coeffs->Get(3),
+                    .k3 = dist_coeffs->Get(4),
+                    .k4 = (num_params >= 8 ? dist_coeffs->Get(5) : 0.0),
+                    .k5 = (num_params >= 8 ? dist_coeffs->Get(6) : 0.0),
+                    .k6 = (num_params >= 8 ? dist_coeffs->Get(7) : 0.0),
+                    .num_params = num_params};
+}
 
 // GPU based april tag detector.
 class GpuDetector {

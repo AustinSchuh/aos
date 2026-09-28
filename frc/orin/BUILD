@@ -153,6 +153,7 @@ cuda_library(
         ":cuda",
         ":threshold",
         "//aos/time",
+        "//frc/vision:calibration_fbs",
         "//frc/vision:vision_fbs",
         "//third_party:cudart",
         "//third_party/apriltag",
