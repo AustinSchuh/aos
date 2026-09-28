@@ -316,11 +316,6 @@ class CudaAprilTagDetector {
 #undef DUMP
     }
 
-    union_marker_pair_.resize((width - 2) / 2 * (height - 2) / 2 * 4,
-                              QuadBoundaryPoint());
-    compressed_union_marker_pair_.resize((width - 2) / 2 * (height - 2) / 2 * 4,
-                                         QuadBoundaryPoint());
-
     // Pre-compute the border and width thresholds.
     for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
       apriltag_family_t *family;
@@ -364,9 +359,8 @@ class CudaAprilTagDetector {
     gpu_detector_.CopyUnionMarkersSizeTo(
         reinterpret_cast<uint32_t *>(union_markers_size_.data));
 
-    gpu_detector_.CopyUnionMarkerPairTo(union_marker_pair_.data());
-    gpu_detector_.CopyCompressedUnionMarkerPairTo(
-        compressed_union_marker_pair_.data());
+    compressed_union_marker_pair_ =
+        gpu_detector_.CopyCompressedUnionMarkerPair();
     sorted_union_marker_pair_ = gpu_detector_.CopySortedUnionMarkerPair();
     num_compressed_union_marker_pair_ =
         gpu_detector_.NumCompressedUnionMarkerPairs();
@@ -433,6 +427,23 @@ class CudaAprilTagDetector {
       return x - 1 + (y - 1) * (width - 2);
     };
 
+    // The GPU finds points in no particular order.  Put each where a dense
+    // array of 4 points per pixel has it, so every point is compared.
+    std::vector<QuadBoundaryPoint> union_marker_pair(
+        (width - 2) * (height - 2) * 4, QuadBoundaryPoint());
+    for (const QuadBoundaryPoint point : compressed_union_marker_pair_) {
+      ABSL_CHECK(point.nonzero());
+      ABSL_CHECK_GE(point.base_x(), 1u);
+      ABSL_CHECK_LT(point.base_x(), width - 1);
+      ABSL_CHECK_GE(point.base_y(), 1u);
+      ABSL_CHECK_LT(point.base_y(), height - 1);
+      QuadBoundaryPoint &dense_point =
+          union_marker_pair[ToIndex(point.base_x(), point.base_y()) +
+                            point.dxy() * (width - 2) * (height - 2)];
+      ABSL_CHECK(!dense_point.nonzero()) << ": found " << point << " twice";
+      dense_point = point;
+    }
+
     size_t wrong = 0;
     size_t right_nonzero = 0;
 
@@ -498,7 +509,7 @@ class CudaAprilTagDetector {
           }
           size_t index = ToIndex(x, y) + offset * (width - 2) * (height - 2);
 
-          QuadBoundaryPoint actual = union_marker_pair_[index];
+          QuadBoundaryPoint actual = union_marker_pair[index];
           if (!point.near(actual)) {
             ABSL_CHECK_LT(wrong, 10u);
             ABSL_LOG(WARNING)
@@ -529,7 +540,7 @@ class CudaAprilTagDetector {
     ABSL_CHECK_EQ(wrong, 0u) << ", got " << right_nonzero << " right";
 
     for (size_t i = 0; i < expected_union_marker_pair.size(); ++i) {
-      ABSL_CHECK_EQ(expected_union_marker_pair[i], union_marker_pair_[i]);
+      ABSL_CHECK_EQ(expected_union_marker_pair[i], union_marker_pair[i]);
     }
 
     return expected_union_marker_pair;
@@ -559,13 +570,6 @@ class CudaAprilTagDetector {
 
       ABSL_CHECK_EQ(static_cast<size_t>(sorted_union_marker_pair.size()),
                     expected_compressed_union_marker_pair.size());
-
-      // And make sure they match.
-      for (size_t i = 0; i < expected_compressed_union_marker_pair.size();
-           ++i) {
-        ABSL_CHECK_EQ(expected_compressed_union_marker_pair[i],
-                      compressed_union_marker_pair[i]);
-      }
     }
 
     // Now, sort the points.
@@ -578,6 +582,19 @@ class CudaAprilTagDetector {
 
                 return a < b;
               });
+
+    // The GPU finds points in no particular order, and its sort by blob pair
+    // leaves them in that order within each pair, so compare them as sets.
+    auto CheckSamePoints = [&](std::vector<QuadBoundaryPoint> points) {
+      ABSL_CHECK_EQ(points.size(),
+                    expected_compressed_union_marker_pair.size());
+      std::sort(points.begin(), points.end());
+      for (size_t i = 0; i < points.size(); ++i) {
+        ABSL_CHECK_EQ(expected_compressed_union_marker_pair[i], points[i]);
+      }
+    };
+    CheckSamePoints(compressed_union_marker_pair);
+    CheckSamePoints(sorted_union_marker_pair);
 
     for (size_t i = 0; i < static_cast<size_t>(sorted_union_marker_pair.size());
          ++i) {
@@ -1780,6 +1797,31 @@ class CudaAprilTagDetector {
 
   void set_undistort(bool value) { undistort_ = value; }
 
+  // Checks that the GPU's sorted points and line fit points match those of
+  // the last call, and saves them for the next.  The GPU finds points in a
+  // different order each time, and that must not reach anything past the
+  // sort by angle.
+  void CheckSameAsLastDetect() {
+    if (!last_sorted_selected_blobs_.empty()) {
+      ABSL_CHECK_EQ(sorted_selected_blobs_cuda_.size(),
+                    last_sorted_selected_blobs_.size());
+      ABSL_CHECK_EQ(line_fit_points_cuda_.size(), last_line_fit_points_.size());
+      for (size_t i = 0; i < sorted_selected_blobs_cuda_.size(); ++i) {
+        ABSL_CHECK_EQ(sorted_selected_blobs_cuda_[i].key,
+                      last_sorted_selected_blobs_[i].key)
+            << ": at " << i;
+        const LineFitPoint &a = line_fit_points_cuda_[i];
+        const LineFitPoint &b = last_line_fit_points_[i];
+        ABSL_CHECK(a.Mxx == b.Mxx && a.Myy == b.Myy && a.Mxy == b.Mxy &&
+                   a.Mx == b.Mx && a.My == b.My && a.W == b.W &&
+                   a.blob_index == b.blob_index)
+            << ": at " << i;
+      }
+    }
+    last_sorted_selected_blobs_ = sorted_selected_blobs_cuda_;
+    last_line_fit_points_ = line_fit_points_cuda_;
+  }
+
   void CheckDetections(zarray_t *aprilrobotics_detections,
                        const zarray_t *_gpu_detections) {
     zarray_t *gpu_detections = zarray_copy(_gpu_detections);
@@ -2147,7 +2189,6 @@ class CudaAprilTagDetector {
   cv::Mat union_markers_;
   cv::Mat union_markers_size_;
 
-  std::vector<QuadBoundaryPoint> union_marker_pair_;
   std::vector<QuadBoundaryPoint> compressed_union_marker_pair_;
   std::vector<QuadBoundaryPoint> sorted_union_marker_pair_;
   std::vector<uint32_t> quad_length_;
@@ -2156,6 +2197,8 @@ class CudaAprilTagDetector {
   std::vector<IndexPoint> selected_blobs_cuda_;
   std::vector<IndexPoint> sorted_selected_blobs_cuda_;
   std::vector<LineFitPoint> line_fit_points_cuda_;
+  std::vector<IndexPoint> last_sorted_selected_blobs_;
+  std::vector<LineFitPoint> last_line_fit_points_;
 
   std::vector<double> errors_device_;
   std::vector<double> filtered_errors_device_;
@@ -2214,6 +2257,7 @@ TEST_F(AprilDetectionTest, ImageRepeat) {
   for (size_t i = 0; i < 4; ++i) {
     ABSL_LOG(INFO) << "Attempt " << i;
     cuda_detector.DetectGPU(color_image.clone());
+    cuda_detector.CheckSameAsLastDetect();
     cuda_detector.DetectCPU(color_image.clone());
   }
   cuda_detector.Check(color_image.clone());

@@ -77,6 +77,14 @@ struct BlobWorkList {
   uint16_t big_blobs[IndexPoint::kMaxBlobs];
 };
 
+// BlobDiff's counts.  Both are zero between frames.
+struct BlobDiffCounters {
+  // The number of points found so far.
+  uint32_t num_points;
+  // The number of blocks which have finished.
+  uint32_t num_finished_blocks;
+};
+
 struct CameraMatrix {
   double fx;
   double cx;
@@ -197,12 +205,10 @@ class GpuDetector {
     union_markers_device_.MemcpyTo(output);
   }
 
-  void CopyUnionMarkerPairTo(QuadBoundaryPoint *output) const {
-    union_marker_pair_device_.MemcpyTo(output);
-  }
-
-  void CopyCompressedUnionMarkerPairTo(QuadBoundaryPoint *output) const {
-    compressed_union_marker_pair_device_.MemcpyTo(output);
+  // The points between blobs, in no particular order.
+  std::vector<QuadBoundaryPoint> CopyCompressedUnionMarkerPair() const {
+    return compressed_union_marker_pair_device_.Copy(
+        NumCompressedUnionMarkerPairs());
   }
 
   std::vector<QuadBoundaryPoint> CopySortedUnionMarkerPair() const {
@@ -363,8 +369,7 @@ class GpuDetector {
   // After each of LabelImage's kernels.
   std::array<CudaEvent, 5> after_labeling_kernel_;
   CudaEvent after_unionfinding_;
-  CudaEvent after_diff_;
-  CudaEvent after_compact_{cudaEventBlockingSync};
+  CudaEvent after_diff_{cudaEventBlockingSync};
   CudaEvent after_sort_;
   CudaEvent after_bounds_;
   CudaEvent after_transform_extents_;
@@ -381,7 +386,7 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 21> stages_{{
+  const std::array<Stage, 20> stages_{{
       {"Memset", &memset_start_, &after_memset_},
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
@@ -394,8 +399,7 @@ class GpuDetector {
       {"UF C2", &after_labeling_kernel_[2], &after_labeling_kernel_[3]},
       {"UF Final", &after_labeling_kernel_[3], &after_labeling_kernel_[4]},
       {"Diff", &after_unionfinding_, &after_diff_},
-      {"Compact", &after_diff_, &after_compact_},
-      {"Sort", &after_compact_, &after_sort_},
+      {"Sort", &after_diff_, &after_sort_},
       {"Bounds", &after_sort_, &after_bounds_},
       {"Transform Extents", &after_bounds_, &after_transform_extents_},
       {"Filter by dot product", &after_transform_extents_, &after_filter_},
@@ -429,15 +433,14 @@ class GpuDetector {
   // union marker id in union_markers_device_ aboe.
   GpuMemory<uint32_t> union_markers_size_device_;
 
-  // Full list of boundary points, densly stored but mostly zero.
-  GpuMemory<QuadBoundaryPoint> union_marker_pair_device_;
-  // Unsorted list of points with 0's removed.
+  // The points between blobs, in the order BlobDiff found them.
   GpuMemory<QuadBoundaryPoint> compressed_union_marker_pair_device_;
   // Blob representation sorted list of points.
   GpuMemory<QuadBoundaryPoint> sorted_union_marker_pair_device_;
   // Number of compressed points.  Mapped so the host reads the count straight
-  // from where the compaction writes it.
+  // from where BlobDiff writes it.
   MappedHostMemory<int> num_compressed_union_marker_pair_{1};
+  GpuMemory<BlobDiffCounters> blob_diff_counters_device_{1};
 
   // Number of unique blob IDs.  Only the GPU reads it during Detect().
   GpuMemory<size_t> num_quads_device_{/* allocate 1 integer...*/ 1};
@@ -476,7 +479,6 @@ class GpuDetector {
   // Temporary storage for each of the steps.
   // TODO(austin): Can we combine these and just use the max?
   GpuMemory<uint32_t> radix_sort_tmpstorage_device_;
-  GpuMemory<uint8_t> temp_storage_compressed_union_marker_pair_device_;
   GpuMemory<uint8_t> temp_storage_bounds_reduce_by_key_device_;
   GpuMemory<uint8_t> temp_storage_compressed_filtered_blobs_device_;
   GpuMemory<uint8_t> temp_storage_selected_extents_scan_device_;

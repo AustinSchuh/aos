@@ -14,6 +14,7 @@
 #include <cub/device/device_select.cuh>
 #include <cub/iterator/discard_output_iterator.cuh>
 #include <cub/iterator/transform_input_iterator.cuh>
+#include <cub/warp/warp_scan.cuh>
 #include <numbers>
 #include <vector>
 
@@ -35,14 +36,6 @@ namespace frc::apriltag {
 namespace {
 
 typedef std::chrono::duration<float, std::milli> float_milli;
-
-// Returns true if the QuadBoundaryPoint is nonzero.
-struct NonZero {
-  __host__ __device__ __forceinline__ bool operator()(
-      const QuadBoundaryPoint &a) const {
-    return a.nonzero();
-  }
-};
 
 // Always returns true (only used for scratch space calcs).
 template <typename T>
@@ -128,12 +121,14 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       thresholded_image_device_(width / 2 * height / 2),
       union_markers_device_(width / 2 * height / 2),
       union_markers_size_device_(width / 2 * height / 2),
-      union_marker_pair_device_((width / 2 - 2) * (height / 2 - 2) * 4),
-      compressed_union_marker_pair_device_(union_marker_pair_device_.size()),
-      sorted_union_marker_pair_device_(union_marker_pair_device_.size()),
-      extents_device_(union_marker_pair_device_.size()),
+      // Up to 4 points for each pixel off the image's edge.
+      compressed_union_marker_pair_device_((width / 2 - 2) * (height / 2 - 2) *
+                                           4),
+      sorted_union_marker_pair_device_(
+          compressed_union_marker_pair_device_.size()),
+      extents_device_(compressed_union_marker_pair_device_.size()),
       selected_extents_device_(kMaxBlobs),
-      selected_blobs_device_(union_marker_pair_device_.size()),
+      selected_blobs_device_(compressed_union_marker_pair_device_.size()),
       sorted_selected_blobs_device_(selected_blobs_device_.size()),
       line_fit_points_device_(selected_blobs_device_.size()),
       errs_device_(line_fit_points_device_.size()),
@@ -143,16 +138,12 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       distortion_coefficients_(distortion_coefficients),
       radix_sort_tmpstorage_device_(RadixSortScratchSpace<QuadBoundaryPoint>(
           sorted_union_marker_pair_device_.size())),
-      temp_storage_compressed_union_marker_pair_device_(
-          DeviceSelectIfScratchSpace<QuadBoundaryPoint, QuadBoundaryPoint>(
-              union_marker_pair_device_.size(),
-              num_compressed_union_marker_pair_.device_ptr())),
       temp_storage_bounds_reduce_by_key_device_(
           DeviceReduceByKeyScratchSpace<uint64_t, MinMaxExtents>(
-              union_marker_pair_device_.size())),
+              compressed_union_marker_pair_device_.size())),
       temp_storage_compressed_filtered_blobs_device_(
           DeviceSelectIfScratchSpace<IndexPoint, IndexPoint>(
-              union_marker_pair_device_.size(),
+              compressed_union_marker_pair_device_.size(),
               num_selected_blobs_device_.get())),
       temp_storage_selected_extents_scan_device_(
           DeviceScanInclusiveScanScratchSpace<
@@ -182,6 +173,9 @@ GpuDetector::GpuDetector(size_t width, size_t height,
   // past the frame's blob pair count, which start out uninitialized.
   CHECK_CUDA(cudaMemsetAsync(extents_device_.get(), 0,
                              kMaxBlobs * sizeof(MinMaxExtents), stream_.get()));
+  // BlobDiff leaves its counters zeroed for the next frame.
+  CHECK_CUDA(cudaMemsetAsync(blob_diff_counters_device_.get(), 0,
+                             sizeof(BlobDiffCounters), stream_.get()));
   CHECK_CUDA(cudaStreamSynchronize(stream_.get()));
 
   for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
@@ -219,106 +213,31 @@ GpuDetector::~GpuDetector() {
 
 namespace {
 
-// Computes a massive image of 4x QuadBoundaryPoint per pixel with a
-// QuadBoundaryPoint for each pixel pair which crosses a blob boundary.
-template <size_t kBlockWidth, size_t kBlockHeight>
-__global__ void BlobDiff(const uint8_t *thresholded_image,
-                         const uint32_t *blobs,
-                         const uint32_t *union_markers_size,
-                         QuadBoundaryPoint *result, apriltag_size_t width,
-                         apriltag_size_t height) {
-  __shared__ uint32_t temp_blob_storage[kBlockWidth * kBlockHeight];
-  __shared__ uint8_t temp_image_storage[kBlockWidth * kBlockHeight];
+// Finds a QuadBoundaryPoint for each pixel pair which crosses the boundary
+// between two blobs of kMinBlobPixels or more, and appends them to points in no
+// particular order.  The last block to finish writes the number of points to
+// *num_points_host and zeros the counters for the next frame.
+//
+// Each block row is one warp.  Blocks overlap by 1 column on each side and 1
+// row below, so each pixel's neighbors are in shared memory.
+template <int kBlockWidth, int kBlockHeight>
+__global__ void __launch_bounds__(kBlockWidth *kBlockHeight)
+    BlobDiff(const uint8_t *thresholded_image, const uint32_t *blobs,
+             const uint32_t *union_markers_size, QuadBoundaryPoint *points,
+             BlobDiffCounters *counters, int *num_points_host,
+             apriltag_size_t width, apriltag_size_t height) {
+  static_assert(kBlockWidth == 32);
+  constexpr uint32_t kMinBlobPixels = 25;
+  __shared__ uint8_t thresholded[kBlockHeight][kBlockWidth];
+  typedef cub::WarpScan<uint32_t> WarpScan;
+  __shared__ typename WarpScan::TempStorage scan_storage[kBlockHeight];
 
-  // We overlap both directions in X, and only one direction in Y.
-  const uint x = blockIdx.x * (blockDim.x - 2) + threadIdx.x;
-  const uint y = blockIdx.y * (blockDim.y - 1) + threadIdx.y;
-
-  // Ignore anything outside the image.
-  if (x >= width || y >= height || y == 0) {
-    return;
-  }
-
-  // Compute the location in the image this threads is responsible for.
-  const uint global_input_index = x + y * width;
-  // And the destination in the temporary storage to save it.
-  const uint thread_linear_index = threadIdx.x + blockDim.x * threadIdx.y;
-
-  // Now, load all the data.
-  const uint32_t rep0 = temp_blob_storage[thread_linear_index] =
-      blobs[global_input_index];
-  const uint8_t v0 = temp_image_storage[thread_linear_index] =
-      thresholded_image[global_input_index];
-
-  // All threads in the block have now gotten this far so the shared memory is
-  // consistent.
+  const uint x = blockIdx.x * (kBlockWidth - 2) + threadIdx.x;
+  const uint y = blockIdx.y * (kBlockHeight - 1) + threadIdx.y;
+  const bool in_image = x < width && y < height;
+  thresholded[threadIdx.y][threadIdx.x] =
+      in_image ? thresholded_image[x + y * width] : 127;
   __syncthreads();
-
-  // We've done our job loading things into memory, this pixel is a boundary
-  // with the upper and left sides, or covered by the next block.
-  if (threadIdx.x == 0) {
-    return;
-  }
-
-  // We need to search both ways in x, this thread doesn't participate further
-  // :(
-  if (threadIdx.x == blockDim.x - 1) {
-    return;
-  }
-
-  if (threadIdx.y == blockDim.y - 1) {
-    return;
-  }
-
-  // This is the last pixel along the lower and right sides, we don't need to
-  // compute it.
-  if (x == width - 1 || y == height - 1) {
-    return;
-  }
-
-  // Place in memory to write the result.
-  const uint global_output_index = (x - 1) + (y - 1) * (width - 2);
-
-  // Short circuit 127's and write an empty point out.
-  if (v0 == 127 || union_markers_size[rep0] < 25) {
-#pragma unroll
-    for (size_t point_offset = 0; point_offset < 4; ++point_offset) {
-      const apriltag_size_t write_address =
-          (width - 2) * (height - 2) * point_offset + global_output_index;
-      result[write_address] = QuadBoundaryPoint();
-    }
-    return;
-  }
-
-  uint32_t rep1;
-  uint8_t v1;
-
-#define DO_CONN(dx, dy, point_offset)                                    \
-  {                                                                      \
-    QuadBoundaryPoint cluster_id;                                        \
-    const uint x1 = dx + threadIdx.x;                                    \
-    const uint y1 = dy + threadIdx.y;                                    \
-    const uint thread_linear_index1 = x1 + blockDim.x * y1;              \
-    v1 = temp_image_storage[thread_linear_index1];                       \
-    rep1 = temp_blob_storage[thread_linear_index1];                      \
-    if (v0 + v1 == 255) {                                                \
-      if (union_markers_size[rep1] >= 25) {                              \
-        if (rep0 < rep1) {                                               \
-          cluster_id.set_rep1(rep1);                                     \
-          cluster_id.set_rep0(rep0);                                     \
-        } else {                                                         \
-          cluster_id.set_rep1(rep0);                                     \
-          cluster_id.set_rep0(rep1);                                     \
-        }                                                                \
-        cluster_id.set_base_xy(x, y);                                    \
-        cluster_id.set_dxy(point_offset);                                \
-        cluster_id.set_black_to_white(v1 > v0);                          \
-      }                                                                  \
-    }                                                                    \
-    const apriltag_size_t write_address =                                \
-        (width - 2) * (height - 2) * point_offset + global_output_index; \
-    result[write_address] = cluster_id;                                  \
-  }
 
   // We search the following 4 neighbors.
   //      ________
@@ -327,35 +246,105 @@ __global__ void BlobDiff(const uint8_t *thresholded_image,
   //  | 3 | 2 | 1 |
   //  -------------
   //
-  //  If connection 3 has the same IDs as the connection between blocks 0 and 2,
-  //  we will have a duplicate entry.  Detect and don't add it.  This will only
-  //  happen if id(x) == id(0) and id(2) == id(3),
-  //         or id(x) == id(2) and id(0) ==id(3).
+  // The pixels along the image's edges and the block's overlap have no point
+  // of their own.
+  QuadBoundaryPoint point[4];
+  const uint8_t v0 = thresholded[threadIdx.y][threadIdx.x];
+  if (in_image && threadIdx.x != 0 && threadIdx.x != kBlockWidth - 1 &&
+      threadIdx.y != kBlockHeight - 1 && y != 0 && x != width - 1 &&
+      y != height - 1 && v0 != 127) {
+    const uint8_t v1[4] = {
+        thresholded[threadIdx.y][threadIdx.x + 1],
+        thresholded[threadIdx.y + 1][threadIdx.x + 1],
+        thresholded[threadIdx.y + 1][threadIdx.x],
+        thresholded[threadIdx.y + 1][threadIdx.x - 1],
+    };
+    const uint8_t v_left = thresholded[threadIdx.y][threadIdx.x - 1];
+    bool crosses[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      crosses[i] = v0 + v1[i] == 255;
+    }
 
-  DO_CONN(1, 0, 0);
-  DO_CONN(1, 1, 1);
-  DO_CONN(0, 1, 2);
-  const uint64_t rep_block_2 = rep1;
-  const uint8_t v1_block_2 = v1;
+    // Most pixels are inside a blob, and need nothing more.
+    if (crosses[0] || crosses[1] || crosses[2] || crosses[3]) {
+      // When the left pixel and 2 have different colors, the left pixel's
+      // point across 1 is at the same place as ours across 3, between the
+      // same two blobs, so ours is left out.  Pixels on the image's edge have
+      // no points.
+      const bool maybe_duplicate = crosses[3] && v_left != 127 &&
+                                   v1[2] != 127 && v_left != v1[2] && x != 1;
+      const uint index0 = x + y * width;
+      const uint index1[4] = {index0 + 1, index0 + width + 1, index0 + width,
+                              index0 + width - 1};
+      // Issue every load before using any, since each is a round trip to
+      // memory.
+      const uint32_t rep0 = blobs[index0];
+      uint32_t rep1[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        rep1[i] =
+            crosses[i] || (i == 2 && maybe_duplicate) ? blobs[index1[i]] : 0;
+      }
+      const uint32_t rep_left = maybe_duplicate ? blobs[index0 - 1] : 0;
+      const uint32_t size0 = union_markers_size[rep0];
+      uint32_t size1[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        size1[i] = crosses[i] || (i == 2 && maybe_duplicate)
+                       ? union_markers_size[rep1[i]]
+                       : 0;
+      }
+      const uint32_t size_left =
+          maybe_duplicate ? union_markers_size[rep_left] : 0;
 
-  const uint left_thread_linear_index1 =
-      threadIdx.x - 1 + blockDim.x * threadIdx.y;
-  const uint8_t v1_block_left = temp_image_storage[left_thread_linear_index1];
-  const uint32_t rep_block_left = temp_blob_storage[left_thread_linear_index1];
-
-  // Do the dedup calculation now.
-  if (v1_block_left != 127 && v1_block_2 != 127 &&
-      v1_block_2 != v1_block_left) {
-    if (x != 1 && union_markers_size[rep_block_left] >= 25 &&
-        union_markers_size[rep_block_2] >= 25) {
-      const uint32_t write_address =
-          (width - 2) * (height - 2) * 3 + global_output_index;
-      result[write_address] = QuadBoundaryPoint();
-      return;
+      if (size0 >= kMinBlobPixels) {
+        const bool duplicate = maybe_duplicate && size_left >= kMinBlobPixels &&
+                               size1[2] >= kMinBlobPixels;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          if (crosses[i] && size1[i] >= kMinBlobPixels &&
+              !(i == 3 && duplicate)) {
+            point[i].set_rep0(min(rep0, rep1[i]));
+            point[i].set_rep1(max(rep0, rep1[i]));
+            point[i].set_base_xy(x, y);
+            point[i].set_dxy(i);
+            point[i].set_black_to_white(v1[i] > v0);
+          }
+        }
+      }
     }
   }
 
-  DO_CONN(-1, 1, 3);
+  // Each warp claims space for its points with one atomic.
+  const uint32_t num_thread_points = point[0].nonzero() + point[1].nonzero() +
+                                     point[2].nonzero() + point[3].nonzero();
+  uint32_t offset;
+  uint32_t num_warp_points;
+  WarpScan(scan_storage[threadIdx.y])
+      .ExclusiveSum(num_thread_points, offset, num_warp_points);
+  uint32_t warp_start = 0;
+  if (threadIdx.x == 0 && num_warp_points > 0) {
+    warp_start = atomicAdd(&counters->num_points, num_warp_points);
+  }
+  offset += __shfl_sync(0xffffffffu, warp_start, 0);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    if (point[i].nonzero()) {
+      points[offset++] = point[i];
+    }
+  }
+
+  // Every warp in the block has its space once the block is past this.
+  __syncthreads();
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    __threadfence();
+    if (atomicAdd(&counters->num_finished_blocks, 1) ==
+        gridDim.x * gridDim.y - 1) {
+      *num_points_host = atomicExch(&counters->num_points, 0);
+      counters->num_finished_blocks = 0;
+    }
+  }
 }
 
 // Masks out just the blob ID pair, rep01.
@@ -1165,10 +1154,10 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   // 1280 -> 2 * 128 * 5
   // 720 -> 2 * 8 * 5 * 9
 
-  // Compute the unfiltered list of blob pairs and points.
+  // Find the points between blobs.
   {
-    constexpr size_t kBlockWidth = 32;
-    constexpr size_t kBlockHeight = 16;
+    constexpr int kBlockWidth = 32;
+    constexpr int kBlockHeight = 8;
     dim3 threads(kBlockWidth, kBlockHeight, 1);
     // Overlap 1 on each side in x, and 1 in y.
     dim3 blocks((decimated_width + threads.x - 3) / (threads.x - 2),
@@ -1179,44 +1168,26 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     BlobDiff<kBlockWidth, kBlockHeight><<<blocks, threads, 0, stream_.get()>>>(
         thresholded_image_device_.get(), union_markers_device_.get(),
-        union_markers_size_device_.get(), union_marker_pair_device_.get(),
-        decimated_width, decimated_height);
+        union_markers_size_device_.get(),
+        compressed_union_marker_pair_device_.get(),
+        blob_diff_counters_device_.get(),
+        num_compressed_union_marker_pair_.device_ptr(), decimated_width,
+        decimated_height);
     MaybeCheckAndSynchronize("BlobDiff");
   }
 
-  // TODO(austin): Can I do the first step of the zero removal in the BlobDiff
-  // kernel?
-
-  record_stage(after_diff_, &stream_);
-
-  {
-    // Remove empty points which aren't to be considered before sorting to speed
-    // things up.
-    size_t temp_storage_bytes =
-        temp_storage_compressed_union_marker_pair_device_.size();
-    NonZero nz;
-    CHECK_CUDA(cub::DeviceSelect::If(
-        temp_storage_compressed_union_marker_pair_device_.get(),
-        temp_storage_bytes, union_marker_pair_device_.get(),
-        compressed_union_marker_pair_device_.get(),
-        num_compressed_union_marker_pair_.device_ptr(),
-        union_marker_pair_device_.size(), nz, stream_.get()));
-
-    MaybeCheckAndSynchronize("cub::DeviceSelect::If");
-  }
-
-  after_compact_.Record(&stream_);
+  after_diff_.Record(&stream_);
 
   int num_compressed_union_marker_pairs;
   {
     // Now, sort just the keys to group like points.
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     QuadBoundaryPointDecomposer decomposer;
-    after_compact_.Synchronize(host_wait_spin_);
+    after_diff_.Synchronize(host_wait_spin_);
     num_compressed_union_marker_pairs =
         *num_compressed_union_marker_pair_.host_ptr();
     ABSL_CHECK_LE(static_cast<size_t>(num_compressed_union_marker_pairs),
-                  union_marker_pair_device_.size());
+                  compressed_union_marker_pair_device_.size());
     CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
         radix_sort_tmpstorage_device_.get(), temp_storage_bytes,
         compressed_union_marker_pair_device_.get(),

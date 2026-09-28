@@ -78,6 +78,8 @@ struct QuadBoundaryPoint {
   __forceinline__ __host__ __device__ void set_dxy(uint64_t dxy) {
     key = (key & 0xfffffffffffffffcull) | (static_cast<uint64_t>(dxy & 0x3));
   }
+  // Returns dxy.
+  __forceinline__ __host__ __device__ uint32_t dxy() const { return key & 0x3; }
 
   // Returns the change in x derived from the search direction.
   __forceinline__ __host__ __device__ int32_t dx() const {
