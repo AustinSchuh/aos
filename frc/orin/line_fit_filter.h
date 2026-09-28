@@ -1,6 +1,8 @@
 #ifndef FRC_ORIN_LINE_FIT_FILTER_H_
 #define FRC_ORIN_LINE_FIT_FILTER_H_
 
+#include <array>
+#include <bit>
 #include <cub/iterator/transform_input_iterator.cuh>
 #include <cuda/std/tuple>
 
@@ -105,20 +107,6 @@ struct Peak {
   uint16_t blob_index;
 };
 
-struct PeakExtents {
-  uint16_t blob_index;
-  uint32_t starting_offset;
-  uint32_t count;
-};
-
-struct PeakDecomposer {
-  static constexpr size_t kBitsInKey = 16 + 32;
-  __host__ __device__ ::cuda::std::tuple<uint16_t &, float &> operator()(
-      Peak &key) const {
-    return {key.blob_index, key.error};
-  }
-};
-
 constexpr std::array<float, 7> FilterCoefficients() {
   return std::array<float, 7>{
       0.01110899634659290314, 0.13533528149127960205, 0.60653066635131835938,
@@ -143,12 +131,29 @@ void FitLines(
     double *errs_device, double *filtered_errs_device, Peak *peaks_device,
     CudaStream *stream);
 
+// Fits a quad to each of the first num_blobs blobs in selected_extents_device
+// from its best nmaxima peaks, the way aprilrobotics' fit_quad does.  A blob's
+// quad goes in its own slot of fit_quads_device, and fit_quad_valid_device says
+// which slots hold a valid quad.  No blob has more than max_blob_points points.
 void FitQuads(
-    const Peak *peaks_device, size_t peaks, const PeakExtents *peak_extents,
-    size_t num_extents, const LineFitPoint *line_fit_points_device, int nmaxima,
+    const Peak *peaks_device, const LineFitPoint *line_fit_points_device,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
+    size_t num_blobs, size_t max_blob_points, int nmaxima,
     float max_line_fit_mse, double cos_critical_rad, FitQuad *fit_quads_device,
-    CudaStream *stream);
+    bool *fit_quad_valid_device, CudaStream *stream);
+
+// Returns a key which orders peaks the way a stable cub radix sort by error
+// does: by error, then by index.  cub compares floats by their bits, with -0.0
+// equal to +0.0.
+__host__ __device__ inline uint64_t PeakSortKey(float error, uint32_t index) {
+  uint32_t bits = std::bit_cast<uint32_t>(error);
+  if (bits == 0x80000000u) {
+    bits = 0;
+  }
+  // Negative floats order backwards by their bits, and below positive ones.
+  bits ^= (bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+  return (static_cast<uint64_t>(bits) << 32) | index;
+}
 
 // Returns the m0, m1, m2, m3 indices for the provided index.  The index is the
 // inner loop number when you process the 4 for loops in order and count.  See
@@ -158,6 +163,10 @@ void FitQuads(
 __host__ __device__ std::tuple<uint, uint, uint, uint> Unrank(uint i);
 // The max number of work elements for a max maxes of 10.
 constexpr size_t MaxRankedIndex() { return 210; }
+
+// Returns Unrank(i) for every i, packed as m0 | m1 << 8 | m2 << 16 | m3 << 24,
+// the table the quad fit's threads look their combination up in.
+std::array<uint32_t, MaxRankedIndex()> PackedUnrank();
 
 }  // namespace frc::apriltag
 

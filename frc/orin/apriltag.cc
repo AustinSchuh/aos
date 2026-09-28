@@ -148,12 +148,8 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       errs_device_(line_fit_points_device_.size()),
       filtered_errs_device_(line_fit_points_device_.size()),
       filtered_is_local_peak_device_(line_fit_points_device_.size()),
-      compressed_peaks_device_(line_fit_points_device_.size()),
-      sorted_compressed_peaks_device_(line_fit_points_device_.size()),
-      peak_extents_device_(kMaxBlobs),
       camera_matrix_(camera_matrix),
       distortion_coefficients_(distortion_coefficients),
-      fit_quads_device_(kMaxBlobs),
       radix_sort_tmpstorage_device_(RadixSortScratchSpace<QuadBoundaryPoint>(
           sorted_union_marker_pair_device_.size())),
       temp_storage_compressed_union_marker_pair_device_(
@@ -162,12 +158,6 @@ GpuDetector::GpuDetector(size_t width, size_t height,
               num_compressed_union_marker_pair_.device_ptr())),
       temp_storage_bounds_reduce_by_key_device_(
           DeviceReduceByKeyScratchSpace<uint64_t, MinMaxExtents>(
-              union_marker_pair_device_.size())),
-      temp_storage_peak_reduce_by_key_device_(
-          DeviceReduceByKeyScratchSpace<uint32_t, PeakExtents, int, int>(
-              compressed_peaks_device_.size())),
-      temp_storage_dot_product_device_(
-          DeviceReduceByKeyScratchSpace<uint64_t, float>(
               union_marker_pair_device_.size())),
       temp_storage_compressed_filtered_blobs_device_(
           DeviceSelectIfScratchSpace<IndexPoint, IndexPoint>(
@@ -685,40 +675,6 @@ struct SumLineFitPoints {
   }
 };
 
-struct ValidPeaks {
-  __host__ __device__ __forceinline__ bool operator()(const Peak &a) const {
-    return a.blob_index != Peak::kNoPeak();
-  }
-};
-
-struct TransformToPeakExtents {
-  __host__ __device__ __forceinline__ PeakExtents
-  operator()(const cub::KeyValuePair<long, Peak> &a) const {
-    PeakExtents result;
-    result.blob_index = a.value.blob_index;
-    result.starting_offset = a.key;
-    result.count = 1;
-    return result;
-  }
-};
-
-struct MaskPeakExtentsByBlobId {
-  __host__ __device__ __forceinline__ uint32_t operator()(const Peak &a) const {
-    return a.blob_index;
-  }
-};
-
-struct MergePeakExtents {
-  __host__ __device__ __forceinline__ PeakExtents
-  operator()(const PeakExtents &a, const PeakExtents &b) const {
-    PeakExtents result;
-    result.blob_index = a.blob_index;
-    result.starting_offset = std::min(a.starting_offset, b.starting_offset);
-    result.count = a.count + b.count;
-    return result;
-  }
-};
-
 }  // namespace
 
 void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
@@ -1043,104 +999,17 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   }
   record_stage(after_line_filter_, &stream_);
 
-  int num_compressed_peaks_host;
-  {
-    // Remove empty points which aren't to be considered before sorting to speed
-    // things up.
-    size_t temp_storage_bytes =
-        temp_storage_compressed_union_marker_pair_device_.size();
-    ValidPeaks peak_filter;
-    CHECK_CUDA(cub::DeviceSelect::If(
-        temp_storage_compressed_union_marker_pair_device_.get(),
-        temp_storage_bytes, filtered_is_local_peak_device_.get(),
-        compressed_peaks_device_.get(), num_compressed_peaks_device_.get(),
-        num_selected_blobs_host, peak_filter, stream_.get()));
-
-    record_stage(after_peak_compression_, &stream_);
-    MaybeCheckAndSynchronize("cub::DeviceSelect::If");
-    num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host_,
-                                               &stream_);
-    after_peak_count_memcpy_.Record(&stream_);
-    after_peak_count_memcpy_.Synchronize(host_wait_spin_);
-    num_compressed_peaks_host = *num_compressed_peaks_host_.get();
-  }
-
-  {
-    // Sort based on the angle.
-    size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
-    PeakDecomposer decomposer;
-
-    CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
-        radix_sort_tmpstorage_device_.get(), temp_storage_bytes,
-        compressed_peaks_device_.get(), sorted_compressed_peaks_device_.get(),
-        num_compressed_peaks_host, decomposer, 0, PeakDecomposer::kBitsInKey,
-        stream_.get()));
-
-    MaybeCheckAndSynchronize("cub::DeviceRadixSort::SortKeys");
-  }
-
-  record_stage(after_peak_sort_, &stream_);
-
-  int num_quad_peaked_quads_host;
-  // Now that we have the peaks sorted, recompute the extents so we can easily
-  // pick out the number and top 10 peaks for line fitting.
-  {
-    // Our next step is to compute the extents of each blob so we can filter
-    // blobs.
-    cub::ArgIndexInputIterator<Peak *> value_index_input_iterator(
-        sorted_compressed_peaks_device_.get());
-    TransformToPeakExtents transform_extents;
-    cub::TransformInputIterator<PeakExtents, TransformToPeakExtents,
-                                cub::ArgIndexInputIterator<Peak *>>
-        value_input_iterator(value_index_input_iterator, transform_extents);
-
-    // Don't care about the output keys...
-    cub::DiscardOutputIterator<uint32_t> key_discard_iterator;
-
-    // Provide a mask to detect keys by rep01()
-    MaskPeakExtentsByBlobId mask;
-    cub::TransformInputIterator<uint32_t, MaskPeakExtentsByBlobId, Peak *>
-        key_input_iterator(sorted_compressed_peaks_device_.get(), mask);
-
-    // Reduction operator.
-    MergePeakExtents reduce;
-
-    size_t temp_storage_bytes = temp_storage_peak_reduce_by_key_device_.size();
-    CHECK_CUDA(cub::DeviceReduce::ReduceByKey(
-        temp_storage_peak_reduce_by_key_device_.get(), temp_storage_bytes,
-        key_input_iterator, key_discard_iterator, value_input_iterator,
-        peak_extents_device_.get(), num_quad_peaked_quads_device_.get(), reduce,
-        num_compressed_peaks_host, stream_.get()));
-    MaybeCheckAndSynchronize("cub::DeviceReduce::ReduceByKey");
-
-    record_stage(after_filtered_peak_reduce_, &stream_);
-
-    num_quad_peaked_quads_device_.MemcpyAsyncTo(&num_quad_peaked_quads_host_,
-                                                &stream_);
-    MaybeCheckAndSynchronize("num_quad_peaked_quads_device_.MemcpyTo");
-    after_filtered_peak_host_memcpy_.Record(&stream_);
-    after_filtered_peak_host_memcpy_.Synchronize(host_wait_spin_);
-    num_quad_peaked_quads_host = *num_quad_peaked_quads_host_.get();
-  }
-
-  {
-    apriltag::FitQuads(
-        sorted_compressed_peaks_device_.get(), num_compressed_peaks_host,
-        peak_extents_device_.get(), num_quad_peaked_quads_host,
-        line_fit_points_device_.get(), tag_detector_->qtp.max_nmaxima,
-        selected_extents_device_.get(), tag_detector_->qtp.max_line_fit_mse,
-        tag_detector_->qtp.cos_critical_rad, fit_quads_device_.get(), &stream_);
-    MaybeCheckAndSynchronize("FitQuads");
-  }
+  // The host reads the quads where this writes them, so this is the only wait
+  // after the filtered points' count.
+  apriltag::FitQuads(
+      filtered_is_local_peak_device_.get(), line_fit_points_device_.get(),
+      selected_extents_device_.get(), kMaxBlobs, max_april_tag_perimeter,
+      tag_detector_->qtp.max_nmaxima, tag_detector_->qtp.max_line_fit_mse,
+      tag_detector_->qtp.cos_critical_rad, fit_quads_host_.device_ptr(),
+      fit_quad_valid_host_.device_ptr(), &stream_);
+  MaybeCheckAndSynchronize("FitQuads");
   after_quad_fit_.Record(&stream_);
-
-  {
-    num_fit_quads_host_ = num_quad_peaked_quads_host;
-    fit_quads_device_.MemcpyAsyncTo(fit_quads_host_.get(), num_fit_quads_host_,
-                                    &stream_);
-    after_quad_fit_memcpy_.Record(&stream_);
-    after_quad_fit_memcpy_.Synchronize(host_wait_spin_);
-  }
+  after_quad_fit_.Synchronize(host_wait_spin_);
 
   // selected_extents_device_ and the 12 bit blob index in IndexPoint only hold
   // kMaxBlobs blobs, so the GPU filtered every blob out of an overflowing
@@ -1169,15 +1038,13 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   ABSL_VLOG(1) << "Selected " << num_selected_blobs_host
                << " right side out points";
   ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;
-  ABSL_VLOG(1) << "Peaks " << num_compressed_peaks_host << " peaks";
-  ABSL_VLOG(1) << "Peak Selected blobs " << num_quad_peaked_quads_host
-               << " quads";
+  ABSL_VLOG(1) << "Fit " << quad_corners_host_.size() << " quads";
   const std::chrono::nanoseconds gpu_time = after_quad_fit_.ElapsedTime(start_);
   gpu_time_ms_ = float_milli(gpu_time).count();
   host_decode_time_ms_ = float_milli(end_time - before_fit_quads).count();
   if (stage_timing_) {
-    // Every event completed before after_quad_fit_memcpy_, which the host
-    // already waited on.
+    // Every event completed before after_quad_fit_, which the host already
+    // waited on.
     stage_times_ms_.clear();
     if (absl::GetFlag(FLAGS_use_neon)) {
       stage_times_ms_.emplace_back("NEON threshold (host)", neon_threshold_ms);

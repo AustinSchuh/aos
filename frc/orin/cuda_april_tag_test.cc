@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <cub/device/device_radix_sort.cuh>
 #include <numbers>
 #include <numeric>
 #include <random>
@@ -2311,6 +2312,7 @@ TEST(FilterTest, Matches) {
 
 // Tests that Unrank returns the right value for each input.
 TEST(FilterTest, Unrank) {
+  const std::array<uint32_t, MaxRankedIndex()> packed = PackedUnrank();
   const int nmaxima = 10;
   int overall_count = 0;
   for (int m0 = 0; m0 < nmaxima - 3; m0++) {
@@ -2328,12 +2330,63 @@ TEST(FilterTest, Unrank) {
           ASSERT_EQ(m1, std::get<1>(unranked));
           ASSERT_EQ(m2, std::get<2>(unranked));
           ASSERT_EQ(m3, std::get<3>(unranked));
+          ASSERT_EQ(packed[overall_count],
+                    static_cast<uint32_t>(m0 | m1 << 8 | m2 << 16 | m3 << 24));
           ++overall_count;
         }
       }
     }
   }
   EXPECT_EQ(overall_count, MaxRankedIndex());
+}
+
+// Sorts peaks by error with cub's radix sort.
+struct PeakErrorDecomposer {
+  __host__ __device__ ::cuda::std::tuple<float &> operator()(Peak &key) const {
+    return {key.error};
+  }
+};
+
+// Tests that PeakSortKey orders peaks the way a stable cub radix sort by error
+// does, including how it breaks ties and orders signed zeros and NaNs.
+TEST(FilterTest, PeakSortKey) {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  const float denorm = std::numeric_limits<float>::denorm_min();
+  const std::vector<float> errors = {
+      0.0f,    -0.0f,  1.0f,  -1.0f, -0.0f,    0.0f,    -2.5f,   2.5f,
+      -2.5f,   inf,    -inf,  nan,   -nan,     denorm,  -denorm, 1.0f,
+      -1e-30f, 1e-30f, -1.0f, 0.0f,  -3.0e38f, 3.0e38f, -0.0f,   7.0f,
+  };
+  std::vector<Peak> peaks(errors.size());
+  for (size_t i = 0; i < errors.size(); ++i) {
+    peaks[i] = Peak{.error = errors[i],
+                    .filtered_point_index = static_cast<uint32_t>(i)};
+  }
+
+  GpuMemory<Peak> peaks_device(peaks.size());
+  GpuMemory<Peak> sorted_peaks_device(peaks.size());
+  peaks_device.MemcpyFrom(peaks.data());
+  size_t temp_storage_bytes = 0;
+  CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
+      nullptr, temp_storage_bytes, peaks_device.get(),
+      sorted_peaks_device.get(), peaks.size(), PeakErrorDecomposer{}));
+  GpuMemory<uint8_t> temp_storage(temp_storage_bytes);
+  CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
+      temp_storage.get(), temp_storage_bytes, peaks_device.get(),
+      sorted_peaks_device.get(), peaks.size(), PeakErrorDecomposer{}));
+  const std::vector<Peak> sorted_peaks = sorted_peaks_device.Copy();
+
+  std::vector<uint32_t> expected_order(peaks.size());
+  std::iota(expected_order.begin(), expected_order.end(), 0);
+  std::sort(expected_order.begin(), expected_order.end(),
+            [&](uint32_t a, uint32_t b) {
+              return PeakSortKey(errors[a], a) < PeakSortKey(errors[b], b);
+            });
+  for (size_t i = 0; i < peaks.size(); ++i) {
+    EXPECT_EQ(sorted_peaks[i].filtered_point_index, expected_order[i])
+        << ": at " << i;
+  }
 }
 
 // Tests our Undistort is working properly
@@ -2454,7 +2507,6 @@ TEST_F(SyntheticImageTest, Blank) {
     EXPECT_EQ(gpu_detector_.NumCompressedUnionMarkerPairs(), 0);
     EXPECT_EQ(gpu_detector_.NumQuads(), 0);
     EXPECT_EQ(gpu_detector_.NumSelectedPairs(), 0);
-    EXPECT_EQ(gpu_detector_.NumCompressedPeaks(), 0);
     EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
     EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
     EXPECT_FALSE(gpu_detector_.last_frame_overflowed());
@@ -2470,7 +2522,6 @@ TEST_F(SyntheticImageTest, TooManyBlobs) {
   EXPECT_EQ(gpu_detector_.NumQuads(), 3564);
   EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
   EXPECT_EQ(gpu_detector_.NumSelectedPairs(), 0);
-  EXPECT_EQ(gpu_detector_.NumCompressedPeaks(), 0);
   EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
   EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
 

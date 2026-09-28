@@ -171,6 +171,12 @@ class MappedHostMemory {
   // GPU writes it behind the compiler's back.
   const volatile T *host_ptr() const { return span_.data(); }
 
+  // Returns the memory for the host to read as ordinary memory, which structs
+  // need since they can't be copied out through host_ptr().  Only read it
+  // after the same wait as host_ptr(): the wait is a call the compiler can't
+  // see into, so it doesn't reuse anything read before it.
+  std::span<const T> host_span() const { return span_; }
+
   // Returns the pointer for kernels to use.
   T *device_ptr() { return device_ptr_; }
 

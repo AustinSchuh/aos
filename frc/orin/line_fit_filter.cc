@@ -1,7 +1,7 @@
 #include "frc/orin/line_fit_filter.h"
 
 #include <cub/block/block_reduce.cuh>
-#include <cub/warp/warp_merge_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <iomanip>
 
 #include "absl/log/absl_check.h"
@@ -677,7 +677,7 @@ constexpr std::array<uint, 7> BinomialM1() {
 }
 
 // Returns the m0 for the provided global index.
-__host__ __device__ const cuda::std::pair<uint, uint> FindM0(uint i) {
+constexpr __host__ __device__ const cuda::std::pair<uint, uint> FindM0(uint i) {
   uint m0 = 0;
   uint last = 0;
   while (true) {
@@ -691,7 +691,8 @@ __host__ __device__ const cuda::std::pair<uint, uint> FindM0(uint i) {
 }
 
 // Returns the m1 for the provided m0 and global index remainder.
-__host__ __device__ const cuda::std::pair<uint, uint> FindM1(uint m0, uint i) {
+constexpr __host__ __device__ const cuda::std::pair<uint, uint> FindM1(uint m0,
+                                                                       uint i) {
   uint m1 = m0;
   while (true) {
     uint next = BinomialM1()[m1];
@@ -704,7 +705,8 @@ __host__ __device__ const cuda::std::pair<uint, uint> FindM1(uint m0, uint i) {
 }
 
 // Returns the m2 for the provided m1 and global index remainder.
-__host__ __device__ const cuda::std::pair<uint, uint> FindM2(uint m1, uint i) {
+constexpr __host__ __device__ const cuda::std::pair<uint, uint> FindM2(uint m1,
+                                                                       uint i) {
   uint m2 = m1;
   while (true) {
     uint next = kNMaxima - m2 - 1 - 1;
@@ -716,9 +718,8 @@ __host__ __device__ const cuda::std::pair<uint, uint> FindM2(uint m1, uint i) {
   }
 }
 
-}  // namespace
-
-__host__ __device__ std::tuple<uint, uint, uint, uint> Unrank(uint i) {
+// Unrank(), for use in constant expressions.
+constexpr std::tuple<uint, uint, uint, uint> ConstexprUnrank(uint i) {
   uint m0 = 0;
   uint m1;
   uint m2;
@@ -739,19 +740,24 @@ __host__ __device__ std::tuple<uint, uint, uint, uint> Unrank(uint i) {
   return std::make_tuple(m0, m1, m2, m3);
 }
 
-// TODO(austin): Convert this into a constant lookup.
-__device__ __host__ cuda::std::pair<uint, uint> GetM0M1(uint tid) {
-  constexpr int nmaxima = kNMaxima;
-  uint count = 0;
-  for (uint m0 = 0; m0 < nmaxima - 3; m0++) {
-    for (uint m1 = m0 + 1; m1 < nmaxima - 2; m1++) {
-      if (count == tid) {
-        return cuda::std::make_pair(m0, m1);
-      }
-      ++count;
-    }
+constexpr std::array<uint32_t, MaxRankedIndex()> MakePackedUnrank() {
+  std::array<uint32_t, MaxRankedIndex()> result{};
+  for (uint i = 0; i < MaxRankedIndex(); ++i) {
+    const std::tuple<uint, uint, uint, uint> ms = ConstexprUnrank(i);
+    result[i] = std::get<0>(ms) | std::get<1>(ms) << 8 | std::get<2>(ms) << 16 |
+                std::get<3>(ms) << 24;
   }
-  return cuda::std::make_pair(0, 0);
+  return result;
+}
+
+}  // namespace
+
+__host__ __device__ std::tuple<uint, uint, uint, uint> Unrank(uint i) {
+  return ConstexprUnrank(i);
+}
+
+std::array<uint32_t, MaxRankedIndex()> PackedUnrank() {
+  return MakePackedUnrank();
 }
 
 __device__ __forceinline__ LineFitMoments
@@ -892,188 +898,6 @@ __device__ __forceinline__ void FitLine(
   FitLine(moments, lineparam01, lineparam23, err, mse, print);
 }
 
-struct QuadFitStorage {
-  double errorm0m1[kNMaxima - 3][kNMaxima - 3];
-  double lineparams23m0m1[kNMaxima - 3][kNMaxima - 3][2];
-  uint16_t point_indices[16];
-};
-
-class QuadFitCalculator {
- public:
-  __host__ __device__ QuadFitCalculator(
-      const Peak *peaks_device, const PeakExtents *peak_extents,
-      const LineFitPoint *line_fit_points_device,
-      const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-      float max_line_fit_mse, double max_dot, QuadFitStorage *storage)
-      : peaks_device_(peaks_device),
-        extents_(peak_extents[blockIdx.x]),
-        selected_extent_(selected_extents_device[extents_.blob_index].value),
-        line_fit_points_device_(line_fit_points_device +
-                                selected_extent_.starting_offset),
-        max_line_fit_mse_(max_line_fit_mse),
-        max_dot_(max_dot),
-        storage_(storage) {}
-
-  __host__ __device__ int RawIndexFromMaxima(int m) const {
-    return peaks_device_[m + extents_.starting_offset].filtered_point_index -
-           selected_extent_.starting_offset;
-  }
-
-  __host__ __device__ uint32_t IndexFromMaxima(int m) const {
-    return storage_->point_indices[m];
-  }
-
-  __device__ __forceinline__ uint32_t sz() const {
-    return selected_extent_.count;
-  }
-
-  __device__ __forceinline__ void FitLine(size_t index0, size_t index1,
-                                          double *lineparam01,
-                                          double *lineparam23, double *err,
-                                          double *mse,
-                                          bool print = false) const {
-    if (print) {
-      printf("Block %d Thread %d   Fitting line %d, %d\n", blockIdx.x,
-             threadIdx.x, (int)index0, (int)index1);
-    }
-    ::frc::apriltag::FitLine(line_fit_points_device_, selected_extent_.count,
-                             index0, index1, lineparam01, lineparam23, err, mse,
-                             print);
-  }
-
-  __device__ __forceinline__ LineFitMoments ReadMoments(size_t index0,
-                                                        size_t index1) {
-    return ::frc::apriltag::ReadMoments(line_fit_points_device_,
-                                        selected_extent_.count, index0, index1);
-  }
-
-  __device__ void ComputeM0M1Fit() {
-    if (extents_.count < 4) {
-      return;
-    }
-
-    cuda::std::pair<uint, uint> m0m1 = GetM0M1(threadIdx.x);
-    const uint m0 = m0m1.first;
-    const uint m1 = m0m1.second;
-    if (m0 >= m1) {
-      return;
-    }
-
-    // First 35 threads compute the first 35 m0, m1 pairs.
-    // That lets us cache them in shared memory.  Then, all the threads
-    // calculate the full depth of the tree.
-    //
-    // If we don't have the full kNMaxima maxima, skip any indices which are
-    // past the end.
-    if (m1 < kNMaxima && m1 < extents_.count) {
-      const uint i0 = IndexFromMaxima(m0);
-      const uint i1 = IndexFromMaxima(m1);
-
-      double err01;
-      double mse01;
-
-      FitLine(i0, i1, nullptr, storage_->lineparams23m0m1[m0][m1 - 1], &err01,
-              &mse01);
-
-      if (mse01 > max_line_fit_mse_) {
-        err01 = std::numeric_limits<double>::max();
-      }
-
-      storage_->errorm0m1[m0][m1 - 1] = err01;
-    } else {
-      storage_->errorm0m1[m0][m1 - 1] = std::numeric_limits<double>::max();
-    }
-  }
-
-  __host__ __device__ int blob_index() const { return extents_.blob_index; }
-
-  __device__ double FitLines(uint m0, uint m1, uint m2, uint m3) const {
-    const bool print =
-#ifdef DEBUG_BLOB_NUMBER
-        (blob_index() == DEBUG_BLOB_NUMBER &&
-         (  //(m0 == 5 && m1 == 6 && m2 == 7 && m3 == 8) ||
-             (m0 == 0 && m1 == 4 && m2 == 8 && m3 == 9)));
-#else
-        false;
-#endif
-    double err = std::numeric_limits<double>::max();
-
-    if (extents_.count < 4) {
-      return err;
-    }
-
-    if (m3 >= kNMaxima || m3 >= extents_.count) {
-      return err;
-    }
-
-    const double errm0m1 = storage_->errorm0m1[m0][m1 - 1];
-    if (errm0m1 == std::numeric_limits<double>::max()) {
-      return err;
-    }
-
-    const double *paramsm0m123 = storage_->lineparams23m0m1[m0][m1 - 1];
-
-    double errm1m2;
-    double msem1m2;
-    double paramsm1m223[2];
-
-    const int i1 = IndexFromMaxima(m1);
-    const int i2 = IndexFromMaxima(m2);
-    FitLine(i1, i2, nullptr, paramsm1m223, &errm1m2, &msem1m2, print);
-    if (msem1m2 > max_line_fit_mse_) {
-      return std::numeric_limits<double>::max();
-    }
-
-    // return m0 + m1 * 10 + m2 * 100 + m3 * 1000 + errm0m1 + errm1m2;
-
-    const double dot =
-        paramsm0m123[0] * paramsm1m223[0] + paramsm0m123[1] * paramsm1m223[1];
-    if (fabs(dot) > max_dot_) {
-      return std::numeric_limits<double>::max();
-    }
-
-    const int i3 = IndexFromMaxima(m3);
-
-    double errm2m3;
-    double msem2m3;
-
-    FitLine(i2, i3, nullptr, nullptr, &errm2m3, &msem2m3, print);
-    if (msem2m3 > max_line_fit_mse_) {
-      return std::numeric_limits<double>::max();
-    }
-
-    const int i0 = IndexFromMaxima(m0);
-    double errm3m0;
-    double msem3m0;
-    FitLine(i3, i0, nullptr, nullptr, &errm3m0, &msem3m0, print);
-    if (msem3m0 > max_line_fit_mse_) {
-      return std::numeric_limits<double>::max();
-    }
-
-    if (print) {
-      printf(
-          "Block %d Thread %d  %d %d %d %d: errm0m1 %f errm1m2 %f errm2m3 %f "
-          "errm3m0 %f\n",
-          blockIdx.x, threadIdx.x, i0, i1, i2, i3, errm0m1, errm1m2, errm2m3,
-          errm3m0);
-    }
-
-    return errm0m1 + errm1m2 + errm2m3 + errm3m0;
-  }
-
-  __host__ __device__ size_t peaks_count() const { return extents_.count; }
-
- private:
-  const Peak *peaks_device_;
-  const PeakExtents extents_;
-  const MinMaxExtents selected_extent_;
-
-  const LineFitPoint *line_fit_points_device_;
-  const float max_line_fit_mse_;
-  const double max_dot_;
-  QuadFitStorage *storage_;
-};
-
 struct QuadError {
   uint8_t m0;
   uint8_t m1;
@@ -1093,140 +917,243 @@ struct MinQuadError {
   }
 };
 
-struct CustomLess {
-  __device__ bool operator()(const uint16_t lhs, const uint16_t rhs) {
-    return lhs < rhs;
-  }
+namespace {
+
+// Threads per DoFitQuads block.  Each combination of 4 peaks gets its own
+// thread.
+constexpr uint32_t kFitQuadsThreads = 256;
+static_assert(kFitQuadsThreads >= MaxRankedIndex());
+
+// Unrank() for each DoFitQuads thread, so the threads look their combination up
+// instead of computing it.
+__constant__ std::array<uint32_t, MaxRankedIndex()> kPackedUnrank =
+    MakePackedUnrank();
+
+// A line fit to the points between two peaks.
+struct SegmentFit {
+  double err;
+  double mse;
+  // Only set for segments which don't wrap around the end of the blob.
+  double lineparam23[2];
 };
 
-__global__ void DoFitQuads(
-    const Peak *peaks_device, const PeakExtents *peak_extents,
-    const LineFitPoint *line_fit_points_device,
+struct FitQuadsStorage {
+  typedef cub::BlockScan<int, kFitQuadsThreads> BlockScan;
+  typedef cub::BlockReduce<QuadError, kFitQuadsThreads> BlockReduce;
+
+  union {
+    typename BlockScan::TempStorage scan;
+    typename BlockReduce::TempStorage reduce;
+  } cub;
+
+  // The best kNMaxima peaks' point indices, by rank.
+  uint16_t best_peaks[kNMaxima];
+  // The same point indices, in point order.
+  uint16_t point_indices[kNMaxima];
+
+  // segments[a][b] fits the points from point_indices[a] to point_indices[b],
+  // wrapping around the end of the blob when a > b.
+  SegmentFit segments[kNMaxima][kNMaxima];
+};
+
+// Returns the error of the quad with corners at the peaks quad.m0-m3, or the
+// max double if they don't make a quad, checking the segments in the same
+// order aprilrobotics does.
+__device__ double QuadFitError(const FitQuadsStorage &storage,
+                               const QuadError &quad, uint32_t num_maxima,
+                               float max_line_fit_mse, double max_dot) {
+  constexpr double kMaxError = std::numeric_limits<double>::max();
+  if (quad.m3 >= num_maxima) {
+    return kMaxError;
+  }
+
+  const SegmentFit &segment01 = storage.segments[quad.m0][quad.m1];
+  if (segment01.mse > max_line_fit_mse) {
+    return kMaxError;
+  }
+  const SegmentFit &segment12 = storage.segments[quad.m1][quad.m2];
+  if (segment12.mse > max_line_fit_mse) {
+    return kMaxError;
+  }
+
+  const double dot = segment01.lineparam23[0] * segment12.lineparam23[0] +
+                     segment01.lineparam23[1] * segment12.lineparam23[1];
+  if (fabs(dot) > max_dot) {
+    return kMaxError;
+  }
+
+  const SegmentFit &segment23 = storage.segments[quad.m2][quad.m3];
+  if (segment23.mse > max_line_fit_mse) {
+    return kMaxError;
+  }
+  const SegmentFit &segment30 = storage.segments[quad.m3][quad.m0];
+  if (segment30.mse > max_line_fit_mse) {
+    return kMaxError;
+  }
+
+  return segment01.err + segment12.err + segment23.err + segment30.err;
+}
+
+// Fits a quad to blob blockIdx.x from its best kNMaxima peaks.  peak_keys has
+// room for max_peaks keys.
+__global__ void __launch_bounds__(kFitQuadsThreads) DoFitQuads(
+    const Peak *peaks_device, const LineFitPoint *line_fit_points_device,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    float max_line_fit_mse, double cos_critical_rad,
-    FitQuad *fit_quads_device) {
-  __shared__ QuadFitStorage storage;
-  // Specialize BlockReduce for a 1D block of 128 threads of type int
-  typedef cub::BlockReduce<QuadError, MaxRankedIndex()> BlockReduce;
-  // Allocate shared memory for BlockReduce
-  __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
+    uint32_t max_peaks, float max_line_fit_mse, double max_dot,
+    FitQuad *fit_quads_device, bool *fit_quad_valid_device) {
+  extern __shared__ uint64_t peak_keys[];
+  __shared__ FitQuadsStorage storage;
 
-  QuadFitCalculator calculator(peaks_device, peak_extents,
-                               line_fit_points_device, selected_extents_device,
-                               max_line_fit_mse, cos_critical_rad, &storage);
-
-  // Step 1, unsort the maxima back by point index.
-  constexpr size_t kItemsPerThread = 1;
-  constexpr size_t kItems = 16;
-  using WarpMergeSortT = cub::WarpMergeSort<uint16_t, kItemsPerThread, kItems>;
-
-  if (threadIdx.x < kItems) {
-    __shared__ typename WarpMergeSortT::TempStorage temp_storage_merge;
-    uint16_t index[1];
-    if (threadIdx.x >= calculator.peaks_count() || threadIdx.x >= kNMaxima) {
-      index[0] = std::numeric_limits<uint16_t>::max();
-    } else {
-      index[0] = calculator.RawIndexFromMaxima(threadIdx.x);
+  const uint32_t blob_index = blockIdx.x;
+  const MinMaxExtents extents = selected_extents_device[blob_index].value;
+  const uint32_t count = extents.count;
+  // Filtered out blobs, and blobs past the end, have no points.
+  if (count == 0) {
+    if (threadIdx.x == 0) {
+      fit_quad_valid_device[blob_index] = false;
     }
-    WarpMergeSortT(temp_storage_merge).Sort(index, CustomLess());
-    storage.point_indices[threadIdx.x] = index[0];
+    return;
+  }
+  const Peak *peaks = peaks_device + extents.starting_offset;
+  const LineFitPoint *line_fit_points =
+      line_fit_points_device + extents.starting_offset;
+
+  // Collect the peaks' keys, in point order.
+  uint32_t num_peaks = 0;
+  for (uint32_t chunk = 0; chunk < count; chunk += kFitQuadsThreads) {
+    const uint32_t index = chunk + threadIdx.x;
+    int is_peak = 0;
+    float error = 0;
+    if (index < count) {
+      is_peak = peaks[index].blob_index != Peak::kNoPeak();
+      error = peaks[index].error;
+    }
+    int offset;
+    int chunk_peaks;
+    FitQuadsStorage::BlockScan(storage.cub.scan)
+        .ExclusiveSum(is_peak, offset, chunk_peaks);
+    // Two neighboring points can't both be peaks, so this always holds.
+    if (is_peak && num_peaks + offset < max_peaks) {
+      peak_keys[num_peaks + offset] = PeakSortKey(error, index);
+    }
+    num_peaks += chunk_peaks;
+    __syncthreads();
   }
 
+  // It takes 4 peaks to make a quad.
+  if (num_peaks < 4) {
+    if (threadIdx.x == 0) {
+      fit_quad_valid_device[blob_index] = false;
+    }
+    return;
+  }
+  num_peaks = min(num_peaks, max_peaks);
+  const uint32_t num_maxima = min(num_peaks, static_cast<uint32_t>(kNMaxima));
+
+  // Rank each peak against the others to pick the best num_maxima.  Keys are
+  // unique, so the ranks are too.
+  for (uint32_t i = threadIdx.x; i < num_peaks; i += kFitQuadsThreads) {
+    const uint64_t key = peak_keys[i];
+    uint32_t rank = 0;
+    for (uint32_t j = 0; j < num_peaks && rank < kNMaxima; ++j) {
+      rank += peak_keys[j] < key;
+    }
+    if (rank < kNMaxima) {
+      storage.best_peaks[rank] = static_cast<uint16_t>(key);
+    }
+  }
   __syncthreads();
 
-#ifdef DEBUG_BLOB_NUMBER
-  if (threadIdx.x == 0) {
-    if (calculator.blob_index() == DEBUG_BLOB_NUMBER) {
-      for (size_t i = 0; i < std::min(calculator.peaks_count(), kItems); ++i) {
-        printf("  %d: %d, now %d\n", (int)i, calculator.RawIndexFromMaxima(i),
-               storage.point_indices[i]);
-      }
+  // And put them back in point order.
+  if (threadIdx.x < num_maxima) {
+    const uint16_t index = storage.best_peaks[threadIdx.x];
+    uint32_t position = 0;
+    for (uint32_t j = 0; j < num_maxima; ++j) {
+      position += storage.best_peaks[j] < index;
     }
+    storage.point_indices[position] = index;
   }
-#endif
-
-  // TODO(austin): Where do we handle blobs with less than 4 extents?
-  calculator.ComputeM0M1Fit();
-
   __syncthreads();
 
-  const std::tuple<uint, uint, uint, uint> ms = Unrank(threadIdx.x);
-  QuadError quad_error;
-  quad_error.m0 = std::get<0>(ms);
-  quad_error.m1 = std::get<1>(ms);
-  quad_error.m2 = std::get<2>(ms);
-  quad_error.m3 = std::get<3>(ms);
-  quad_error.error = calculator.FitLines(quad_error.m0, quad_error.m1,
-                                         quad_error.m2, quad_error.m3);
-
-#ifdef DEBUG_BLOB_NUMBER
-  if (calculator.blob_index() == DEBUG_BLOB_NUMBER) {
-    if (quad_error.error < 0.0) {
-      printf("blob index %d maxima: %d %d %d %d, error negative of: %f\n",
-             (int)calculator.blob_index(), (int)quad_error.m0,
-             (int)quad_error.m1, (int)quad_error.m2, (int)quad_error.m3,
-             quad_error.error);
+  // Fit each segment between two of the peaks once, for all the combinations
+  // to share.  Only the forward segments' line parameters get used.
+  if (threadIdx.x < kNMaxima * kNMaxima) {
+    const uint32_t a = threadIdx.x / kNMaxima;
+    const uint32_t b = threadIdx.x % kNMaxima;
+    if (a != b && a < num_maxima && b < num_maxima) {
+      SegmentFit &segment = storage.segments[a][b];
+      FitLine(line_fit_points, count, storage.point_indices[a],
+              storage.point_indices[b], nullptr,
+              a < b ? segment.lineparam23 : nullptr, &segment.err,
+              &segment.mse);
     }
   }
-#endif
+  __syncthreads();
 
-  // Each thread obtains an input item
-  // Compute the block-wide max for thread0
-  QuadError min_error =
-      BlockReduce(temp_storage_reduce).Reduce(quad_error, MinQuadError());
+  // Threads past the combinations contribute the max error, and come after
+  // them, so the reduction still picks the first of equally good quads.
+  QuadError quad;
+  quad.m0 = quad.m1 = quad.m2 = quad.m3 = 0;
+  quad.error = std::numeric_limits<double>::max();
+  if (threadIdx.x < MaxRankedIndex()) {
+    const uint32_t packed = kPackedUnrank[threadIdx.x];
+    quad.m0 = packed;
+    quad.m1 = packed >> 8;
+    quad.m2 = packed >> 16;
+    quad.m3 = packed >> 24;
+    quad.error =
+        QuadFitError(storage, quad, num_maxima, max_line_fit_mse, max_dot);
+  }
+  const QuadError best = FitQuadsStorage::BlockReduce(storage.cub.reduce)
+                             .Reduce(quad, MinQuadError());
 
   if (threadIdx.x == 0) {
-    const bool valid = min_error.error < max_line_fit_mse * calculator.sz();
-    fit_quads_device[blockIdx.x].valid = valid;
-    fit_quads_device[blockIdx.x].blob_index = calculator.blob_index();
-    uint32_t i0 = calculator.IndexFromMaxima(min_error.m0);
-    uint32_t i1 = calculator.IndexFromMaxima(min_error.m1);
-    uint32_t i2 = calculator.IndexFromMaxima(min_error.m2);
-    uint32_t i3 = calculator.IndexFromMaxima(min_error.m3);
-#ifdef DEBUG_BLOB_NUMBER
-    if (calculator.blob_index() == DEBUG_BLOB_NUMBER) {
-      printf("blob index %d maxima: %d\n", (int)calculator.blob_index(),
-             (int)calculator.peaks_count());
-      for (size_t i = 0; i < std::min(kItems, calculator.peaks_count()); ++i) {
-        printf("  %d: %d\n", (int)i, calculator.IndexFromMaxima(i));
-      }
-      printf("Best fit is %d(%d) %d(%d) %d(%d) %d(%d) -> %f, valid? %d\n", i0,
-             (int)min_error.m0, i1, (int)min_error.m1, i2, (int)min_error.m2,
-             i3, (int)min_error.m3, min_error.error, valid);
+    const bool valid = best.error < max_line_fit_mse * count;
+    fit_quad_valid_device[blob_index] = valid;
+    if (valid) {
+      FitQuad &fit_quad = fit_quads_device[blob_index];
+      fit_quad.blob_index = blob_index;
+      fit_quad.valid = true;
+      const uint32_t i0 = storage.point_indices[best.m0];
+      const uint32_t i1 = storage.point_indices[best.m1];
+      const uint32_t i2 = storage.point_indices[best.m2];
+      const uint32_t i3 = storage.point_indices[best.m3];
+      fit_quad.indices[0] = i0;
+      fit_quad.indices[1] = i1;
+      fit_quad.indices[2] = i2;
+      fit_quad.indices[3] = i3;
+      fit_quad.moments[0] = ReadMoments(line_fit_points, count, i0, i1);
+      fit_quad.moments[1] = ReadMoments(line_fit_points, count, i1, i2);
+      fit_quad.moments[2] = ReadMoments(line_fit_points, count, i2, i3);
+      fit_quad.moments[3] = ReadMoments(line_fit_points, count, i3, i0);
     }
-#endif
-    fit_quads_device[blockIdx.x].indices[0] = i0;
-    fit_quads_device[blockIdx.x].indices[1] = i1;
-    fit_quads_device[blockIdx.x].indices[2] = i2;
-    fit_quads_device[blockIdx.x].indices[3] = i3;
-    fit_quads_device[blockIdx.x].moments[0] = calculator.ReadMoments(i0, i1);
-    fit_quads_device[blockIdx.x].moments[1] = calculator.ReadMoments(i1, i2);
-    fit_quads_device[blockIdx.x].moments[2] = calculator.ReadMoments(i2, i3);
-    fit_quads_device[blockIdx.x].moments[3] = calculator.ReadMoments(i3, i0);
   }
 }
 
+}  // namespace
+
 void FitQuads(
-    const Peak *peaks_device, size_t /*peaks*/, const PeakExtents *peak_extents,
-    size_t num_extents, const LineFitPoint *line_fit_points_device, int nmaxima,
+    const Peak *peaks_device, const LineFitPoint *line_fit_points_device,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
+    size_t num_blobs, size_t max_blob_points, int nmaxima,
     float max_line_fit_mse, double cos_critical_rad, FitQuad *fit_quads_device,
-    CudaStream *stream) {
-  constexpr size_t kThreads = MaxRankedIndex();
-  const size_t kBlocks = num_extents;
-  ABSL_VLOG(1) << "Spawning with " << kThreads << " threads, and " << kBlocks
-               << " blocks for " << num_extents << " blob_ids";
+    bool *fit_quad_valid_device, CudaStream *stream) {
   ABSL_CHECK_EQ(nmaxima, kNMaxima)
       << ": Kernel is compiled and optimized for a fixed nmaxima, please "
          "recompile if you want to change it.";
-  // A launch with no blocks fails and leaves the error pending.
-  if (kBlocks == 0) {
-    return;
+  // No two neighboring points are both peaks.
+  const uint32_t max_peaks = max_blob_points / 2 + 1;
+  const size_t peak_keys_bytes = max_peaks * sizeof(uint64_t);
+  // Launches get 48 KiB of shared memory unless the kernel asks for more.
+  if (peak_keys_bytes + sizeof(FitQuadsStorage) > 48 * 1024) {
+    CHECK_CUDA(cudaFuncSetAttribute(DoFitQuads,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    peak_keys_bytes));
   }
-  DoFitQuads<<<kBlocks, kThreads, 0, stream->get()>>>(
-      peaks_device, peak_extents, line_fit_points_device,
-      selected_extents_device, max_line_fit_mse, cos_critical_rad,
-      fit_quads_device);
+  DoFitQuads<<<num_blobs, kFitQuadsThreads, peak_keys_bytes, stream->get()>>>(
+      peaks_device, line_fit_points_device, selected_extents_device, max_peaks,
+      max_line_fit_mse, cos_critical_rad, fit_quads_device,
+      fit_quad_valid_device);
 }
 
 std::ostream &operator<<(std::ostream &os,

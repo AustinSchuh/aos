@@ -100,15 +100,29 @@ const std::vector<QuadCorners> &GpuDetector::FitQuads() const {
   return quad_corners_host_;
 }
 
+std::vector<FitQuad> GpuDetector::CopyFitQuads() const {
+  const size_t num_blobs =
+      std::min<size_t>(frame_status_.host_ptr()->num_blob_pairs, kMaxBlobs);
+  std::vector<FitQuad> result;
+  for (size_t i = 0; i < num_blobs; ++i) {
+    if (fit_quad_valid_host_.host_ptr()[i]) {
+      result.push_back(fit_quads_host_.host_span()[i]);
+    }
+  }
+  return result;
+}
+
 void GpuDetector::UpdateFitQuads() {
   quad_corners_host_.resize(0);
-  ABSL_VLOG(1) << "Considering " << num_fit_quads_host_;
-  for (const FitQuad &quad :
-       std::span(fit_quads_host_.get(), num_fit_quads_host_)) {
-    bool print = quad.blob_index == absl::GetFlag(FLAGS_debug_blob_index);
-    if (!quad.valid) {
+  const size_t num_blobs =
+      std::min<size_t>(frame_status_.host_ptr()->num_blob_pairs, kMaxBlobs);
+  ABSL_VLOG(1) << "Considering " << num_blobs;
+  for (size_t i = 0; i < num_blobs; ++i) {
+    if (!fit_quad_valid_host_.host_ptr()[i]) {
       continue;
     }
+    const FitQuad &quad = fit_quads_host_.host_span()[i];
+    bool print = quad.blob_index == absl::GetFlag(FLAGS_debug_blob_index);
     QuadCorners corners;
     corners.blob_index = quad.blob_index;
     ABSL_CHECK(normal_border_ != reversed_border_);

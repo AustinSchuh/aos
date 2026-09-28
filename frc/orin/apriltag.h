@@ -157,7 +157,7 @@ class GpuDetector {
     return stage_times_ms_;
   }
   // GPU time of the last Detect(), from the first event on the main stream to
-  // the end of FitQuads.
+  // the end of the last kernel.
   float GpuTimeMs() const { return gpu_time_ms_; }
   // Host time spent after the GPU finished (quad filtering and decoding) in
   // the last Detect().
@@ -248,19 +248,11 @@ class GpuDetector {
     return filtered_is_local_peak_device_.Copy(NumSelectedPairs());
   }
 
-  int NumCompressedPeaks() const {
-    return num_compressed_peaks_device_.Copy()[0];
-  }
+  // The number of valid quads the GPU fit.
+  int NumFitQuads() const { return CopyFitQuads().size(); }
 
-  std::vector<Peak> CopyCompressedPeaks() const {
-    return compressed_peaks_device_.Copy(NumCompressedPeaks());
-  }
-
-  int NumFitQuads() const { return num_quad_peaked_quads_device_.Copy()[0]; }
-
-  std::vector<FitQuad> CopyFitQuads() const {
-    return fit_quads_device_.Copy(NumFitQuads());
-  }
+  // The valid quads the GPU fit, in blob order.
+  std::vector<FitQuad> CopyFitQuads() const;
 
   void AdjustCenter(float corners[4][2]) const;
 
@@ -346,9 +338,8 @@ class GpuDetector {
   CudaStream stream_;
   CudaStream memset_stream_;
 
-  // Events between the steps.  Detect() always records start_,
-  // after_quad_fit_, and the events it waits on, and records the rest only for
-  // stage timing.
+  // Events between the steps.  Detect() always records start_ and the events
+  // it waits on, and records the rest only for stage timing.
   //
   // Every event the host waits on is a cudaEventBlockingSync event.  Sleeping
   // there instead of spinning frees the core while the GPU is busy, which
@@ -372,14 +363,7 @@ class GpuDetector {
   CudaEvent after_filtered_sort_;
   CudaEvent after_line_fit_;
   CudaEvent after_line_filter_;
-  CudaEvent after_peak_compression_;
-  CudaEvent after_peak_count_memcpy_{cudaEventBlockingSync};
-  CudaEvent after_peak_sort_;
-  CudaEvent after_filtered_peak_reduce_;
-  CudaEvent after_filtered_peak_host_memcpy_{cudaEventBlockingSync};
-  CudaEvent after_quad_fit_;
-  CudaEvent after_quad_fit_memcpy_{cudaEventDisableTiming |
-                                   cudaEventBlockingSync};
+  CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
   // A stage's time is from begin to end.
   struct Stage {
@@ -388,7 +372,7 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 26> stages_{{
+  const std::array<Stage, 21> stages_{{
       {"Memset", &memset_start_, &after_memset_},
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
@@ -409,13 +393,7 @@ class GpuDetector {
       {"Filtered sort", &after_filter_, &after_filtered_sort_},
       {"Line Fit", &after_filtered_sort_, &after_line_fit_},
       {"Error Filter", &after_line_fit_, &after_line_filter_},
-      {"Compress Peaks", &after_line_filter_, &after_peak_compression_},
-      {"Memcpy Peaks", &after_peak_compression_, &after_peak_count_memcpy_},
-      {"Sort Peaks", &after_peak_count_memcpy_, &after_peak_sort_},
-      {"Peak Extents", &after_peak_sort_, &after_filtered_peak_reduce_},
-      {"Memcpy num Extents", &after_filtered_peak_reduce_,
-       &after_filtered_peak_host_memcpy_},
-      {"FitQuads", &after_filtered_peak_host_memcpy_, &after_quad_fit_},
+      {"FitQuads", &after_line_filter_, &after_quad_fit_},
   }};
 
   // TODO(austin): Remove this...
@@ -474,24 +452,14 @@ class GpuDetector {
   GpuMemory<double> errs_device_;
   GpuMemory<double> filtered_errs_device_;
   GpuMemory<Peak> filtered_is_local_peak_device_;
-  GpuMemory<int> num_compressed_peaks_device_{/* allocate 1 integer...*/ 1};
-  HostMemory<int> num_compressed_peaks_host_{/* allocate 1 integer...*/ 1};
-  GpuMemory<Peak> compressed_peaks_device_;
-  GpuMemory<Peak> sorted_compressed_peaks_device_;
-
-  GpuMemory<int> num_quad_peaked_quads_device_{/* allocate 1 integer...*/ 1};
-  HostMemory<int> num_quad_peaked_quads_host_{/* allocate 1 integer...*/ 1};
-  GpuMemory<PeakExtents> peak_extents_device_;
 
   CameraMatrix camera_matrix_;
   DistCoeffs distortion_coefficients_;
 
-  GpuMemory<FitQuad> fit_quads_device_;
-
-  // Pinned so the copy from fit_quads_device_ is a real async DMA instead of a
-  // staged, blocking copy.  Only the first num_fit_quads_host_ are valid.
-  HostMemory<FitQuad> fit_quads_host_{kMaxBlobs};
-  size_t num_fit_quads_host_ = 0;
+  // The quad fit for each blob, and whether it is valid.  Mapped so the host
+  // reads them where the GPU writes them.
+  MappedHostMemory<FitQuad> fit_quads_host_{kMaxBlobs};
+  MappedHostMemory<bool> fit_quad_valid_host_{kMaxBlobs};
   std::vector<QuadCorners> quad_corners_host_;
 
   // Temporary storage for each of the steps.
@@ -499,8 +467,6 @@ class GpuDetector {
   GpuMemory<uint32_t> radix_sort_tmpstorage_device_;
   GpuMemory<uint8_t> temp_storage_compressed_union_marker_pair_device_;
   GpuMemory<uint8_t> temp_storage_bounds_reduce_by_key_device_;
-  GpuMemory<uint8_t> temp_storage_peak_reduce_by_key_device_;
-  GpuMemory<uint8_t> temp_storage_dot_product_device_;
   GpuMemory<uint8_t> temp_storage_compressed_filtered_blobs_device_;
   GpuMemory<uint8_t> temp_storage_selected_extents_scan_device_;
   GpuMemory<uint8_t> temp_storage_line_fit_scan_device_;
