@@ -203,6 +203,58 @@ cc_test(
 )
 
 cuda_library(
+    name = "apriltag_benchmark_lib",
+    srcs = ["apriltag_benchmark.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":apriltag",
+        ":cuda",
+        "//aos:init",
+        "//aos:json_to_flatbuffer",
+        "//aos/time",
+        "//frc/vision:camera_constants_fbs",
+        "//frc/vision:vision_fbs",
+        "//third_party:cudart",
+        "//third_party/apriltag",
+        "@com_github_nvidia_cccl//:cccl",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+    alwayslink = True,
+)
+
+cc_binary(
+    name = "apriltag_benchmark",
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [":apriltag_benchmark_lib"],
+)
+
+cc_binary(
+    name = "apriltag_corpus_extract",
+    srcs = ["apriltag_corpus_extract.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        "//aos:configuration",
+        "//aos:flatbuffer_merge",
+        "//aos:init",
+        "//aos/events:simulated_event_loop",
+        "//aos/events/logging:log_reader",
+        "//aos/util:file",
+        "//frc/vision:camera_constants_fbs",
+        "//frc/vision:vision_fbs",
+        "//third_party:libturbojpeg",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cuda_library(
     name = "output_iterator_test_lib",
     testonly = True,
     srcs = ["output_iterator_test.cc"],

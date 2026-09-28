@@ -105,6 +105,18 @@ class GpuDetector {
 
   const zarray_t *Detections() const { return detections_; }
 
+  // Time each GPU stage of the last Detect() took, in pipeline order, measured
+  // between CUDA events.  For benchmarking; the names may change as the
+  // pipeline does.
+  const std::vector<std::pair<std::string_view, float>> &StageTimesMs() const {
+    return stage_times_ms_;
+  }
+  // GPU time from the first to the last event of the last Detect().
+  float GpuTimeMs() const { return gpu_time_ms_; }
+  // Host time spent after the GPU finished (quad filtering and decoding) in
+  // the last Detect().
+  float HostDecodeTimeMs() const { return host_decode_time_ms_; }
+
   // Debug methods to expose internal state for testing.
   void CopyGrayTo(uint8_t *output) const {
     gray_image_device_.MemcpyTo(output);
@@ -389,6 +401,10 @@ class GpuDetector {
   size_t execution_count_ = 0;
   // True if this is the first detection.
   bool first_ = true;
+
+  std::vector<std::pair<std::string_view, float>> stage_times_ms_;
+  float gpu_time_ms_ = 0;
+  float host_decode_time_ms_ = 0;
 
   // Cached quantities used for tag filtering.
   bool normal_border_ = false;

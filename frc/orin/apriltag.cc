@@ -1108,6 +1108,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   ABSL_VLOG(1) << "Peak Selected blobs " << num_quad_peaked_quads_host
                << " quads";
   CudaEvent *previous_event = &start_;
+  stage_times_ms_.clear();
   for (auto name_event : std::vector<std::tuple<std::string_view, CudaEvent &>>{
            {"Memcpy", after_image_memcpy_to_device_},
            {"Threshold", after_threshold_},
@@ -1133,13 +1134,16 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
            {"FitQuads", after_quad_fit_},
        }) {
     std::get<1>(name_event).Synchronize();
-    ABSL_VLOG(1) << "    " << std::get<0>(name_event) << " "
-                 << float_milli(
-                        std::get<1>(name_event).ElapsedTime(*previous_event))
-                        .count()
+    const float stage_ms =
+        float_milli(std::get<1>(name_event).ElapsedTime(*previous_event))
+            .count();
+    stage_times_ms_.emplace_back(std::get<0>(name_event), stage_ms);
+    ABSL_VLOG(1) << "    " << std::get<0>(name_event) << " " << stage_ms
                  << "ms";
     previous_event = &std::get<1>(name_event);
   }
+  gpu_time_ms_ = float_milli(previous_event->ElapsedTime(start_)).count();
+  host_decode_time_ms_ = float_milli(end_time - before_fit_quads).count();
   ABSL_VLOG(1) << "  FitQuads "
                << float_milli(end_time - before_fit_quads).count()
                << "ms on host";
