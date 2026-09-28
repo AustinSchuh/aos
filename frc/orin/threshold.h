@@ -10,7 +10,7 @@
 namespace frc::apriltag {
 
 // Returns the number of bytes per pixel.
-constexpr __device__ apriltag_size_t
+constexpr __host__ __device__ apriltag_size_t
 BytesPerPixel(const vision::ImageFormat image_format) {
   switch (image_format) {
     case vision::ImageFormat::MONO8:
@@ -24,9 +24,9 @@ BytesPerPixel(const vision::ImageFormat image_format) {
     case vision::ImageFormat::BGRA8:
       return 4;
     case vision::ImageFormat::MJPEG:
-      asm("trap;");
+      __builtin_trap();
   }
-  asm("trap;");
+  __builtin_trap();
   return 0;
 }
 

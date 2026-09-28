@@ -180,6 +180,7 @@ cuda_library(
         "//third_party:opencv",
         "//third_party/apriltag",
         "@bazel_tools//tools/cpp/runfiles",
+        "@com_google_absl//absl/flags:reflection",
     ],
     alwayslink = True,
 )

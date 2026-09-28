@@ -116,9 +116,7 @@ class HostMemory {
   }
 
   // Copies data to other (host memory) from this's memory.
-  void MemcpyTo(const T *other) {
-    memcpy(other, span_.data(), sizeof(T) * size());
-  }
+  void MemcpyTo(T *other) { memcpy(other, span_.data(), sizeof(T) * size()); }
 
  private:
   std::span<T> span_;
@@ -160,14 +158,14 @@ class GpuMemory {
                                cudaMemcpyHostToDevice, stream->get()));
   }
   void MemcpyAsyncFrom(const HostMemory<T> *host_memory, CudaStream *stream) {
-    CHECK_CUDA(cudaMemcpyAsync(memory_, host_memory,
+    CHECK_CUDA(cudaMemcpyAsync(memory_, host_memory->get(),
                                sizeof(T) * host_memory->size(),
                                cudaMemcpyHostToDevice, stream->get()));
   }
   void MemcpyAsyncFrom(const HostMemory<T> *host_memory, const size_t size,
                        CudaStream *stream) {
     ABSL_CHECK_LE(size, size_);
-    CHECK_CUDA(cudaMemcpyAsync(memory_, host_memory, sizeof(T) * size,
+    CHECK_CUDA(cudaMemcpyAsync(memory_, host_memory->get(), sizeof(T) * size,
                                cudaMemcpyHostToDevice, stream->get()));
   }
 

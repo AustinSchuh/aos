@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include <numbers>
 #include <numeric>
 #include <random>
@@ -5,6 +7,7 @@
 
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "absl/log/absl_vlog_is_on.h"
@@ -36,6 +39,7 @@ ABSL_FLAG(double, min_decision_margin, 50.0,
 ABSL_FLAG(bool, debug, false, "If true, write debug images.");
 
 ABSL_DECLARE_FLAG(int32_t, debug_blob_index);
+ABSL_DECLARE_FLAG(bool, use_neon);
 
 // Get access to the intermediates of aprilrobotics.
 extern "C" {
@@ -275,9 +279,12 @@ DistCoeffs create_distortion_coefficients_eight() {
 
 class CudaAprilTagDetector {
  public:
-  CudaAprilTagDetector(size_t width, size_t height,
-                       apriltag_family_t *tag_family = tag16h5_create())
-      : tag_family_(tag_family),
+  CudaAprilTagDetector(
+      size_t width, size_t height,
+      apriltag_family_t *tag_family = tag16h5_create(),
+      vision::ImageFormat image_format = vision::ImageFormat::YUYV422)
+      : image_format_(image_format),
+        tag_family_(tag_family),
         tag_detector_(MakeTagDetector(tag_family_)),
         gray_cuda_(cv::Size(width, height), CV_8UC1),
         decimated_cuda_(gray_cuda_.size() / 2, CV_8UC1),
@@ -285,8 +292,7 @@ class CudaAprilTagDetector {
         union_markers_(decimated_cuda_.size(), CV_32SC1),
         union_markers_size_(decimated_cuda_.size(), CV_32SC1),
         gpu_detector_(width, height, tag_detector_, create_camera_matrix(),
-                      create_distortion_coefficients_five(),
-                      vision::ImageFormat::YUYV422),
+                      create_distortion_coefficients_five(), image_format),
         width_(width),
         height_(height) {
     // Report out info about our GPU.
@@ -338,13 +344,17 @@ class CudaAprilTagDetector {
     free(tag_family_);
   }
 
-  // Detects tags on the GPU.
-  void DetectGPU(cv::Mat color_image) {
+  // Detects tags on the GPU.  image_device, if not null, is the device address
+  // of color_image's data.
+  void DetectGPU(cv::Mat color_image, const uint8_t *image_device = nullptr) {
     ABSL_CHECK_EQ(color_image.size(), gray_cuda_.size());
 
-    gpu_detector_.Detect(color_image.data, nullptr);
+    gpu_detector_.Detect(color_image.data, image_device);
 
-    gpu_detector_.CopyGrayTo(gray_cuda_.data);
+    // A MONO8 image is its own gray image, so the GPU makes none.
+    if (image_format_ != vision::ImageFormat::MONO8) {
+      gpu_detector_.CopyGrayTo(gray_cuda_.data);
+    }
     gpu_detector_.CopyDecimatedTo(decimated_cuda_.data);
     gpu_detector_.CopyThresholdedTo(thresholded_cuda_.data);
 
@@ -377,8 +387,7 @@ class CudaAprilTagDetector {
 
   // Detects tags on the CPU.
   void DetectCPU(cv::Mat color_image) {
-    cv::Mat gray_image(color_image.size(), CV_8UC1);
-    cv::cvtColor(color_image, gray_image, cv::COLOR_YUV2GRAY_YUYV);
+    cv::Mat gray_image = ToGray(color_image);
     image_u8_t im = {
         .width = gray_image.cols,
         .height = gray_image.rows,
@@ -1841,11 +1850,12 @@ class CudaAprilTagDetector {
 
   // Checks that the GPU and CPU algorithms match.
   void Check(cv::Mat color_image) {
-    cv::Mat gray_image(color_image.size(), CV_8UC1);
-    cv::cvtColor(color_image, gray_image, cv::COLOR_YUV2GRAY_YUYV);
+    cv::Mat gray_image = ToGray(color_image);
 
     image_u8_t gray_im = ToImageu8t(gray_image);
-    CheckImage(gray_im, ToImageu8t(gray_cuda_), "gray_cuda");
+    if (image_format_ != vision::ImageFormat::MONO8) {
+      CheckImage(gray_im, ToImageu8t(gray_cuda_), "gray_cuda");
+    }
 
     image_u8_t *quad_im =
         image_u8_decimate(&gray_im, tag_detector_->quad_decimate);
@@ -2103,6 +2113,18 @@ class CudaAprilTagDetector {
     }
   }
 
+  // Returns the gray version of an image in image_format_.
+  cv::Mat ToGray(cv::Mat color_image) const {
+    if (image_format_ == vision::ImageFormat::MONO8) {
+      ABSL_CHECK_EQ(color_image.type(), CV_8UC1);
+      return color_image;
+    }
+    ABSL_CHECK(image_format_ == vision::ImageFormat::YUYV422);
+    cv::Mat gray_image(color_image.size(), CV_8UC1);
+    cv::cvtColor(color_image, gray_image, cv::COLOR_YUV2GRAY_YUYV);
+    return gray_image;
+  }
+
   // Sets the camera constants for camera 24-04
   void SetCameraFourConstants() {
     gpu_detector_.SetCameraMatrix(
@@ -2112,6 +2134,7 @@ class CudaAprilTagDetector {
   }
 
  private:
+  const vision::ImageFormat image_format_;
   apriltag_family_t *tag_family_;
   apriltag_detector_t *tag_detector_;
 
@@ -2360,4 +2383,155 @@ TEST_F(AprilDetectionTest, UndistortEdge) {
     cuda_detector.WriteDebug(color_image);
   }
 }
+
+// Runs a GpuDetector on synthetic YUYV images the size of the robot's cameras.
+class SyntheticImageTest : public ::testing::Test {
+ public:
+  static constexpr size_t kWidth = 1600;
+  static constexpr size_t kHeight = 1304;
+
+  SyntheticImageTest()
+      : tag_family_(tag16h5_create()),
+        tag_detector_(MakeTagDetector(tag_family_)),
+        gpu_detector_(kWidth, kHeight, tag_detector_, create_camera_matrix(),
+                      create_distortion_coefficients_five(),
+                      vision::ImageFormat::YUYV422) {}
+
+  ~SyntheticImageTest() override {
+    apriltag_detector_destroy(tag_detector_);
+    free(tag_family_);
+  }
+
+  // Returns a YUYV image with every luma sample set to `y` and neutral chroma.
+  static std::vector<uint8_t> UniformImage(uint8_t y) {
+    std::vector<uint8_t> image(kWidth * kHeight * 2, 128);
+    for (size_t i = 0; i < kWidth * kHeight; ++i) {
+      image[2 * i] = y;
+    }
+    return image;
+  }
+
+  // Returns a white YUYV image with up to max_squares black squares of side
+  // `square` every `pitch` pixels.  Every square is its own blob next to the
+  // white one.
+  static std::vector<uint8_t> GridImage(size_t square, size_t pitch,
+                                        size_t max_squares = SIZE_MAX) {
+    std::vector<uint8_t> image = UniformImage(255);
+    const size_t offset = pitch / 4;
+    size_t squares = 0;
+    for (size_t y0 = offset; y0 + square <= kHeight; y0 += pitch) {
+      for (size_t x0 = offset; x0 + square <= kWidth && squares < max_squares;
+           x0 += pitch, ++squares) {
+        for (size_t y = y0; y < y0 + square; ++y) {
+          for (size_t x = x0; x < x0 + square; ++x) {
+            image[2 * (y * kWidth + x)] = 0;
+          }
+        }
+      }
+    }
+    return image;
+  }
+
+  // Runs one frame and checks CUDA has no error pending afterwards.
+  void Detect(const std::vector<uint8_t> &image) {
+    ASSERT_EQ(image.size(), kWidth * kHeight * 2);
+    gpu_detector_.Detect(image.data(), nullptr);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(cudaPeekAtLastError(), cudaSuccess);
+  }
+
+ protected:
+  apriltag_family_t *tag_family_;
+  apriltag_detector_t *tag_detector_;
+  GpuDetector gpu_detector_;
+};
+
+// Tests that a frame with nothing in it runs every stage with zero counts.
+TEST_F(SyntheticImageTest, Blank) {
+  for (int i = 0; i < 2; ++i) {
+    Detect(UniformImage(128));
+    EXPECT_EQ(gpu_detector_.NumCompressedUnionMarkerPairs(), 0);
+    EXPECT_EQ(gpu_detector_.NumQuads(), 0);
+    EXPECT_EQ(gpu_detector_.NumSelectedPairs(), 0);
+    EXPECT_EQ(gpu_detector_.NumCompressedPeaks(), 0);
+    EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
+    EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
+    EXPECT_FALSE(gpu_detector_.last_frame_overflowed());
+  }
+}
+
+// Tests that a frame with more blob pairs than kMaxBlobs is dropped rather than
+// overrunning the per-blob buffers.
+TEST_F(SyntheticImageTest, TooManyBlobs) {
+  // 12 pixel squares on a 24 pixel pitch give 66 x 54 = 3564 black blobs, each
+  // paired with the white background.
+  Detect(GridImage(12, 24));
+  EXPECT_EQ(gpu_detector_.NumQuads(), 3564);
+  EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
+  EXPECT_EQ(gpu_detector_.NumSelectedPairs(), 0);
+  EXPECT_EQ(gpu_detector_.NumCompressedPeaks(), 0);
+  EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
+  EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
+
+  // The next frame starts clean.
+  Detect(UniformImage(128));
+  EXPECT_FALSE(gpu_detector_.last_frame_overflowed());
+  EXPECT_EQ(gpu_detector_.NumQuads(), 0);
+
+  // kMaxBlobs pairs still fit, and one more is dropped.
+  Detect(GridImage(12, 24, GpuDetector::kMaxBlobs));
+  EXPECT_EQ(static_cast<size_t>(gpu_detector_.NumQuads()),
+            GpuDetector::kMaxBlobs);
+  EXPECT_FALSE(gpu_detector_.last_frame_overflowed());
+  EXPECT_GT(gpu_detector_.NumFitQuads(), 0);
+
+  Detect(GridImage(12, 24, GpuDetector::kMaxBlobs + 1));
+  EXPECT_EQ(static_cast<size_t>(gpu_detector_.NumQuads()),
+            GpuDetector::kMaxBlobs + 1);
+  EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
+  EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
+  EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
+}
+
+#if defined(__aarch64__)
+// Tests the production path: a MONO8 image thresholded on the CPU with NEON,
+// read from host memory registered with CUDA.  fatal_neon_threshold.cc is all
+// other platforms get, so this only runs on arm64.
+TEST_F(AprilDetectionTest, NeonMono8) {
+  absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_use_neon, true);
+
+  auto image = ReadImage("orin_capture_24_04/file/orin_capture_24_04.bfbs");
+  cv::Mat gray_image;
+  cv::cvtColor(ToMat(&image.message()), gray_image, cv::COLOR_YUV2GRAY_YUYV);
+
+  const size_t image_bytes = gray_image.total();
+  const size_t page_size = sysconf(_SC_PAGESIZE);
+  uint8_t *image_host = static_cast<uint8_t *>(aligned_alloc(
+      page_size, (image_bytes + page_size - 1) / page_size * page_size));
+  ASSERT_NE(image_host, nullptr);
+  memcpy(image_host, gray_image.data, image_bytes);
+  CHECK_CUDA(
+      cudaHostRegister(image_host, image_bytes, cudaHostRegisterDefault));
+  uint8_t *image_device = nullptr;
+  CHECK_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void **>(&image_device),
+                                      image_host, 0));
+  const cv::Mat mono_image(gray_image.size(), CV_8UC1, image_host);
+
+  {
+    CudaAprilTagDetector cuda_detector(gray_image.cols, gray_image.rows,
+                                       tag36h11_create(),
+                                       vision::ImageFormat::MONO8);
+    cuda_detector.set_undistort(true);
+    cuda_detector.SetCameraFourConstants();
+
+    cuda_detector.DetectGPU(mono_image, image_device);
+    cuda_detector.DetectCPU(mono_image.clone());
+    cuda_detector.Check(mono_image.clone());
+  }
+
+  CHECK_CUDA(cudaHostUnregister(image_host));
+  free(image_host);
+}
+#endif
 }  // namespace frc::apriltag::testing

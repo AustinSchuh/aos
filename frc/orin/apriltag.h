@@ -147,6 +147,10 @@ class GpuDetector {
   // the last Detect().
   float HostDecodeTimeMs() const { return host_decode_time_ms_; }
 
+  // True if the last Detect() found more than kMaxBlobs blob pairs and dropped
+  // the frame without detecting anything.
+  bool last_frame_overflowed() const { return last_frame_overflowed_; }
+
   // Debug methods to expose internal state for testing.
   void CopyGrayTo(uint8_t *output) const {
     gray_image_device_.MemcpyTo(output);
@@ -418,6 +422,7 @@ class GpuDetector {
   GpuMemory<uint32_t> radix_sort_tmpstorage_device_;
   GpuMemory<uint8_t> temp_storage_compressed_union_marker_pair_device_;
   GpuMemory<uint8_t> temp_storage_bounds_reduce_by_key_device_;
+  GpuMemory<uint8_t> temp_storage_peak_reduce_by_key_device_;
   GpuMemory<uint8_t> temp_storage_dot_product_device_;
   GpuMemory<uint8_t> temp_storage_compressed_filtered_blobs_device_;
   GpuMemory<uint8_t> temp_storage_selected_extents_scan_device_;
@@ -435,6 +440,7 @@ class GpuDetector {
   std::vector<std::pair<std::string_view, float>> stage_times_ms_;
   float gpu_time_ms_ = 0;
   float host_decode_time_ms_ = 0;
+  bool last_frame_overflowed_ = false;
 
   // Cached quantities used for tag filtering.
   bool normal_border_ = false;

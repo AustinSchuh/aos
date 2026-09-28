@@ -94,8 +94,11 @@ class ErrorCalculator {
       // Maybe overload a little bit past the end, but we over-allocate
       // things on the host too.  Otherwise the end of the message can be
       // corrupted.  For arrays which are multiples of kPointsPerBlock long,
-      // this will have no issues.
-      if (i + global_index <= points_ * sizeof(LineFitPoint) / kLoadSize) {
+      // this will have no issues.  LineFitPoint is 40 bytes, not a multiple of
+      // the load size, so round up to load the last point's tail but nothing
+      // entirely past it.
+      if (i + global_index <
+          (points_ * sizeof(LineFitPoint) + kLoadSize - 1) / kLoadSize) {
         *(reinterpret_cast<int4 *>(storage_->tmp_storage) + i + threadIdx.x) =
             *(reinterpret_cast<const int4 *>(line_fit_points_device_) +
               global_index + i);
@@ -609,6 +612,10 @@ void FitLines(
   ABSL_VLOG(1) << "Spawning with " << kThreads << " threads, and " << kBlocks
                << " blocks for " << num_extents << " blob_ids and " << points
                << " points";
+  // A launch with no blocks fails and leaves the error pending.
+  if (kBlocks == 0) {
+    return;
+  }
   DoFitLines<kThreads><<<kBlocks, kThreads, 0, stream->get()>>>(
       line_fit_points_device, points, selected_extents_device, errs_device,
       filtered_errs_device, peaks_device);
@@ -1213,6 +1220,10 @@ void FitQuads(
   ABSL_CHECK_EQ(nmaxima, kNMaxima)
       << ": Kernel is compiled and optimized for a fixed nmaxima, please "
          "recompile if you want to change it.";
+  // A launch with no blocks fails and leaves the error pending.
+  if (kBlocks == 0) {
+    return;
+  }
   DoFitQuads<<<kBlocks, kThreads, 0, stream->get()>>>(
       peaks_device, peak_extents, line_fit_points_device,
       selected_extents_device, max_line_fit_mse, cos_critical_rad,

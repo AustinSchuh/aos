@@ -85,12 +85,15 @@ struct CustomFirst {
 
 // Computes and returns the scratch space needed for DeviceReduce::ReduceByKey
 // of the provided key K and value V with the provided number of elements.
-template <typename K, typename V>
-static size_t DeviceReduceByKeyScratchSpace(size_t elements) {
+// NumRunsT and NumItemsT must match the call being sized since they pick the
+// offset type cub uses.
+template <typename K, typename V, typename NumRunsT = size_t,
+          typename NumItemsT = size_t>
+static size_t DeviceReduceByKeyScratchSpace(NumItemsT elements) {
   size_t temp_storage_bytes = 0;
   CHECK_CUDA(cub::DeviceReduce::ReduceByKey(
       nullptr, temp_storage_bytes, (K *)(nullptr), (K *)(nullptr),
-      (V *)(nullptr), (V *)(nullptr), (size_t *)(nullptr), CustomFirst<V>(),
+      (V *)(nullptr), (V *)(nullptr), (NumRunsT *)(nullptr), CustomFirst<V>(),
       elements));
   return temp_storage_bytes;
 }
@@ -128,7 +131,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       height_(height),
       tag_detector_(tag_detector),
       gray_image_host_(width * height),
-      color_image_device_(width * height * 2),
+      color_image_device_(BytesPerPixel(image_format) * width * height),
       gray_image_device_(width * height),
       decimated_image_device_(width / 2 * height / 2),
       thresholded_image_device_(width / 2 * height / 2),
@@ -160,6 +163,9 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       temp_storage_bounds_reduce_by_key_device_(
           DeviceReduceByKeyScratchSpace<uint64_t, MinMaxExtents>(
               union_marker_pair_device_.size())),
+      temp_storage_peak_reduce_by_key_device_(
+          DeviceReduceByKeyScratchSpace<uint32_t, PeakExtents, int, int>(
+              compressed_peaks_device_.size())),
       temp_storage_dot_product_device_(
           DeviceReduceByKeyScratchSpace<uint64_t, float>(
               union_marker_pair_device_.size())),
@@ -182,6 +188,10 @@ GpuDetector::GpuDetector(size_t width, size_t height,
 
   ABSL_CHECK_EQ(tag_detector_->quad_decimate, 2);
   ABSL_CHECK(!tag_detector_->qtp.deglitch);
+  // The NEON threshold reads one byte per pixel from the host image.
+  ABSL_CHECK(!absl::GetFlag(FLAGS_use_neon) ||
+             image_format == vision::ImageFormat::MONO8)
+      << ": --use_neon only supports MONO8 images";
 
   for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
     apriltag_family_t *family;
@@ -462,7 +472,8 @@ class NonzeroBlobs {
 
   __host__ __device__ __forceinline__ bool operator()(
       const IndexPoint &a) const {
-    return extents_device_[a.blob_index()].value.count > 0;
+    return a.blob_index() < GpuDetector::kMaxBlobs &&
+           extents_device_[a.blob_index()].value.count > 0;
   }
 
  private:
@@ -525,25 +536,28 @@ class SelectBlobs {
 
 // Class to zero out the count (and clear the starting offset) for each extents
 // which is going to be filtered out.  Used in conjunction with SumPoints to
-// update zero sized blobs.
+// update zero sized blobs.  drop_all filters out every blob.
 struct TransformZeroFilteredBlobSizes {
  public:
   TransformZeroFilteredBlobSizes(apriltag_size_t tag_width,
                                  bool reversed_border, bool normal_border,
                                  apriltag_size_t min_cluster_pixels,
-                                 apriltag_size_t max_cluster_pixels)
+                                 apriltag_size_t max_cluster_pixels,
+                                 bool drop_all)
       : select_blobs_(nullptr, tag_width, reversed_border, normal_border,
-                      min_cluster_pixels, max_cluster_pixels) {}
+                      min_cluster_pixels, max_cluster_pixels),
+        drop_all_(drop_all) {}
 
   __host__ __device__ __forceinline__ cub::KeyValuePair<long, MinMaxExtents>
   operator()(cub::KeyValuePair<long, MinMaxExtents> pt) const {
-    pt.value.count *= select_blobs_(pt.value);
+    pt.value.count *= !drop_all_ && select_blobs_(pt.value);
     pt.value.starting_offset = 0;
     return pt;
   }
 
  private:
   SelectBlobs select_blobs_;
+  bool drop_all_;
 };
 
 // Class to implement a custom Scan operator which passes through the previous
@@ -554,6 +568,11 @@ struct SumPoints {
   operator()(const cub::KeyValuePair<long, MinMaxExtents> &a,
              const cub::KeyValuePair<long, MinMaxExtents> &b) const {
     cub::KeyValuePair<long, MinMaxExtents> result;
+    // KeyValuePair's constructor leaves these uninitialized, and nothing reads
+    // them after the scan.
+    result.value.gx_sum = 0;
+    result.value.gy_sum = 0;
+    result.value.pxgx_plus_pygy_sum = 0;
     if (a.key < b.key) {
       result.value.min_x = b.value.min_x;
       result.value.min_y = b.value.min_y;
@@ -786,9 +805,6 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   {
     num_compressed_union_marker_pair_device_.MemcpyAsyncTo(
         &num_compressed_union_marker_pair_host_, &stream_);
-    ABSL_CHECK_LT(
-        static_cast<size_t>(*num_compressed_union_marker_pair_host_.get()),
-        union_marker_pair_device_.size());
   }
 
   after_num_compact_memcpy_.Record(&stream_);
@@ -798,6 +814,9 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     QuadBoundaryPointDecomposer decomposer;
     after_num_compact_memcpy_.Synchronize();
+    ABSL_CHECK_LE(
+        static_cast<size_t>(*num_compressed_union_marker_pair_host_.get()),
+        union_marker_pair_device_.size());
     CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
         radix_sort_tmpstorage_device_.get(), temp_storage_bytes,
         compressed_union_marker_pair_device_.get(),
@@ -835,11 +854,11 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     size_t temp_storage_bytes =
         temp_storage_bounds_reduce_by_key_device_.size();
-    cub::DeviceReduce::ReduceByKey(
+    CHECK_CUDA(cub::DeviceReduce::ReduceByKey(
         temp_storage_bounds_reduce_by_key_device_.get(), temp_storage_bytes,
         key_input_iterator, key_discard_iterator, value_input_iterator,
         extents_device_.get(), num_quads_device_.get(), reduce,
-        *num_compressed_union_marker_pair_host_.get(), stream_.get());
+        *num_compressed_union_marker_pair_host_.get(), stream_.get()));
     after_bounds_.Record(&stream_);
 
     num_quads_device_.MemcpyAsyncTo(&num_quads_host_, &stream_);
@@ -855,6 +874,19 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   // points in their list at this stage.
   const apriltag_size_t max_april_tag_perimeter = 2 * (width_ + height_);
 
+  after_bounds_memcpy_.Synchronize();
+  // selected_extents_device_ and the 12 bit blob index in IndexPoint only hold
+  // kMaxBlobs blobs.  Rather than guess which ones to keep, filter them all out
+  // so the rest of the pipeline runs with nothing selected.
+  last_frame_overflowed_ = *num_quads_host_.get() > kMaxBlobs;
+  if (last_frame_overflowed_) {
+    ABSL_LOG_EVERY_N_SEC(ERROR, 1)
+        << "Dropping a frame with " << *num_quads_host_.get()
+        << " blob pairs, more than " << kMaxBlobs;
+  }
+  const size_t num_scanned_quads =
+      std::min<size_t>(*num_quads_host_.get(), kMaxBlobs);
+
   {
     // Now that we have the dot products, we need to rewrite the extents for the
     // post-thresholded world so we can find the start and end address of blobs
@@ -866,7 +898,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         extents_device_.get());
     TransformZeroFilteredBlobSizes rewrite(
         min_tag_width_, reversed_border_, normal_border_,
-        tag_detector_->qtp.min_cluster_pixels, max_april_tag_perimeter);
+        tag_detector_->qtp.min_cluster_pixels, max_april_tag_perimeter,
+        last_frame_overflowed_);
     cub::TransformInputIterator<cub::KeyValuePair<long, MinMaxExtents>,
                                 TransformZeroFilteredBlobSizes,
                                 cub::ArgIndexInputIterator<MinMaxExtents *>>
@@ -882,12 +915,10 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     size_t temp_storage_bytes =
         temp_storage_selected_extents_scan_device_.size();
 
-    after_bounds_memcpy_.Synchronize();
-
     CHECK_CUDA(cub::DeviceScan::InclusiveScan(
         temp_storage_selected_extents_scan_device_.get(), temp_storage_bytes,
         input_iterator, selected_extents_device_.get(), sum_points,
-        *num_quads_host_.get(), stream_.get()));
+        num_scanned_quads, stream_.get()));
 
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScan");
   }
@@ -974,7 +1005,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     CHECK_CUDA(cub::DeviceScan::InclusiveScanByKey(
         temp_storage_line_fit_scan_device_.get(), temp_storage_bytes,
         key_iterator, input_iterator, line_fit_points_device_.get(), sum_points,
-        num_selected_blobs_host));
+        num_selected_blobs_host, cub::Equality(), stream_.get()));
 
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScanByKey");
   }
@@ -982,7 +1013,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   {
     FitLines(line_fit_points_device_.get(), num_selected_blobs_host,
-             selected_extents_device_.get(), *num_quads_host_.get(),
+             selected_extents_device_.get(), num_scanned_quads,
              errs_device_.get(), filtered_errs_device_.get(),
              filtered_is_local_peak_device_.get(), &stream_);
   }
@@ -1049,13 +1080,12 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     // Reduction operator.
     MergePeakExtents reduce;
 
-    size_t temp_storage_bytes =
-        temp_storage_bounds_reduce_by_key_device_.size();
-    cub::DeviceReduce::ReduceByKey(
-        temp_storage_bounds_reduce_by_key_device_.get(), temp_storage_bytes,
+    size_t temp_storage_bytes = temp_storage_peak_reduce_by_key_device_.size();
+    CHECK_CUDA(cub::DeviceReduce::ReduceByKey(
+        temp_storage_peak_reduce_by_key_device_.get(), temp_storage_bytes,
         key_input_iterator, key_discard_iterator, value_input_iterator,
         peak_extents_device_.get(), num_quad_peaked_quads_device_.get(), reduce,
-        num_compressed_peaks_host, stream_.get());
+        num_compressed_peaks_host, stream_.get()));
     MaybeCheckAndSynchronize("cub::DeviceReduce::ReduceByKey");
 
     after_filtered_peak_reduce_.Record(&stream_);
