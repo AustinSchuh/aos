@@ -121,6 +121,8 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       thresholded_image_device_(width / 2 * height / 2),
       union_markers_device_(width / 2 * height / 2),
       union_markers_size_device_(width / 2 * height / 2),
+      label_tile_roots_device_(width / 4 * height / 4),
+      label_forest_device_(width / 2 * height / 2),
       // Up to 4 points for each pixel off the image's edge.
       compressed_union_marker_pair_device_((width / 2 - 2) * (height / 2 - 2) *
                                            4),
@@ -163,8 +165,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
 
   // The Orin has no concurrent managed access, so the CPU may only touch
   // globally attached managed memory while no stream in the process has work
-  // in flight, and memset_stream_ can while NEON writes these.  Attached to
-  // stream_, they only need stream_ to be idle.
+  // in flight.  Attached to stream_, these only need stream_ to be idle.
   CHECK_CUDA(cudaStreamAttachMemAsync(
       stream_.get(), decimated_image_device_.get(), 0, cudaMemAttachSingle));
   CHECK_CUDA(cudaStreamAttachMemAsync(
@@ -1083,10 +1084,6 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     }
   };
 
-  record_stage(memset_start_, &memset_stream_);
-  union_markers_size_device_.MemsetAsync(0u, &memset_stream_);
-  after_memset_.Record(&memset_stream_);
-
   // Threshold the image.
   float neon_threshold_ms = 0;
   if (absl::GetFlag(FLAGS_use_neon)) {
@@ -1132,15 +1129,13 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   record_stage(after_memcpy_gray_, &stream_);
 
-  after_memset_.Synchronize(host_wait_spin_);
-
   // Unionfind the image.
-  record_stage(before_unionfinding_, &stream_);
-  LabelImage(ToGpuImage(thresholded_image_device_),
-             ToGpuImage(union_markers_device_),
-             ToGpuImage(union_markers_size_device_), stream_.get(),
-             stage_timing_ ? std::span<CudaEvent>(after_labeling_kernel_)
-                           : std::span<CudaEvent>());
+  LabelImage(
+      ToGpuImage(thresholded_image_device_), ToGpuImage(union_markers_device_),
+      ToGpuImage(union_markers_size_device_), label_tile_roots_device_.get(),
+      label_forest_device_.get(), stream_.get(),
+      stage_timing_ ? std::span<CudaEvent>(after_labeling_kernel_)
+                    : std::span<CudaEvent>());
 
   record_stage(after_unionfinding_, &stream_);
 

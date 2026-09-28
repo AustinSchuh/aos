@@ -27,6 +27,7 @@
 #include "aos/testing/random_seed.h"
 #include "aos/time/time.h"
 #include "frc/orin/apriltag.h"
+#include "frc/orin/labeling_allegretti_2019_BKE.h"
 #include "frc/vision/vision_generated.h"
 #include "tools/cpp/runfiles/runfiles.h"
 
@@ -2587,6 +2588,266 @@ TEST_F(SyntheticImageTest, TooManyBlobs) {
   EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
   EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
   EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
+}
+
+// The labels LabelImage gives a thresholded image, and the size at each label.
+struct ReferenceLabels {
+  std::vector<uint32_t> labels;
+  std::map<uint32_t, uint32_t> sizes;
+};
+
+// Labels a thresholded image on the CPU from the definition rather than the
+// GPU's algorithm.  255 pixels are 8 way connected, 0 pixels 4 way, and each
+// component is labeled with the smallest node index of its pixels.  The node of
+// a 255 pixel is its 2x2 block's top left pixel, of a 0 pixel in the left
+// column the bottom left pixel, and of a 0 pixel in the right column the bottom
+// right pixel.  A 127 pixel is labeled with its own index in a block of only
+// 127s, and with 0 otherwise.
+ReferenceLabels ReferenceLabelImage(const std::vector<uint8_t> &image,
+                                    size_t rows, size_t cols) {
+  std::vector<uint32_t> parent(rows * cols);
+  std::iota(parent.begin(), parent.end(), 0);
+  auto find = [&](uint32_t n) {
+    while (parent[n] != n) {
+      parent[n] = parent[parent[n]];
+      n = parent[n];
+    }
+    return n;
+  };
+  auto join = [&](uint32_t a, uint32_t b) {
+    a = find(a);
+    b = find(b);
+    parent[std::max(a, b)] = std::min(a, b);
+  };
+  for (size_t y = 0; y < rows; ++y) {
+    for (size_t x = 0; x < cols; ++x) {
+      const uint8_t v = image[y * cols + x];
+      if (v != 0 && v != 255) {
+        continue;
+      }
+      const uint32_t i = y * cols + x;
+      if (x > 0 && image[i - 1] == v) {
+        join(i, i - 1);
+      }
+      if (y > 0 && image[i - cols] == v) {
+        join(i, i - cols);
+      }
+      if (v == 255 && y > 0) {
+        if (x > 0 && image[i - cols - 1] == v) {
+          join(i, i - cols - 1);
+        }
+        if (x + 1 < cols && image[i - cols + 1] == v) {
+          join(i, i - cols + 1);
+        }
+      }
+    }
+  }
+
+  auto node = [&](size_t x, size_t y) -> uint32_t {
+    const size_t block_x = x & ~size_t{1};
+    const size_t block_y = y & ~size_t{1};
+    if (image[y * cols + x] == 255) {
+      return block_y * cols + block_x;
+    }
+    return (block_y + 1) * cols + x;
+  };
+  std::map<uint32_t, uint32_t> smallest_node;
+  for (size_t y = 0; y < rows; ++y) {
+    for (size_t x = 0; x < cols; ++x) {
+      const uint8_t v = image[y * cols + x];
+      if (v == 0 || v == 255) {
+        auto [it, inserted] =
+            smallest_node.emplace(find(y * cols + x), node(x, y));
+        it->second = std::min(it->second, node(x, y));
+      }
+    }
+  }
+
+  ReferenceLabels result;
+  result.labels.resize(rows * cols);
+  for (size_t y = 0; y < rows; ++y) {
+    for (size_t x = 0; x < cols; ++x) {
+      const uint8_t v = image[y * cols + x];
+      uint32_t label;
+      if (v == 0 || v == 255) {
+        label = smallest_node[find(y * cols + x)];
+        ++result.sizes[label];
+      } else {
+        const size_t block_x = x & ~size_t{1};
+        const size_t block_y = y & ~size_t{1};
+        bool all_127 = true;
+        for (size_t j = 0; j < 2; ++j) {
+          for (size_t i = 0; i < 2; ++i) {
+            const uint8_t w = image[(block_y + j) * cols + block_x + i];
+            all_127 = all_127 && w != 0 && w != 255;
+          }
+        }
+        label = all_127 ? y * cols + x : 0;
+        result.sizes.emplace(label, 0);
+      }
+      result.labels[y * cols + x] = label;
+    }
+  }
+  return result;
+}
+
+// Thresholded images which stress the connectivity rules, the tile edges, and
+// the image edges.
+std::vector<std::vector<uint8_t>> LabelTestImages(size_t rows, size_t cols) {
+  std::vector<std::vector<uint8_t>> result;
+  std::mt19937 random(aos::testing::RandomSeed());
+  auto uniform = [&](uint8_t v) {
+    return std::vector<uint8_t>(rows * cols, v);
+  };
+  for (uint8_t v : {0, 127, 255}) {
+    result.push_back(uniform(v));
+  }
+  // Noise, with and without 127s mixed in.
+  for (int percent_255 : {5, 50, 95}) {
+    for (bool with_127 : {false, true}) {
+      std::vector<uint8_t> image = uniform(0);
+      for (uint8_t &p : image) {
+        p = static_cast<int>(random() % 100) < percent_255 ? 255 : 0;
+        if (with_127 && random() % 5 == 0) {
+          p = 127;
+        }
+      }
+      result.push_back(std::move(image));
+    }
+  }
+  // Checkerboards, including squares which line up with the 32 pixel tiles
+  // and ones which don't.
+  for (size_t square : {1, 2, 3, 16, 31, 32, 33}) {
+    std::vector<uint8_t> image = uniform(0);
+    for (size_t y = 0; y < rows; ++y) {
+      for (size_t x = 0; x < cols; ++x) {
+        image[y * cols + x] = ((x / square + y / square) % 2) ? 255 : 0;
+      }
+    }
+    result.push_back(std::move(image));
+  }
+  // 1 pixel lines of each color: diagonals both ways, and straight lines on
+  // either side of the tile edges.
+  for (uint8_t line : {0, 255}) {
+    std::vector<uint8_t> image = uniform(255 - line);
+    for (size_t y = 0; y < rows; ++y) {
+      for (size_t x = 0; x < cols; ++x) {
+        if ((x + y) % 7 == 0 || (x + 3 * cols - y) % 9 == 0 || x % 32 == 31 ||
+            y % 32 == 0) {
+          image[y * cols + x] = line;
+        }
+      }
+    }
+    result.push_back(std::move(image));
+  }
+  // A 1 pixel wall spiralling in, so one component winds through many tiles
+  // and rows.
+  for (uint8_t wall : {0, 255}) {
+    std::vector<uint8_t> image = uniform(255 - wall);
+    size_t x0 = 0, y0 = 0, x1 = cols - 1, y1 = rows - 1;
+    while (x0 + 2 <= x1 && y0 + 2 <= y1) {
+      for (size_t x = x0; x <= x1; ++x) {
+        image[y0 * cols + x] = wall;
+        image[y1 * cols + x] = wall;
+      }
+      for (size_t y = y0; y <= y1; ++y) {
+        image[y * cols + x1] = wall;
+        if (y >= y0 + 2) {
+          image[y * cols + x0] = wall;
+        }
+      }
+      x0 += 2;
+      y0 += 2;
+      x1 -= 2;
+      y1 -= 2;
+      if (x0 <= x1 && y0 <= y1) {
+        image[(y0 - 1) * cols + x0] = wall;
+      }
+    }
+    result.push_back(std::move(image));
+  }
+  // Diagonal-only 255s with 127 between, and each kind of top left block.
+  {
+    std::vector<uint8_t> image = uniform(127);
+    for (size_t y = 0; y < rows; ++y) {
+      for (size_t x = 0; x < cols; ++x) {
+        if ((x + y) % 2 == 0) {
+          image[y * cols + x] = random() % 2 ? 255 : 0;
+        }
+      }
+    }
+    result.push_back(std::move(image));
+  }
+  for (uint8_t top_left : {0, 127, 255}) {
+    std::vector<uint8_t> image = uniform(127);
+    for (uint8_t &p : image) {
+      p = std::array<uint8_t, 3>{0, 127, 255}[random() % 3];
+    }
+    image[0] = top_left;
+    image[1] = 127;
+    image[cols] = 127;
+    image[cols + 1] = 127;
+    result.push_back(std::move(image));
+  }
+  return result;
+}
+
+// Tests that LabelImage matches the reference labels, and the reference sizes
+// at every label, on images of several sizes.  The scratch and output memory
+// starts as garbage and carries over between images, like it does between
+// frames.
+TEST(LabelImageTest, MatchesReference) {
+  CudaStream stream;
+  std::mt19937 random(aos::testing::RandomSeed());
+  for (auto [rows, cols] : std::vector<std::pair<size_t, size_t>>{
+           {652, 800}, {70, 100}, {32, 32}, {2, 66}, {36, 2}}) {
+    GpuMemory<uint8_t> input(rows * cols);
+    GpuMemory<uint32_t> labels(rows * cols);
+    GpuMemory<uint32_t> sizes(rows * cols);
+    GpuMemory<uint32_t> tile_roots(rows / 2 * cols / 2);
+    GpuMemory<uint32_t> forest(rows * cols);
+    std::vector<uint32_t> garbage(rows * cols);
+    for (uint32_t &g : garbage) {
+      g = random();
+    }
+    labels.MemcpyFrom(garbage.data());
+    sizes.MemcpyFrom(garbage.data());
+    forest.MemcpyFrom(garbage.data());
+    tile_roots.MemcpyFrom(garbage.data());
+
+    int image_index = 0;
+    for (const std::vector<uint8_t> &image : LabelTestImages(rows, cols)) {
+      SCOPED_TRACE(::testing::Message()
+                   << cols << "x" << rows << " image " << image_index++);
+      input.MemcpyFrom(image.data());
+      LabelImage(GpuImage<uint8_t>{input.get(), rows, cols, cols},
+                 GpuImage<uint32_t>{labels.get(), rows, cols, cols},
+                 GpuImage<uint32_t>{sizes.get(), rows, cols, cols},
+                 tile_roots.get(), forest.get(), stream.get());
+      ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
+
+      const ReferenceLabels expected = ReferenceLabelImage(image, rows, cols);
+      const std::vector<uint32_t> gpu_labels = labels.Copy();
+      const std::vector<uint32_t> gpu_sizes = sizes.Copy();
+      size_t mismatches = 0;
+      for (size_t i = 0; i < rows * cols && mismatches < 10; ++i) {
+        if (gpu_labels[i] != expected.labels[i]) {
+          ADD_FAILURE() << "Label at (" << i % cols << ", " << i / cols
+                        << "), pixel " << static_cast<int>(image[i]) << ", is "
+                        << gpu_labels[i] << ", expected " << expected.labels[i];
+          ++mismatches;
+        }
+      }
+      for (const auto &[label, size] : expected.sizes) {
+        if (gpu_sizes[label] != size && mismatches < 10) {
+          ADD_FAILURE() << "Size at " << label << " is " << gpu_sizes[label]
+                        << ", expected " << size;
+          ++mismatches;
+        }
+      }
+      ASSERT_EQ(mismatches, 0u);
+    }
+  }
 }
 
 #if defined(__aarch64__)

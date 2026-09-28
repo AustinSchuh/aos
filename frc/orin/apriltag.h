@@ -167,9 +167,8 @@ class GpuDetector {
 
   // Time each stage of the last Detect() took, in pipeline order, if stage
   // timing is on.  For benchmarking; the names may change as the pipeline
-  // does.  "NEON threshold (host)" is host time, "Memset" runs on another
-  // stream, and the "UF" stages split "Unionfinding"; the rest sum to
-  // GpuTimeMs().
+  // does.  "NEON threshold (host)" is host time, and the "UF" stages split
+  // "Unionfinding"; the rest sum to GpuTimeMs().
   const std::vector<std::pair<std::string_view, float>> &StageTimesMs() const {
     return stage_times_ms_;
   }
@@ -351,7 +350,6 @@ class GpuDetector {
 
   // Stream to operate on.
   CudaStream stream_;
-  CudaStream memset_stream_;
 
   // Events between the steps.  Detect() always records start_ and the events
   // it waits on, and records the rest only for stage timing.
@@ -363,11 +361,8 @@ class GpuDetector {
   CudaEvent after_image_memcpy_to_device_;
   CudaEvent after_threshold_;
   CudaEvent after_memcpy_gray_;
-  CudaEvent memset_start_;
-  CudaEvent after_memset_{cudaEventBlockingSync};
-  CudaEvent before_unionfinding_;
   // After each of LabelImage's kernels.
-  std::array<CudaEvent, 5> after_labeling_kernel_;
+  std::array<CudaEvent, 3> after_labeling_kernel_;
   CudaEvent after_unionfinding_;
   CudaEvent after_diff_{cudaEventBlockingSync};
   CudaEvent after_sort_;
@@ -386,18 +381,14 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 20> stages_{{
-      {"Memset", &memset_start_, &after_memset_},
+  const std::array<Stage, 16> stages_{{
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
       {"Memcpy Gray", &after_threshold_, &after_memcpy_gray_},
-      {"Wait memset", &after_memcpy_gray_, &before_unionfinding_},
-      {"Unionfinding", &before_unionfinding_, &after_unionfinding_},
-      {"UF Init", &before_unionfinding_, &after_labeling_kernel_[0]},
-      {"UF C1", &after_labeling_kernel_[0], &after_labeling_kernel_[1]},
-      {"UF Merge", &after_labeling_kernel_[1], &after_labeling_kernel_[2]},
-      {"UF C2", &after_labeling_kernel_[2], &after_labeling_kernel_[3]},
-      {"UF Final", &after_labeling_kernel_[3], &after_labeling_kernel_[4]},
+      {"Unionfinding", &after_memcpy_gray_, &after_unionfinding_},
+      {"UF Tile", &after_memcpy_gray_, &after_labeling_kernel_[0]},
+      {"UF Border", &after_labeling_kernel_[0], &after_labeling_kernel_[1]},
+      {"UF Final", &after_labeling_kernel_[1], &after_labeling_kernel_[2]},
       {"Diff", &after_unionfinding_, &after_diff_},
       {"Sort", &after_diff_, &after_sort_},
       {"Bounds", &after_sort_, &after_bounds_},
@@ -430,8 +421,13 @@ class GpuDetector {
   // The union markers for each pixel.
   GpuMemory<uint32_t> union_markers_device_;
   // The size of each blob.  The blob size is stored at the index of the stored
-  // union marker id in union_markers_device_ aboe.
+  // union marker id in union_markers_device_ aboe.  Entries no union marker
+  // points to hold whatever an earlier frame left there.
   GpuMemory<uint32_t> union_markers_size_device_;
+  // LabelImage's scratch: each 2x2 block's roots within its tile, and the
+  // union-find forest joining the tiles.
+  GpuMemory<uint32_t> label_tile_roots_device_;
+  GpuMemory<uint32_t> label_forest_device_;
 
   // The points between blobs, in the order BlobDiff found them.
   GpuMemory<QuadBoundaryPoint> compressed_union_marker_pair_device_;
