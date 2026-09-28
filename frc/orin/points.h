@@ -218,6 +218,8 @@ struct IndexPoint {
     key = (key & 0xfffffffffffffffcull) | (static_cast<uint64_t>(dxy & 0x3));
   }
 
+  __forceinline__ __host__ __device__ uint32_t dxy() const { return key & 0x3; }
+
   __forceinline__ __host__ __device__ int32_t dx() const {
     switch (key & 0x3) {
       case 0:

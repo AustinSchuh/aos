@@ -786,9 +786,90 @@ __device__ __forceinline__ void WriteSortedChunk(
   __syncthreads();
 }
 
+// Returns the key that orders a blob's points with the same angle: dxy, then
+// base_y, then base_x.  No two points share it, so sorting by angle and then
+// this does not depend on the order the blob has its points in.
+__device__ __forceinline__ uint32_t AngleTieKey(IndexPoint point) {
+  return (point.dxy() << 20) | (point.base_y() << 10) | point.base_x();
+}
+
+// Puts each run of a blob's sorted points with the same angle in AngleTieKey()
+// order, and redoes the line fit prefix sums inside the run.  Every thread in
+// the block calls this after writing the blob's points and passing a barrier.
+template <int kThreads, int kPointsPerThread>
+__device__ __forceinline__ void FixAngleTies(
+    uint32_t blob_index, uint32_t count, const TransformLineFitPoint &transform,
+    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
+  // Reading the angles back keeps the sort's registers free for the scans.
+  // Each lane reads one, and gets the next from the next lane.
+  const uint32_t lane = threadIdx.x % 32;
+  bool has_tie = false;
+#pragma unroll
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t position = i * kThreads + threadIdx.x;
+    const uint32_t theta =
+        position < count ? sorted_points[position].theta() : 0;
+    uint32_t next_theta = __shfl_down_sync(0xffffffffu, theta, 1);
+    if (lane == 31 && position + 1 < count) {
+      next_theta = sorted_points[position + 1].theta();
+    }
+    has_tie |= position + 1 < count && next_theta == theta;
+  }
+  // Ties are rare, and most blobs have none.
+  if (!__syncthreads_or(has_tie)) {
+    return;
+  }
+
+  // Every run is found before any moves, since finding one reads the points
+  // on both sides of it.  run_end is 0 where no run starts.
+  uint32_t run_end[kPointsPerThread];
+#pragma unroll
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t start = i * kThreads + threadIdx.x;
+    run_end[i] = 0;
+    if (start + 1 < count) {
+      const uint32_t theta = sorted_points[start].theta();
+      if (sorted_points[start + 1].theta() == theta &&
+          (start == 0 || sorted_points[start - 1].theta() != theta)) {
+        uint32_t end = start + 2;
+        while (end < count && sorted_points[end].theta() == theta) {
+          ++end;
+        }
+        run_end[i] = end;
+      }
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t start = i * kThreads + threadIdx.x;
+    const uint32_t end = run_end[i];
+    if (end == 0) {
+      continue;
+    }
+    for (uint32_t j = start + 1; j < end; ++j) {
+      const IndexPoint point = sorted_points[j];
+      const uint32_t key = AngleTieKey(point);
+      uint32_t k = j;
+      for (; k > start && AngleTieKey(sorted_points[k - 1]) > key; --k) {
+        sorted_points[k] = sorted_points[k - 1];
+      }
+      sorted_points[k] = point;
+    }
+    // The run's last prefix sum covers all of it in any order, so it stays,
+    // and the run after this one may read it.
+    LineFitPoint sum =
+        start == 0 ? ZeroLineFitPoint(blob_index) : line_fit_points[start - 1];
+    for (uint32_t j = start; j + 1 < end; ++j) {
+      sum = SumLineFitPoints()(sum, transform(sorted_points[j]));
+      line_fit_points[j] = sum;
+    }
+  }
+}
+
 // Sorts a blob's points by angle with a radix sort, then writes them and their
-// line fit points.  The sort is stable, so points with the same angle stay in
-// the order the blob had them, the way the global (blob, angle) sort left them.
+// line fit points.  Points with the same angle end up in AngleTieKey() order.
 //
 // With kScanInChunks, the block scans kThreads sorted points at a time, which
 // keeps the writes coalesced.  Otherwise each thread sums its own
@@ -806,8 +887,6 @@ __device__ __forceinline__ void RadixSortAndScanBlob(
       BlockRadixSort;
   uint32_t theta[kPointsPerThread];
   uint32_t point_bits[kPointsPerThread];
-  // The sort breaks ties by position in this blocked arrangement, which is the
-  // blob's order.
 #pragma unroll
   for (int i = 0; i < kPointsPerThread; ++i) {
     const uint32_t index = threadIdx.x * kPointsPerThread + i;
@@ -876,6 +955,10 @@ __device__ __forceinline__ void RadixSortAndScanBlob(
     // The next blob reuses scan_storage.
     __syncthreads();
   }
+  // The sort is stable, so it left points with the same angle in the blob's
+  // order.
+  FixAngleTies<kThreads, kPointsPerThread>(blob_index, count, transform,
+                                           sorted_points, line_fit_points);
 }
 
 struct SmallBlobStorage {
@@ -895,7 +978,7 @@ struct SmallBlobStorage {
 
 // Sorts a blob's points by angle by ranking each against the others, then
 // writes them and their line fit points.  Points with the same angle rank by
-// their position in the blob, keeping the order the blob had them.
+// AngleTieKey().
 __device__ __forceinline__ void RankSortAndScanBlob(
     SmallBlobStorage &storage, uint32_t blob_index, const IndexPoint *points,
     uint32_t count, const TransformLineFitPoint &transform,
@@ -907,7 +990,7 @@ __device__ __forceinline__ void RankSortAndScanBlob(
   IndexPoint point;
   if (has_point) {
     point = points[threadIdx.x];
-    key = (static_cast<uint64_t>(point.theta()) << 32) | threadIdx.x;
+    key = (static_cast<uint64_t>(point.theta()) << 32) | AngleTieKey(point);
     storage.temp.rank_keys[threadIdx.x] = key;
   }
   __syncthreads();
@@ -1269,8 +1352,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     // Sort each selected blob's points by angle around the blob, and prefix
     // sum their line fit points, in a block per blob.  Blobs are contiguous
     // and in blob order in selected_blobs_device_, so this matches a global
-    // stable sort by (blob, angle), and the host never needs the number of
-    // selected points.
+    // sort by (blob, angle, AngleTieKey()), and the host never needs the
+    // number of selected points.
     BuildBlobWorkList<<<1, kWorkListThreads, 0, stream_.get()>>>(
         selected_extents_device_.get(), blob_work_list_device_.get());
     MaybeCheckAndSynchronize("BuildBlobWorkList");
