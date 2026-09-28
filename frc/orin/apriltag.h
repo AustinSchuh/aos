@@ -19,49 +19,6 @@
 
 namespace frc::apriltag {
 
-// Class to find the blob index of a point in a point vector.
-class BlobExtentsIndexFinder {
- public:
-  // num_extents is read when searching, so it may be a device pointer the
-  // GPU fills in after this is constructed.
-  BlobExtentsIndexFinder(const MinMaxExtents *extents_device,
-                         const size_t *num_extents)
-      : extents_device_(extents_device), num_extents_(num_extents) {}
-
-  __host__ __device__ apriltag_size_t
-  FindBlobIndex(apriltag_size_t point_index) const {
-    const apriltag_size_t num_extents = *num_extents_;
-    // Do a binary search for the blob which has the point in it's
-    // starting_offset range.
-    apriltag_size_t min = 0;
-    apriltag_size_t max = num_extents;
-    while (true) {
-      if (min + 1 == max) {
-        return min;
-      }
-
-      apriltag_size_t average = min + (max - min) / 2;
-      if (average < num_extents &&
-          extents_device_[average].starting_offset <= point_index) {
-        min = average;
-      } else {
-        max = average;
-      }
-    }
-  }
-
-  // Returns the extents for a blob index.
-  __host__ __device__ MinMaxExtents Get(apriltag_size_t index) const {
-    return extents_device_[index];
-  }
-
- private:
-  const MinMaxExtents *extents_device_;
-  const size_t *num_extents_;
-
-  // TODO(austin): Cache the last one?
-};
-
 struct QuadCorners {
   float corners[4][2];
   bool reversed_border;
@@ -77,12 +34,45 @@ struct BlobWorkList {
   uint16_t big_blobs[IndexPoint::kMaxBlobs];
 };
 
-// BlobDiff's counts.  Both are zero between frames.
-struct BlobDiffCounters {
-  // The number of points found so far.
+// The pairs of blobs with points between them, in an open addressing hash
+// table keyed by rep01(), and the order the kernels after BinBlobPairs put
+// them in.  Between frames, every slot is empty and every count is zero.
+struct BlobPairTable {
+  // Twice as many as fit downstream, so a frame which fits always has room.
+  static constexpr uint32_t kSlotBits = 12;
+  static constexpr uint32_t kSlots = 1 << kSlotBits;
+  static_assert(kSlots == 2 * IndexPoint::kMaxBlobs);
+
+  // Each slot's rep01(), or 0 when it is empty.  No pair has a rep01() of 0,
+  // since rep1 is bigger than rep0.
+  unsigned long long keys[kSlots];
+  // The same sums of each pair's points as MinMaxExtents holds.
+  unsigned long long pxgx_plus_pygy_sums[kSlots];
+  uint32_t counts[kSlots];
+  uint32_t min_xs[kSlots];
+  uint32_t max_xs[kSlots];
+  uint32_t min_ys[kSlots];
+  uint32_t max_ys[kSlots];
+  int32_t gx_sums[kSlots];
+  int32_t gy_sums[kSlots];
+
+  // The first kMaxBlobs pairs, in the order BinBlobPairs claimed their slots,
+  // as rep01() << kSlotBits | slot.
+  uint64_t pairs[IndexPoint::kMaxBlobs];
+  // Each pair's rank by rep01(), which is its blob index, by slot.
+  uint16_t slot_ranks[kSlots];
+  // How many of each blob's selected points have been placed.
+  uint32_t cursors[IndexPoint::kMaxBlobs];
+
+  // The number of pairs BinBlobPairs found, and of points BlobDiff found.
+  uint32_t num_pairs;
   uint32_t num_points;
-  // The number of blocks which have finished.
-  uint32_t num_finished_blocks;
+  // Nonzero if BinBlobPairs could not fit every pair.
+  uint32_t overflow;
+  // The frame's point count and whether it overflowed, for the kernels after
+  // BlobPairExtents, which zeros the counts above for the next frame.
+  uint32_t frame_num_points;
+  uint32_t frame_overflowed;
 };
 
 struct CameraMatrix {
@@ -204,37 +194,30 @@ class GpuDetector {
     union_markers_device_.MemcpyTo(output);
   }
 
-  // The points between blobs, in no particular order.
-  std::vector<QuadBoundaryPoint> CopyCompressedUnionMarkerPair() const {
-    return compressed_union_marker_pair_device_.Copy(
-        NumCompressedUnionMarkerPairs());
-  }
+  // The points between blobs, in no particular order.  Only valid for frames
+  // which did not overflow.
+  std::vector<QuadBoundaryPoint> CopyBoundaryPoints() const;
 
-  std::vector<QuadBoundaryPoint> CopySortedUnionMarkerPair() const {
-    std::vector<QuadBoundaryPoint> result;
-    int size = NumCompressedUnionMarkerPairs();
-    result.resize(size);
-    sorted_union_marker_pair_device_.MemcpyTo(result.data(), size);
-    return result;
-  }
-
-  int NumCompressedUnionMarkerPairs() const {
-    return *num_compressed_union_marker_pair_.host_ptr();
+  int NumBoundaryPoints() const {
+    return frame_status_.host_ptr()->num_boundary_points;
   }
 
   void CopyUnionMarkersSizeTo(uint32_t *output) const {
     union_markers_size_device_.MemcpyTo(output);
   }
 
-  int NumQuads() const { return num_quads_device_.Copy()[0]; }
+  // The number of blob pairs.  Past kMaxBlobs, the GPU stops counting some of
+  // them.
+  int NumQuads() const { return frame_status_.host_ptr()->num_blob_pairs; }
 
   std::vector<MinMaxExtents> CopyExtents() const {
-    return extents_device_.Copy(NumQuads());
+    return extents_device_.Copy(std::min<size_t>(NumQuads(), kMaxBlobs));
   }
 
   std::vector<cub::KeyValuePair<long, MinMaxExtents>> CopySelectedExtents()
       const {
-    return selected_extents_device_.Copy(NumQuads());
+    return selected_extents_device_.Copy(
+        std::min<size_t>(NumQuads(), kMaxBlobs));
   }
 
   int NumSelectedPairs() const { return num_selected_blobs_device_.Copy()[0]; }
@@ -364,11 +347,11 @@ class GpuDetector {
   // After each of LabelImage's kernels.
   std::array<CudaEvent, 3> after_labeling_kernel_;
   CudaEvent after_unionfinding_;
-  CudaEvent after_diff_{cudaEventBlockingSync};
-  CudaEvent after_sort_;
-  CudaEvent after_bounds_;
-  CudaEvent after_transform_extents_;
-  CudaEvent after_filter_;
+  CudaEvent after_diff_;
+  CudaEvent after_bin_pairs_;
+  CudaEvent after_rank_pairs_;
+  CudaEvent after_pair_extents_;
+  CudaEvent after_scatter_;
   CudaEvent after_small_blob_sort_;
   CudaEvent after_big_blob_sort_;
   CudaEvent after_line_filter_;
@@ -390,11 +373,11 @@ class GpuDetector {
       {"UF Border", &after_labeling_kernel_[0], &after_labeling_kernel_[1]},
       {"UF Final", &after_labeling_kernel_[1], &after_labeling_kernel_[2]},
       {"Diff", &after_unionfinding_, &after_diff_},
-      {"Sort", &after_diff_, &after_sort_},
-      {"Bounds", &after_sort_, &after_bounds_},
-      {"Transform Extents", &after_bounds_, &after_transform_extents_},
-      {"Filter by dot product", &after_transform_extents_, &after_filter_},
-      {"Small blob sort", &after_filter_, &after_small_blob_sort_},
+      {"Bin pairs", &after_diff_, &after_bin_pairs_},
+      {"Rank pairs", &after_bin_pairs_, &after_rank_pairs_},
+      {"Pair extents", &after_rank_pairs_, &after_pair_extents_},
+      {"Scatter selected", &after_pair_extents_, &after_scatter_},
+      {"Small blob sort", &after_scatter_, &after_small_blob_sort_},
       {"Big blob sort", &after_small_blob_sort_, &after_big_blob_sort_},
       {"Error Filter", &after_big_blob_sort_, &after_line_filter_},
       {"FitQuads", &after_line_filter_, &after_quad_fit_},
@@ -429,17 +412,12 @@ class GpuDetector {
   GpuMemory<uint32_t> label_tile_roots_device_;
   GpuMemory<uint32_t> label_forest_device_;
 
-  // The points between blobs, in the order BlobDiff found them.
-  GpuMemory<QuadBoundaryPoint> compressed_union_marker_pair_device_;
-  // Blob representation sorted list of points.
-  GpuMemory<QuadBoundaryPoint> sorted_union_marker_pair_device_;
-  // Number of compressed points.  Mapped so the host reads the count straight
-  // from where BlobDiff writes it.
-  MappedHostMemory<int> num_compressed_union_marker_pair_{1};
-  GpuMemory<BlobDiffCounters> blob_diff_counters_device_{1};
+  // The points between blobs, in the order BlobDiff found them.  BlobDiff
+  // writes each one's key, and BinBlobPairs replaces it with its blob pair's
+  // slot in blob_pairs_device_ << 32 | its point_bits().
+  GpuMemory<uint64_t> boundary_points_device_;
+  GpuMemory<BlobPairTable> blob_pairs_device_{1};
 
-  // Number of unique blob IDs.  Only the GPU reads it during Detect().
-  GpuMemory<size_t> num_quads_device_{/* allocate 1 integer...*/ 1};
   // Bounds per blob, one blob per ID.
   GpuMemory<MinMaxExtents> extents_device_;
   // Extents of all the blobs under consideration.
@@ -472,13 +450,6 @@ class GpuDetector {
   MappedHostMemory<bool> fit_quad_valid_host_{kMaxBlobs};
   std::vector<QuadCorners> quad_corners_host_;
 
-  // Temporary storage for each of the steps.
-  // TODO(austin): Can we combine these and just use the max?
-  GpuMemory<uint32_t> radix_sort_tmpstorage_device_;
-  GpuMemory<uint8_t> temp_storage_bounds_reduce_by_key_device_;
-  GpuMemory<uint8_t> temp_storage_compressed_filtered_blobs_device_;
-  GpuMemory<uint8_t> temp_storage_selected_extents_scan_device_;
-
   std::unique_ptr<Threshold> threshold_;
 
   // Cumulative duration of april tag detection.
@@ -502,6 +473,8 @@ class GpuDetector {
     uint32_t overflow;
     // The number of blob pairs.
     uint32_t num_blob_pairs;
+    // The number of points between blobs.
+    uint32_t num_boundary_points;
   };
   MappedHostMemory<FrameStatus> frame_status_{1};
 

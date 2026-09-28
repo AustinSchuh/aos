@@ -4,7 +4,6 @@
 #include <stdint.h>
 
 #include <cub/iterator/transform_input_iterator.cuh>
-#include <cuda/std/tuple>
 #include <iomanip>
 #include <ostream>
 
@@ -280,14 +279,6 @@ struct IndexPoint {
 };
 
 std::ostream &operator<<(std::ostream &os, const IndexPoint &point);
-
-// Decomposer for sorting which just returns the key.
-struct QuadBoundaryPointDecomposer {
-  __host__ __device__ ::cuda::std::tuple<uint64_t &> operator()(
-      QuadBoundaryPoint &key) const {
-    return {key.key};
-  }
-};
 
 }  // namespace frc::apriltag
 

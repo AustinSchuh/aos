@@ -345,6 +345,21 @@ void CheckAndSynchronize(std::string_view message = "");
 void MaybeCheckAndSynchronize();
 void MaybeCheckAndSynchronize(std::string_view message);
 
+// Returns how many blocks of kernel, with threads threads each, fit on the GPU
+// at once.
+template <typename Kernel>
+int ResidentBlocks(Kernel kernel, int threads) {
+  int device;
+  CHECK_CUDA(cudaGetDevice(&device));
+  int sms;
+  CHECK_CUDA(
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+  int blocks_per_sm;
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm,
+                                                           kernel, threads, 0));
+  return sms * blocks_per_sm;
+}
+
 }  // namespace frc::apriltag
 
 #endif  // FRC_ORIN_CUDA_H_

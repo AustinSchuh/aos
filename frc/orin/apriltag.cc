@@ -1,20 +1,9 @@
 #include "frc/orin/apriltag.h"
 
-#include <thrust/iterator/constant_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
-
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
-#include <cub/device/device_copy.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/device/device_reduce.cuh>
-#include <cub/device/device_run_length_encode.cuh>
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_segmented_sort.cuh>
-#include <cub/device/device_select.cuh>
-#include <cub/iterator/discard_output_iterator.cuh>
-#include <cub/iterator/transform_input_iterator.cuh>
 #include <cub/warp/warp_scan.cuh>
+#include <cuda/atomic>
 #include <numbers>
 #include <vector>
 
@@ -26,7 +15,6 @@
 #include "aos/time/time.h"
 #include "frc/orin/labeling_allegretti_2019_BKE.h"
 #include "frc/orin/threshold.h"
-#include "frc/orin/transform_output_iterator.h"
 
 namespace numbers = std::numbers;
 
@@ -36,73 +24,6 @@ namespace frc::apriltag {
 namespace {
 
 typedef std::chrono::duration<float, std::milli> float_milli;
-
-// Always returns true (only used for scratch space calcs).
-template <typename T>
-struct True {
-  __host__ __device__ __forceinline__ bool operator()(const T &) const {
-    return true;
-  }
-};
-
-// Computes and returns the scratch space needed for DeviceRadixSort::SortKeys
-// of the provided key with the provided number of elements.
-template <typename T>
-static size_t RadixSortScratchSpace(size_t elements) {
-  size_t temp_storage_bytes = 0;
-  QuadBoundaryPointDecomposer decomposer;
-  cub::DeviceRadixSort::SortKeys(nullptr, temp_storage_bytes, (T *)(nullptr),
-                                 (T *)(nullptr), elements, decomposer);
-  return temp_storage_bytes;
-}
-
-// Computes and returns the scratch space needed for DeviceSelect::If of the
-// provided type Tin, to be written to the provided type Tout, for the provided
-// number of elements.  num_markers is the device pointer used to hold the
-// selected number of elements.
-template <typename Tin, typename Tout>
-static size_t DeviceSelectIfScratchSpace(size_t elements, int *num_markers) {
-  size_t temp_storage_bytes = 0;
-  CHECK_CUDA(cub::DeviceSelect::If(nullptr, temp_storage_bytes,
-                                   (Tin *)(nullptr), (Tout *)(nullptr),
-                                   num_markers, elements, True<Tin>()));
-  return temp_storage_bytes;
-}
-
-// Always returns the first element (only used for scratch space calcs).
-template <typename T>
-struct CustomFirst {
-  __host__ __device__ __forceinline__ T operator()(const T &a,
-                                                   const T & /*b*/) const {
-    return a;
-  }
-};
-
-// Computes and returns the scratch space needed for DeviceReduce::ReduceByKey
-// of the provided key K and value V with the provided number of elements.
-// NumRunsT and NumItemsT must match the call being sized since they pick the
-// offset type cub uses.
-template <typename K, typename V, typename NumRunsT = size_t,
-          typename NumItemsT = size_t>
-static size_t DeviceReduceByKeyScratchSpace(NumItemsT elements) {
-  size_t temp_storage_bytes = 0;
-  CHECK_CUDA(cub::DeviceReduce::ReduceByKey(
-      nullptr, temp_storage_bytes, (K *)(nullptr), (K *)(nullptr),
-      (V *)(nullptr), (V *)(nullptr), (NumRunsT *)(nullptr), CustomFirst<V>(),
-      elements));
-  return temp_storage_bytes;
-}
-
-// Computes and returns the scratch space needed for DeviceScan::InclusiveScan
-// of the provided value V with the provided number of elements.
-template <typename V>
-static size_t DeviceScanInclusiveScanScratchSpace(size_t elements) {
-  size_t temp_storage_bytes = 0;
-  CHECK_CUDA(cub::DeviceScan::InclusiveScan(nullptr, temp_storage_bytes,
-                                            (V *)(nullptr), (V *)(nullptr),
-                                            CustomFirst<V>(), elements));
-  return temp_storage_bytes;
-}
 
 }  // namespace
 
@@ -124,13 +45,10 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       label_tile_roots_device_(width / 4 * height / 4),
       label_forest_device_(width / 2 * height / 2),
       // Up to 4 points for each pixel off the image's edge.
-      compressed_union_marker_pair_device_((width / 2 - 2) * (height / 2 - 2) *
-                                           4),
-      sorted_union_marker_pair_device_(
-          compressed_union_marker_pair_device_.size()),
-      extents_device_(compressed_union_marker_pair_device_.size()),
+      boundary_points_device_((width / 2 - 2) * (height / 2 - 2) * 4),
+      extents_device_(kMaxBlobs),
       selected_extents_device_(kMaxBlobs),
-      selected_blobs_device_(compressed_union_marker_pair_device_.size()),
+      selected_blobs_device_(boundary_points_device_.size()),
       sorted_selected_blobs_device_(selected_blobs_device_.size()),
       line_fit_points_device_(selected_blobs_device_.size()),
       errs_device_(line_fit_points_device_.size()),
@@ -138,18 +56,6 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       filtered_is_local_peak_device_(line_fit_points_device_.size()),
       camera_matrix_(camera_matrix),
       distortion_coefficients_(distortion_coefficients),
-      radix_sort_tmpstorage_device_(RadixSortScratchSpace<QuadBoundaryPoint>(
-          sorted_union_marker_pair_device_.size())),
-      temp_storage_bounds_reduce_by_key_device_(
-          DeviceReduceByKeyScratchSpace<uint64_t, MinMaxExtents>(
-              compressed_union_marker_pair_device_.size())),
-      temp_storage_compressed_filtered_blobs_device_(
-          DeviceSelectIfScratchSpace<IndexPoint, IndexPoint>(
-              compressed_union_marker_pair_device_.size(),
-              num_selected_blobs_device_.get())),
-      temp_storage_selected_extents_scan_device_(
-          DeviceScanInclusiveScanScratchSpace<
-              cub::KeyValuePair<long, MinMaxExtents>>(kMaxBlobs)),
       threshold_(absl::GetFlag(FLAGS_use_neon)
                      ? MakeNeonThreshold(image_format, width, height)
                      : MakeThreshold(image_format, width, height)),
@@ -170,13 +76,16 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       stream_.get(), decimated_image_device_.get(), 0, cudaMemAttachSingle));
   CHECK_CUDA(cudaStreamAttachMemAsync(
       stream_.get(), thresholded_image_device_.get(), 0, cudaMemAttachSingle));
-  // The extents scan reads all kMaxBlobs entries each frame and ignores those
-  // past the frame's blob pair count, which start out uninitialized.
-  CHECK_CUDA(cudaMemsetAsync(extents_device_.get(), 0,
-                             kMaxBlobs * sizeof(MinMaxExtents), stream_.get()));
-  // BlobDiff leaves its counters zeroed for the next frame.
-  CHECK_CUDA(cudaMemsetAsync(blob_diff_counters_device_.get(), 0,
-                             sizeof(BlobDiffCounters), stream_.get()));
+  // Every frame leaves the blob pair table empty for the next, with each
+  // slot's minimums at their largest.
+  char *blob_pairs = reinterpret_cast<char *>(blob_pairs_device_.get());
+  CHECK_CUDA(
+      cudaMemsetAsync(blob_pairs, 0, sizeof(BlobPairTable), stream_.get()));
+  for (size_t offset :
+       {offsetof(BlobPairTable, min_xs), offsetof(BlobPairTable, min_ys)}) {
+    CHECK_CUDA(cudaMemsetAsync(blob_pairs + offset, 0xff,
+                               sizeof(BlobPairTable::min_xs), stream_.get()));
+  }
   CHECK_CUDA(cudaStreamSynchronize(stream_.get()));
 
   for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
@@ -212,21 +121,157 @@ GpuDetector::~GpuDetector() {
   zarray_destroy(poly0_);
 }
 
+std::vector<QuadBoundaryPoint> GpuDetector::CopyBoundaryPoints() const {
+  // The pairs' keys are gone from the table, but not from their list.
+  const std::vector<BlobPairTable> table = blob_pairs_device_.Copy();
+  const uint64_t *pairs = table[0].pairs;
+  std::vector<uint64_t> rep01s(BlobPairTable::kSlots, 0);
+  for (size_t i = 0; i < std::min<size_t>(NumQuads(), kMaxBlobs); ++i) {
+    rep01s[pairs[i] & (BlobPairTable::kSlots - 1)] =
+        pairs[i] >> BlobPairTable::kSlotBits;
+  }
+  std::vector<QuadBoundaryPoint> result;
+  for (const uint64_t point :
+       boundary_points_device_.Copy(NumBoundaryPoints())) {
+    QuadBoundaryPoint boundary_point;
+    boundary_point.key =
+        (rep01s[point >> 32] << QuadBoundaryPoint::kRepEndBit) |
+        (point & 0xffffff);
+    result.push_back(boundary_point);
+  }
+  return result;
+}
+
 namespace {
 
+// Returns the slot a blob pair's search starts at in a BlobPairTable.
+__device__ __forceinline__ uint32_t BlobPairHash(uint64_t rep01) {
+  return (rep01 * 0x9e3779b97f4a7c15ull) >> (64 - BlobPairTable::kSlotBits);
+}
+
+// Swaps key from 0 to rep01 if it is 0, and returns what it was.  atomicCAS is
+// sequentially consistent at system scope under clang, which fences all of
+// memory every time, and nothing here needs more than a relaxed swap.
+__device__ __forceinline__ unsigned long long SwapIfEmpty(
+    unsigned long long &key, unsigned long long rep01) {
+  unsigned long long old_key = 0;
+  cuda::atomic_ref<unsigned long long, cuda::thread_scope_device>(key)
+      .compare_exchange_strong(old_key, rep01, cuda::memory_order_relaxed);
+  return old_key;
+}
+
+// Returns the slot holding rep01 in pairs, claiming an empty one if none does,
+// or -1 if the frame overflows first.
+__device__ int FindBlobPair(BlobPairTable *pairs, uint64_t rep01) {
+  uint32_t slot = BlobPairHash(rep01);
+  for (uint32_t probe = 0; probe < BlobPairTable::kSlots; ++probe) {
+    const unsigned long long key = SwapIfEmpty(pairs->keys[slot], rep01);
+    if (key == rep01) {
+      return slot;
+    }
+    if (key == 0) {
+      const uint32_t index = atomicAdd(&pairs->num_pairs, 1);
+      if (index < GpuDetector::kMaxBlobs) {
+        pairs->pairs[index] = (rep01 << BlobPairTable::kSlotBits) | slot;
+      } else {
+        atomicOr(&pairs->overflow, 1);
+      }
+      return slot;
+    }
+    // Nothing reads the table of a frame which overflows, so stop rather than
+    // search through a full table.
+    if (probe % 8 == 7 &&
+        *static_cast<volatile uint32_t *>(&pairs->overflow) != 0) {
+      return -1;
+    }
+    slot = (slot + 1) % BlobPairTable::kSlots;
+  }
+  atomicOr(&pairs->overflow, 1);
+  return -1;
+}
+
+// Adds some of a blob pair's points to its slot in pairs.
+__device__ __forceinline__ void AddToBlobPair(BlobPairTable *pairs,
+                                              uint32_t slot, uint32_t count,
+                                              uint32_t min_x, uint32_t max_x,
+                                              uint32_t min_y, uint32_t max_y,
+                                              int32_t gx_sum, int32_t gy_sum,
+                                              int32_t pxgx_plus_pygy_sum) {
+  atomicAdd(&pairs->counts[slot], count);
+  atomicMin(&pairs->min_xs[slot], min_x);
+  atomicMax(&pairs->max_xs[slot], max_x);
+  atomicMin(&pairs->min_ys[slot], min_y);
+  atomicMax(&pairs->max_ys[slot], max_y);
+  if (gx_sum != 0) {
+    atomicAdd(&pairs->gx_sums[slot], gx_sum);
+  }
+  if (gy_sum != 0) {
+    atomicAdd(&pairs->gy_sums[slot], gy_sum);
+  }
+  if (pxgx_plus_pygy_sum != 0) {
+    // Adding the sign extended sum unsigned is the same as adding it signed.
+    atomicAdd(&pairs->pxgx_plus_pygy_sums[slot],
+              static_cast<unsigned long long>(
+                  static_cast<int64_t>(pxgx_plus_pygy_sum)));
+  }
+}
+
+// Returns the sum, minimum, and maximum of value over the warp.
+__device__ __forceinline__ uint32_t WarpSum(uint32_t value) {
+#if __CUDA_ARCH__ >= 800
+  return __reduce_add_sync(0xffffffffu, value);
+#else
+  for (int i = 16; i > 0; i /= 2) {
+    value += __shfl_xor_sync(0xffffffffu, value, i);
+  }
+  return value;
+#endif
+}
+__device__ __forceinline__ uint32_t WarpMin(uint32_t value) {
+#if __CUDA_ARCH__ >= 800
+  return __reduce_min_sync(0xffffffffu, value);
+#else
+  for (int i = 16; i > 0; i /= 2) {
+    value = min(value, __shfl_xor_sync(0xffffffffu, value, i));
+  }
+  return value;
+#endif
+}
+__device__ __forceinline__ uint32_t WarpMax(uint32_t value) {
+#if __CUDA_ARCH__ >= 800
+  return __reduce_max_sync(0xffffffffu, value);
+#else
+  for (int i = 16; i > 0; i /= 2) {
+    value = max(value, __shfl_xor_sync(0xffffffffu, value, i));
+  }
+  return value;
+#endif
+}
+
+// The sums of some of a blob pair's points, as in MinMaxExtents.
+struct BlobPairSums {
+  uint32_t count;
+  uint32_t min_x;
+  uint32_t max_x;
+  uint32_t min_y;
+  uint32_t max_y;
+  int32_t gx_sum;
+  int32_t gy_sum;
+  // A warp's points sum to well under 2^31.
+  int32_t pxgx_plus_pygy_sum;
+};
+
 // Finds a QuadBoundaryPoint for each pixel pair which crosses the boundary
-// between two blobs of kMinBlobPixels or more, and appends them to points in no
-// particular order.  The last block to finish writes the number of points to
-// *num_points_host and zeros the counters for the next frame.
+// between two blobs of kMinBlobPixels or more, and appends their keys to
+// points in no particular order, counting them in pairs->num_points.
 //
 // Each block row is one warp.  Blocks overlap by 1 column on each side and 1
 // row below, so each pixel's neighbors are in shared memory.
 template <int kBlockWidth, int kBlockHeight>
 __global__ void __launch_bounds__(kBlockWidth *kBlockHeight)
     BlobDiff(const uint8_t *thresholded_image, const uint32_t *blobs,
-             const uint32_t *union_markers_size, QuadBoundaryPoint *points,
-             BlobDiffCounters *counters, int *num_points_host,
-             apriltag_size_t width, apriltag_size_t height) {
+             const uint32_t *union_markers_size, BlobPairTable *pairs,
+             uint64_t *points, apriltag_size_t width, apriltag_size_t height) {
   static_assert(kBlockWidth == 32);
   constexpr uint32_t kMinBlobPixels = 25;
   __shared__ uint8_t thresholded[kBlockHeight][kBlockWidth];
@@ -326,130 +371,94 @@ __global__ void __launch_bounds__(kBlockWidth *kBlockHeight)
       .ExclusiveSum(num_thread_points, offset, num_warp_points);
   uint32_t warp_start = 0;
   if (threadIdx.x == 0 && num_warp_points > 0) {
-    warp_start = atomicAdd(&counters->num_points, num_warp_points);
+    warp_start = atomicAdd(&pairs->num_points, num_warp_points);
   }
   offset += __shfl_sync(0xffffffffu, warp_start, 0);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     if (point[i].nonzero()) {
-      points[offset++] = point[i];
-    }
-  }
-
-  // Every warp in the block has its space once the block is past this.
-  __syncthreads();
-  if (threadIdx.x == 0 && threadIdx.y == 0) {
-    __threadfence();
-    if (atomicAdd(&counters->num_finished_blocks, 1) ==
-        gridDim.x * gridDim.y - 1) {
-      *num_points_host = atomicExch(&counters->num_points, 0);
-      counters->num_finished_blocks = 0;
+      points[offset++] = point[i].key;
     }
   }
 }
 
-// Masks out just the blob ID pair, rep01.
-struct MaskRep01 {
-  __host__ __device__ __forceinline__ uint64_t
-  operator()(const QuadBoundaryPoint &a) const {
-    return a.rep01();
+constexpr int kBinThreads = 256;
+
+// Sums up the points between blobs by blob pair in pairs, and replaces each
+// point's key with its pair's slot << 32 | its point_bits().  Each warp takes
+// 32 points at a time, and the first lane with points from each pair sums them
+// up and adds them to the pair's slot.
+//
+// This is its own kernel so BlobDiff keeps few enough registers to hide its
+// loads behind other blocks.
+__global__ void __launch_bounds__(kBinThreads)
+    BinBlobPairs(BlobPairTable *pairs, uint64_t *points) {
+  const uint32_t num_points = pairs->num_points;
+  const uint32_t lane = threadIdx.x % 32;
+  // Whole warps go around together.
+  for (uint32_t i = blockIdx.x * kBinThreads + threadIdx.x;
+       i - lane < num_points; i += gridDim.x * kBinThreads) {
+    QuadBoundaryPoint point;
+    if (i < num_points) {
+      point.key = points[i];
+    }
+    // No point has a rep01() of 0.
+    const uint64_t key = point.rep01();
+    const uint32_t x = point.x();
+    const uint32_t y = point.y();
+    const int32_t gx = point.gx();
+    const int32_t gy = point.gy();
+
+    BlobPairSums first_sums{};
+    bool first = false;
+    uint32_t first_lane = lane;
+    uint32_t pending = __ballot_sync(0xffffffffu, key != 0);
+    while (pending != 0) {
+      const uint32_t leader = __ffs(pending) - 1;
+      const bool member = key == __shfl_sync(0xffffffffu, key, leader);
+      const uint32_t members = __ballot_sync(0xffffffffu, member);
+      pending &= ~members;
+      const BlobPairSums sums{
+          .count = static_cast<uint32_t>(__popc(members)),
+          .min_x = WarpMin(member ? x : 0xffffffffu),
+          .max_x = WarpMax(member ? x : 0),
+          .min_y = WarpMin(member ? y : 0xffffffffu),
+          .max_y = WarpMax(member ? y : 0),
+          .gx_sum = static_cast<int32_t>(
+              WarpSum(member ? static_cast<uint32_t>(gx) : 0)),
+          .gy_sum = static_cast<int32_t>(
+              WarpSum(member ? static_cast<uint32_t>(gy) : 0)),
+          .pxgx_plus_pygy_sum = static_cast<int32_t>(WarpSum(
+              member ? static_cast<uint32_t>(static_cast<int32_t>(x) * gx +
+                                             static_cast<int32_t>(y) * gy)
+                     : 0)),
+      };
+      if (lane == leader) {
+        first_sums = sums;
+        first = true;
+      }
+      if (member) {
+        first_lane = leader;
+      }
+    }
+    // Every pair's first lane adds its sums at once, so the warp waits on the
+    // table once.
+    int slot = 0;
+    if (first) {
+      slot = FindBlobPair(pairs, key);
+      if (slot >= 0) {
+        AddToBlobPair(pairs, slot, first_sums.count, first_sums.min_x,
+                      first_sums.max_x, first_sums.min_y, first_sums.max_y,
+                      first_sums.gx_sum, first_sums.gy_sum,
+                      first_sums.pxgx_plus_pygy_sum);
+      }
+    }
+    slot = __shfl_sync(0xffffffffu, max(slot, 0), first_lane);
+    if (key != 0) {
+      points[i] = (static_cast<uint64_t>(slot) << 32) | point.point_bits();
+    }
   }
-};
-
-// Rewrites a QuadBoundaryPoint to an IndexPoint, adding the angle to the
-// center.
-class RewriteToIndexPoint {
- public:
-  RewriteToIndexPoint(MinMaxExtents *extents_device, const size_t *num_extents)
-      : blob_finder_(extents_device, num_extents) {}
-
-  __host__ __device__ __forceinline__ IndexPoint
-  operator()(cub::KeyValuePair<long, QuadBoundaryPoint> pt) const {
-    const apriltag_size_t index = blob_finder_.FindBlobIndex(pt.key);
-    IndexPoint result(index, pt.value.point_bits());
-    return result;
-  }
-
-  BlobExtentsIndexFinder blob_finder_;
-};
-
-// Calculates Theta for a given IndexPoint
-class AddThetaToIndexPoint {
- public:
-  AddThetaToIndexPoint(MinMaxExtents *extents_device, const size_t *num_extents)
-      : blob_finder_(extents_device, num_extents) {}
-  __host__ __device__ __forceinline__ IndexPoint operator()(IndexPoint a) {
-    MinMaxExtents extents = blob_finder_.Get(a.blob_index());
-    float theta =
-        (atan2f(a.y() - extents.cy(), a.x() - extents.cx()) + numbers::pi) *
-        8e6;
-    long long int theta_int = llrintf(theta);
-
-    a.set_theta(std::max<long long int>(0, theta_int));
-    return a;
-  }
-
- private:
-  BlobExtentsIndexFinder blob_finder_;
-};
-
-// TODO(austin): Make something which rewrites points on the way back out to
-// memory and adds the slope.
-
-// Transforms a QuadBoundaryPoint into a single point extent for Reduce.
-struct TransformQuadBoundaryPointToMinMaxExtents {
-  __host__ __device__ __forceinline__ MinMaxExtents
-  operator()(cub::KeyValuePair<long, QuadBoundaryPoint> pt) const {
-    MinMaxExtents result;
-    result.min_y = result.max_y = pt.value.y();
-    result.min_x = result.max_x = pt.value.x();
-    result.starting_offset = pt.key;
-    result.count = 1;
-    result.pxgx_plus_pygy_sum =
-        static_cast<int64_t>(pt.value.x()) * pt.value.gx() +
-        static_cast<int64_t>(pt.value.y()) * pt.value.gy();
-    result.gx_sum = pt.value.gx();
-    result.gy_sum = pt.value.gy();
-    return result;
-  }
-};
-
-// Reduces 2 extents by tracking the range and updating the offset and count
-// accordingly.
-struct QuadBoundaryPointExtents {
-  __host__ __device__ __forceinline__ MinMaxExtents
-  operator()(const MinMaxExtents &a, const MinMaxExtents &b) const {
-    MinMaxExtents result;
-    result.min_x = std::min(a.min_x, b.min_x);
-    result.max_x = std::max(a.max_x, b.max_x);
-    result.min_y = std::min(a.min_y, b.min_y);
-    result.max_y = std::max(a.max_y, b.max_y);
-    // And the actual start is the first of the points.
-    result.starting_offset = std::min(a.starting_offset, b.starting_offset);
-    // We want to count everything.
-    result.count = a.count + b.count;
-    result.pxgx_plus_pygy_sum = a.pxgx_plus_pygy_sum + b.pxgx_plus_pygy_sum;
-    result.gx_sum = a.gx_sum + b.gx_sum;
-    result.gy_sum = a.gy_sum + b.gy_sum;
-    return result;
-  }
-};
-
-class NonzeroBlobs {
- public:
-  __host__ __device__
-  NonzeroBlobs(const cub::KeyValuePair<long, MinMaxExtents> *extents_device)
-      : extents_device_(extents_device) {}
-
-  __host__ __device__ __forceinline__ bool operator()(
-      const IndexPoint &a) const {
-    return a.blob_index() < GpuDetector::kMaxBlobs &&
-           extents_device_[a.blob_index()].value.count > 0;
-  }
-
- private:
-  const cub::KeyValuePair<long, MinMaxExtents> *extents_device_;
-};
+}
 
 // Selects blobs which are big enough, not too big, and have the right color in
 // the middle.
@@ -505,84 +514,224 @@ class SelectBlobs {
   apriltag_size_t max_cluster_pixels_;
 };
 
-// Class to zero out the count (and clear the starting offset) for each extents
-// which is going to be filtered out.  Used in conjunction with SumPoints to
-// update zero sized blobs.
-//
-// The scan covers all kMaxBlobs entries so the host never needs the blob pair
-// count, and this zeros the ones past *num_quads_device.  Every blob is
-// filtered out if there are more than kMaxBlobs, since there is no good way to
-// pick which to keep.
-struct TransformZeroFilteredBlobSizes {
- public:
-  TransformZeroFilteredBlobSizes(const size_t *num_quads_device,
-                                 apriltag_size_t tag_width,
-                                 bool reversed_border, bool normal_border,
-                                 apriltag_size_t min_cluster_pixels,
-                                 apriltag_size_t max_cluster_pixels)
-      : num_quads_device_(num_quads_device),
-        select_blobs_(nullptr, tag_width, reversed_border, normal_border,
-                      min_cluster_pixels, max_cluster_pixels) {}
+// Returns a point with its angle around its blob's center.
+__device__ __forceinline__ IndexPoint AddTheta(IndexPoint a,
+                                               const MinMaxExtents &extents) {
+  float theta =
+      (atan2f(a.y() - extents.cy(), a.x() - extents.cx()) + numbers::pi) * 8e6;
+  long long int theta_int = llrintf(theta);
 
-  __host__ __device__ __forceinline__ cub::KeyValuePair<long, MinMaxExtents>
-  operator()(cub::KeyValuePair<long, MinMaxExtents> pt) const {
-    const size_t num_quads = *num_quads_device_;
-    pt.value.count *= num_quads <= GpuDetector::kMaxBlobs &&
-                      static_cast<size_t>(pt.key) < num_quads &&
-                      select_blobs_(pt.value);
-    pt.value.starting_offset = 0;
-    return pt;
-  }
-
- private:
-  const size_t *num_quads_device_;
-  SelectBlobs select_blobs_;
-};
-
-// Reports the frame's blob pair count, and whether it overflowed, to the host.
-__global__ void ReportBlobPairs(const size_t *num_quads_device,
-                                uint32_t *overflow, uint32_t *num_blob_pairs) {
-  const size_t num_quads = *num_quads_device;
-  *overflow = num_quads > GpuDetector::kMaxBlobs;
-  *num_blob_pairs = num_quads;
+  a.set_theta(std::max<long long int>(0, theta_int));
+  return a;
 }
 
-// Class to implement a custom Scan operator which passes through the previous
-// min/max/etc, but re-sums count into starting_offset.  This lets us collapse
-// out regions which don't pass the minimum filters.
-struct SumPoints {
-  __host__ __device__ __forceinline__ cub::KeyValuePair<long, MinMaxExtents>
-  operator()(const cub::KeyValuePair<long, MinMaxExtents> &a,
-             const cub::KeyValuePair<long, MinMaxExtents> &b) const {
-    cub::KeyValuePair<long, MinMaxExtents> result;
-    // KeyValuePair's constructor leaves these uninitialized, and nothing reads
-    // them after the scan.
-    result.value.gx_sum = 0;
-    result.value.gy_sum = 0;
-    result.value.pxgx_plus_pygy_sum = 0;
-    if (a.key < b.key) {
-      result.value.min_x = b.value.min_x;
-      result.value.min_y = b.value.min_y;
-      result.value.max_x = b.value.max_x;
-      result.value.max_y = b.value.max_y;
-      result.value.count = b.value.count;
-      result.key = b.key;
-    } else {
-      result.value.min_x = a.value.min_x;
-      result.value.min_y = a.value.min_y;
-      result.value.max_x = a.value.max_x;
-      result.value.max_y = a.value.max_y;
-      result.value.count = a.value.count;
-      result.key = a.key;
-    }
+// Empties a slot of pairs.
+__device__ __forceinline__ void EmptyBlobPair(BlobPairTable *pairs,
+                                              uint32_t slot) {
+  pairs->keys[slot] = 0;
+  pairs->pxgx_plus_pygy_sums[slot] = 0;
+  pairs->counts[slot] = 0;
+  pairs->min_xs[slot] = 0xffffffffu;
+  pairs->max_xs[slot] = 0;
+  pairs->min_ys[slot] = 0xffffffffu;
+  pairs->max_ys[slot] = 0;
+  pairs->gx_sums[slot] = 0;
+  pairs->gy_sums[slot] = 0;
+}
 
-    result.value.starting_offset = a.value.starting_offset +
-                                   b.value.starting_offset + a.value.count +
-                                   b.value.count - result.value.count;
+constexpr int kRankThreads = 256;
+// The blob pairs each RankBlobPairs block ranks, one per lane.
+constexpr int kRankPairsPerBlock = 32;
 
-    return result;
+// Ranks the blob pairs by rep01(), which puts them in the order sorting their
+// points by it would, records each pair's rank, and moves its sums from the
+// table to its extents, leaving the table empty for the next frame.  Each warp
+// counts the smaller pairs among its share of them.
+__global__ void __launch_bounds__(kRankThreads)
+    RankBlobPairs(BlobPairTable *pairs, MinMaxExtents *extents) {
+  __shared__ uint64_t keys[GpuDetector::kMaxBlobs];
+  __shared__ uint32_t ranks[kRankPairsPerBlock];
+  const uint32_t num_pairs = pairs->num_pairs;
+  // Nothing reads the ranks of a frame which overflows.
+  if (num_pairs > GpuDetector::kMaxBlobs || pairs->overflow != 0 ||
+      blockIdx.x * kRankPairsPerBlock >= num_pairs) {
+    return;
   }
-};
+  for (uint32_t i = threadIdx.x; i < num_pairs; i += kRankThreads) {
+    keys[i] = pairs->pairs[i];
+  }
+  if (threadIdx.x < kRankPairsPerBlock) {
+    ranks[threadIdx.x] = 0;
+  }
+  __syncthreads();
+
+  // The rep01()s are in the high bits and all differ, so the keys sort by them.
+  const uint32_t lane = threadIdx.x % kRankPairsPerBlock;
+  const uint32_t pair = blockIdx.x * kRankPairsPerBlock + lane;
+  const uint64_t key = pair < num_pairs ? keys[pair] : 0;
+  uint32_t rank = 0;
+  for (uint32_t i = threadIdx.x / kRankPairsPerBlock; i < num_pairs;
+       i += kRankThreads / kRankPairsPerBlock) {
+    rank += keys[i] < key;
+  }
+  atomicAdd(&ranks[lane], rank);
+  __syncthreads();
+
+  if (threadIdx.x < kRankPairsPerBlock && pair < num_pairs) {
+    const uint32_t slot = key & (BlobPairTable::kSlots - 1);
+    const uint32_t rank = ranks[lane];
+    pairs->slot_ranks[slot] = rank;
+    // BlobPairExtents fills in the starting offset.
+    extents[rank] = MinMaxExtents{
+        .min_x = static_cast<uint16_t>(pairs->min_xs[slot]),
+        .min_y = static_cast<uint16_t>(pairs->min_ys[slot]),
+        .max_x = static_cast<uint16_t>(pairs->max_xs[slot]),
+        .max_y = static_cast<uint16_t>(pairs->max_ys[slot]),
+        .starting_offset = 0,
+        .count = pairs->counts[slot],
+        .gx_sum = pairs->gx_sums[slot],
+        .gy_sum = pairs->gy_sums[slot],
+        .pxgx_plus_pygy_sum =
+            static_cast<int64_t>(pairs->pxgx_plus_pygy_sums[slot]),
+    };
+    EmptyBlobPair(pairs, slot);
+  }
+}
+
+constexpr int kExtentsThreads = 1024;
+constexpr int kExtentsPerThread = GpuDetector::kMaxBlobs / kExtentsThreads;
+static_assert(kExtentsPerThread * kExtentsThreads == GpuDetector::kMaxBlobs);
+
+// Fills in each blob pair's starting offset in extents, where sorting the
+// points by pair would put it, and writes the extents of the selected blobs,
+// with their offsets once the rest are left out.  selected_extents covers all
+// kMaxBlobs blobs, and those past the last pair have no points.  Then reports
+// on the frame and zeros the table's counts for the next one.
+__global__ void __launch_bounds__(kExtentsThreads)
+    BlobPairExtents(BlobPairTable *pairs, SelectBlobs select_blobs,
+                    MinMaxExtents *extents,
+                    cub::KeyValuePair<long, MinMaxExtents> *selected_extents,
+                    int *num_selected_points, uint32_t *overflow,
+                    uint32_t *num_blob_pairs, uint32_t *num_boundary_points) {
+  typedef cub::BlockScan<unsigned long long, kExtentsThreads> BlockScan;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+
+  const uint32_t num_pairs = pairs->num_pairs;
+  const uint32_t num_points = pairs->num_points;
+  // selected_extents and the other per-blob buffers only hold kMaxBlobs blobs,
+  // and there is no good way to pick which to keep, so a frame with more has
+  // every blob filtered out.
+  const bool overflowed =
+      num_pairs > GpuDetector::kMaxBlobs || pairs->overflow != 0;
+
+  MinMaxExtents blob[kExtentsPerThread] = {};
+  // Each blob's number of points in the low 32 bits, and its number of
+  // selected points in the high 32.
+  unsigned long long counts[kExtentsPerThread];
+#pragma unroll
+  for (int i = 0; i < kExtentsPerThread; ++i) {
+    const uint32_t rank = threadIdx.x * kExtentsPerThread + i;
+    counts[i] = 0;
+    if (!overflowed && rank < num_pairs) {
+      blob[i] = extents[rank];
+      counts[i] =
+          blob[i].count | (static_cast<unsigned long long>(
+                               select_blobs(blob[i]) ? blob[i].count : 0)
+                           << 32);
+    }
+  }
+  unsigned long long offsets[kExtentsPerThread];
+  unsigned long long total;
+  BlockScan(scan_storage).ExclusiveSum(counts, offsets, total);
+
+#pragma unroll
+  for (int i = 0; i < kExtentsPerThread; ++i) {
+    const uint32_t rank = threadIdx.x * kExtentsPerThread + i;
+    if (!overflowed && rank < num_pairs) {
+      blob[i].starting_offset = offsets[i] & 0xffffffffu;
+      extents[rank] = blob[i];
+    }
+    cub::KeyValuePair<long, MinMaxExtents> selected;
+    selected.key = rank;
+    selected.value = MinMaxExtents{};
+    selected.value.min_x = blob[i].min_x;
+    selected.value.min_y = blob[i].min_y;
+    selected.value.max_x = blob[i].max_x;
+    selected.value.max_y = blob[i].max_y;
+    selected.value.count = counts[i] >> 32;
+    selected.value.starting_offset = offsets[i] >> 32;
+    selected_extents[rank] = selected;
+    pairs->cursors[rank] = 0;
+  }
+
+  // RankBlobPairs emptied every slot of a frame which fits.  One which
+  // overflows may have taken slots it could not list.
+  if (overflowed) {
+    for (uint32_t slot = threadIdx.x; slot < BlobPairTable::kSlots;
+         slot += kExtentsThreads) {
+      EmptyBlobPair(pairs, slot);
+    }
+  }
+  // Every thread has read the counts.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    *num_selected_points = overflowed ? 0 : total >> 32;
+    *overflow = overflowed;
+    *num_blob_pairs = num_pairs;
+    *num_boundary_points = num_points;
+    pairs->frame_num_points = num_points;
+    pairs->frame_overflowed = overflowed;
+    pairs->num_pairs = 0;
+    pairs->num_points = 0;
+    pairs->overflow = 0;
+  }
+}
+
+constexpr int kScatterThreads = 256;
+
+// Writes each selected blob's points, with their angles, to its range of
+// selected_points, in no particular order within the blob.
+__global__ void __launch_bounds__(kScatterThreads) ScatterSelectedPoints(
+    const uint64_t *points, BlobPairTable *pairs, const MinMaxExtents *extents,
+    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents,
+    IndexPoint *selected_points) {
+  if (pairs->frame_overflowed) {
+    return;
+  }
+  const uint32_t num_points = pairs->frame_num_points;
+  const uint32_t lane = threadIdx.x % 32;
+  const uint32_t lanes_below = (1u << lane) - 1;
+  constexpr uint32_t kNoBlob = 0xffffffffu;
+  // Whole warps go around together, for __match_any_sync.
+  for (uint32_t i = blockIdx.x * kScatterThreads + threadIdx.x;
+       i - lane < num_points; i += gridDim.x * kScatterThreads) {
+    uint32_t blob_index = kNoBlob;
+    uint32_t starting_offset = 0;
+    IndexPoint point;
+    if (i < num_points) {
+      const uint64_t boundary_point = points[i];
+      const uint32_t index = pairs->slot_ranks[boundary_point >> 32];
+      const MinMaxExtents selected = selected_extents[index].value;
+      if (selected.count > 0) {
+        blob_index = index;
+        starting_offset = selected.starting_offset;
+        point = AddTheta(IndexPoint(index, boundary_point & 0xffffff),
+                         extents[index]);
+      }
+    }
+    // The first lane with points from a blob claims space for all of them.
+    const uint32_t peers = __match_any_sync(0xffffffffu, blob_index);
+    uint32_t position = 0;
+    if (blob_index != kNoBlob && (peers & lanes_below) == 0) {
+      position = atomicAdd(&pairs->cursors[blob_index], __popc(peers));
+    }
+    position = __shfl_sync(0xffffffffu, position, __ffs(peers) - 1) +
+               __popc(peers & lanes_below);
+    if (blob_index != kNoBlob) {
+      selected_points[starting_offset + position] = point;
+    }
+  }
+}
 
 struct TransformLineFitPoint {
   // Returns the weight of a point, from the image gradient at it.
@@ -1149,6 +1298,19 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   // 1280 -> 2 * 128 * 5
   // 720 -> 2 * 8 * 5 * 9
 
+  // Longest april tag will be the full perimeter of the image.  Each point
+  // results in 2 neighbor points, 1 straight, and one at 45 degrees.  But, we
+  // are in decimated space here, and width_ and height_ are in full image
+  // space.  And there are 2 sides to each rectangle...
+  //
+  // Aprilrobotics has a *3 instead of a *2 here since they have duplicated
+  // points in their list at this stage.
+  const apriltag_size_t max_april_tag_perimeter = 2 * (width_ + height_);
+  // SortAndScanBigBlobs holds a whole blob in one block.
+  ABSL_CHECK_LE(
+      max_april_tag_perimeter,
+      static_cast<apriltag_size_t>(kBigBlobThreads * kBigBlobPointsPerThread));
+
   // Find the points between blobs.
   {
     constexpr int kBlockWidth = 32;
@@ -1163,156 +1325,59 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     BlobDiff<kBlockWidth, kBlockHeight><<<blocks, threads, 0, stream_.get()>>>(
         thresholded_image_device_.get(), union_markers_device_.get(),
-        union_markers_size_device_.get(),
-        compressed_union_marker_pair_device_.get(),
-        blob_diff_counters_device_.get(),
-        num_compressed_union_marker_pair_.device_ptr(), decimated_width,
-        decimated_height);
+        union_markers_size_device_.get(), blob_pairs_device_.get(),
+        boundary_points_device_.get(), decimated_width, decimated_height);
     MaybeCheckAndSynchronize("BlobDiff");
   }
+  record_stage(after_diff_, &stream_);
 
-  after_diff_.Record(&stream_);
-
-  int num_compressed_union_marker_pairs;
+  // Sum them up by blob pair.
   {
-    // Now, sort just the keys to group like points.
-    size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
-    QuadBoundaryPointDecomposer decomposer;
-    after_diff_.Synchronize(host_wait_spin_);
-    num_compressed_union_marker_pairs =
-        *num_compressed_union_marker_pair_.host_ptr();
-    ABSL_CHECK_LE(static_cast<size_t>(num_compressed_union_marker_pairs),
-                  compressed_union_marker_pair_device_.size());
-    CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
-        radix_sort_tmpstorage_device_.get(), temp_storage_bytes,
-        compressed_union_marker_pair_device_.get(),
-        sorted_union_marker_pair_device_.get(),
-        num_compressed_union_marker_pairs, decomposer,
-        QuadBoundaryPoint::kRepEndBit, QuadBoundaryPoint::kBitsInKey,
-        stream_.get()));
-
-    MaybeCheckAndSynchronize("cub::DeviceRadixSort::SortKeys");
+    // Only the GPU knows the number of points, so the grid fills the GPU once
+    // and loops over them.
+    static const int kBinBlocks = ResidentBlocks(BinBlobPairs, kBinThreads);
+    BinBlobPairs<<<kBinBlocks, kBinThreads, 0, stream_.get()>>>(
+        blob_pairs_device_.get(), boundary_points_device_.get());
+    MaybeCheckAndSynchronize("BinBlobPairs");
   }
+  record_stage(after_bin_pairs_, &stream_);
 
-  record_stage(after_sort_, &stream_);
+  // Number the blob pairs in the order sorting their points by pair would put
+  // them in, and write their extents in that order.
+  RankBlobPairs<<<kMaxBlobs / kRankPairsPerBlock, kRankThreads, 0,
+                  stream_.get()>>>(blob_pairs_device_.get(),
+                                   extents_device_.get());
+  MaybeCheckAndSynchronize("RankBlobPairs");
+  record_stage(after_rank_pairs_, &stream_);
 
+  // Pick the blobs worth fitting quads to by their extents and dot products,
+  // and work out where their points go.
+  BlobPairExtents<<<1, kExtentsThreads, 0, stream_.get()>>>(
+      blob_pairs_device_.get(),
+      SelectBlobs(nullptr, min_tag_width_, reversed_border_, normal_border_,
+                  tag_detector_->qtp.min_cluster_pixels,
+                  max_april_tag_perimeter),
+      extents_device_.get(), selected_extents_device_.get(),
+      num_selected_blobs_device_.get(), &frame_status_.device_ptr()->overflow,
+      &frame_status_.device_ptr()->num_blob_pairs,
+      &frame_status_.device_ptr()->num_boundary_points);
+  MaybeCheckAndSynchronize("BlobPairExtents");
+  record_stage(after_pair_extents_, &stream_);
+
+  // Copy the selected blobs' points there.
   {
-    // Our next step is to compute the extents and dot product so we can filter
-    // blobs.
-    cub::ArgIndexInputIterator<QuadBoundaryPoint *> value_index_input_iterator(
-        sorted_union_marker_pair_device_.get());
-    TransformQuadBoundaryPointToMinMaxExtents min_max;
-    cub::TransformInputIterator<MinMaxExtents,
-                                TransformQuadBoundaryPointToMinMaxExtents,
-                                cub::ArgIndexInputIterator<QuadBoundaryPoint *>>
-        value_input_iterator(value_index_input_iterator, min_max);
-
-    // Don't care about the output keys...
-    cub::DiscardOutputIterator<uint64_t> key_discard_iterator;
-
-    // Provide a mask to detect keys by rep01()
-    MaskRep01 mask;
-    cub::TransformInputIterator<uint64_t, MaskRep01, QuadBoundaryPoint *>
-        key_input_iterator(sorted_union_marker_pair_device_.get(), mask);
-
-    // Reduction operator.
-    QuadBoundaryPointExtents reduce;
-
-    size_t temp_storage_bytes =
-        temp_storage_bounds_reduce_by_key_device_.size();
-    CHECK_CUDA(cub::DeviceReduce::ReduceByKey(
-        temp_storage_bounds_reduce_by_key_device_.get(), temp_storage_bytes,
-        key_input_iterator, key_discard_iterator, value_input_iterator,
-        extents_device_.get(), num_quads_device_.get(), reduce,
-        num_compressed_union_marker_pairs, stream_.get()));
-    ReportBlobPairs<<<1, 1, 0, stream_.get()>>>(
-        num_quads_device_.get(), &frame_status_.device_ptr()->overflow,
-        &frame_status_.device_ptr()->num_blob_pairs);
-    record_stage(after_bounds_, &stream_);
+    // Only the GPU knows the number of points, so the grid fills the GPU once
+    // and loops over them.
+    static const int kScatterBlocks =
+        ResidentBlocks(ScatterSelectedPoints, kScatterThreads);
+    ScatterSelectedPoints<<<kScatterBlocks, kScatterThreads, 0,
+                            stream_.get()>>>(
+        boundary_points_device_.get(), blob_pairs_device_.get(),
+        extents_device_.get(), selected_extents_device_.get(),
+        selected_blobs_device_.get());
+    MaybeCheckAndSynchronize("ScatterSelectedPoints");
   }
-
-  // Longest april tag will be the full perimeter of the image.  Each point
-  // results in 2 neighbor points, 1 straight, and one at 45 degrees.  But, we
-  // are in decimated space here, and width_ and height_ are in full image
-  // space.  And there are 2 sides to each rectangle...
-  //
-  // Aprilrobotics has a *3 instead of a *2 here since they have duplicated
-  // points in their list at this stage.
-  const apriltag_size_t max_april_tag_perimeter = 2 * (width_ + height_);
-  // SortAndScanBigBlobs holds a whole blob in one block.
-  ABSL_CHECK_LE(
-      max_april_tag_perimeter,
-      static_cast<apriltag_size_t>(kBigBlobThreads * kBigBlobPointsPerThread));
-
-  {
-    // Now that we have the dot products, we need to rewrite the extents for the
-    // post-thresholded world so we can find the start and end address of blobs
-    // for fitting lines.
-    //
-    // Clear the size of non-passing extents and the starting offset of all
-    // extents.
-    cub::ArgIndexInputIterator<MinMaxExtents *> value_index_input_iterator(
-        extents_device_.get());
-    TransformZeroFilteredBlobSizes rewrite(
-        num_quads_device_.get(), min_tag_width_, reversed_border_,
-        normal_border_, tag_detector_->qtp.min_cluster_pixels,
-        max_april_tag_perimeter);
-    cub::TransformInputIterator<cub::KeyValuePair<long, MinMaxExtents>,
-                                TransformZeroFilteredBlobSizes,
-                                cub::ArgIndexInputIterator<MinMaxExtents *>>
-        input_iterator(value_index_input_iterator, rewrite);
-
-    // Sum the counts of everything before us, and update the offset.
-    SumPoints sum_points;
-
-    // TODO(justin): Rip the key off when writing.
-
-    // Rewrite the extents to have the starting offset and count match the
-    // post-selected values.
-    size_t temp_storage_bytes =
-        temp_storage_selected_extents_scan_device_.size();
-
-    CHECK_CUDA(cub::DeviceScan::InclusiveScan(
-        temp_storage_selected_extents_scan_device_.get(), temp_storage_bytes,
-        input_iterator, selected_extents_device_.get(), sum_points, kMaxBlobs,
-        stream_.get()));
-
-    MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScan");
-  }
-
-  record_stage(after_transform_extents_, &stream_);
-
-  {
-    // Now, copy over all points which pass our thresholds.
-    cub::ArgIndexInputIterator<QuadBoundaryPoint *> value_index_input_iterator(
-        sorted_union_marker_pair_device_.get());
-    RewriteToIndexPoint rewrite(extents_device_.get(), num_quads_device_.get());
-
-    cub::TransformInputIterator<IndexPoint, RewriteToIndexPoint,
-                                cub::ArgIndexInputIterator<QuadBoundaryPoint *>>
-        input_iterator(value_index_input_iterator, rewrite);
-
-    AddThetaToIndexPoint add_theta(extents_device_.get(),
-                                   num_quads_device_.get());
-
-    TransformOutputIterator<IndexPoint, IndexPoint, AddThetaToIndexPoint>
-        output_iterator(selected_blobs_device_.get(), add_theta);
-
-    NonzeroBlobs select_blobs(selected_extents_device_.get());
-
-    size_t temp_storage_bytes =
-        temp_storage_compressed_filtered_blobs_device_.size();
-
-    CHECK_CUDA(cub::DeviceSelect::If(
-        temp_storage_compressed_filtered_blobs_device_.get(),
-        temp_storage_bytes, input_iterator, output_iterator,
-        num_selected_blobs_device_.get(), num_compressed_union_marker_pairs,
-        select_blobs, stream_.get()));
-
-    MaybeCheckAndSynchronize("cub::DeviceSelect::If");
-  }
-
-  record_stage(after_filter_, &stream_);
+  record_stage(after_scatter_, &stream_);
 
   {
     // Sort each selected blob's points by angle around the blob, and prefix
@@ -1339,18 +1404,14 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   }
   record_stage(after_big_blob_sort_, &stream_);
 
-  {
-    // Every selected point is one of the compacted points, so their number
-    // bounds the launch.
-    FitLines(line_fit_points_device_.get(), num_selected_blobs_device_.get(),
-             num_compressed_union_marker_pairs, selected_extents_device_.get(),
-             errs_device_.get(), filtered_errs_device_.get(),
-             filtered_is_local_peak_device_.get(), &stream_);
-  }
+  FitLines(line_fit_points_device_.get(), num_selected_blobs_device_.get(),
+           selected_extents_device_.get(), errs_device_.get(),
+           filtered_errs_device_.get(), filtered_is_local_peak_device_.get(),
+           &stream_);
   record_stage(after_line_filter_, &stream_);
 
-  // The host reads the quads where this writes them, so this is the only wait
-  // after the filtered points' count.
+  // The host reads the quads where this writes them, so this is Detect()'s
+  // only wait on the GPU.
   apriltag::FitQuads(
       filtered_is_local_peak_device_.get(), line_fit_points_device_.get(),
       selected_extents_device_.get(), kMaxBlobs, max_april_tag_perimeter,
@@ -1367,8 +1428,9 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   last_frame_overflowed_ = frame_status_.host_ptr()->overflow != 0;
   const uint32_t num_blob_pairs = frame_status_.host_ptr()->num_blob_pairs;
   if (last_frame_overflowed_) {
-    ABSL_LOG_EVERY_N_SEC(ERROR, 1) << "Dropping a frame with " << num_blob_pairs
-                                   << " blob pairs, more than " << kMaxBlobs;
+    ABSL_LOG_EVERY_N_SEC(ERROR, 1)
+        << "Dropping a frame with " << num_blob_pairs
+        << " or more blob pairs, more than " << kMaxBlobs;
   }
 
   const aos::monotonic_clock::time_point before_fit_quads =
@@ -1384,7 +1446,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   // Report out how long things took.
 
-  ABSL_VLOG(1) << "Found " << num_compressed_union_marker_pairs << " items";
+  ABSL_VLOG(1) << "Found " << frame_status_.host_ptr()->num_boundary_points
+               << " items";
   ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;
   ABSL_VLOG(1) << "Fit " << quad_corners_host_.size() << " quads";
   const std::chrono::nanoseconds gpu_time = after_quad_fit_.ElapsedTime(start_);

@@ -360,11 +360,16 @@ class CudaAprilTagDetector {
     gpu_detector_.CopyUnionMarkersSizeTo(
         reinterpret_cast<uint32_t *>(union_markers_size_.data));
 
-    compressed_union_marker_pair_ =
-        gpu_detector_.CopyCompressedUnionMarkerPair();
-    sorted_union_marker_pair_ = gpu_detector_.CopySortedUnionMarkerPair();
-    num_compressed_union_marker_pair_ =
-        gpu_detector_.NumCompressedUnionMarkerPairs();
+    compressed_union_marker_pair_ = gpu_detector_.CopyBoundaryPoints();
+    // The GPU sums up each blob pair's points without sorting them by pair,
+    // so sort them here for the checks which go through the pairs in order.
+    sorted_union_marker_pair_ = compressed_union_marker_pair_;
+    std::stable_sort(sorted_union_marker_pair_.begin(),
+                     sorted_union_marker_pair_.end(),
+                     [](const QuadBoundaryPoint a, const QuadBoundaryPoint b) {
+                       return a.rep01() < b.rep01();
+                     });
+    num_compressed_union_marker_pair_ = gpu_detector_.NumBoundaryPoints();
     extents_cuda_ = gpu_detector_.CopyExtents();
     selected_extents_cuda_ = gpu_detector_.CopySelectedExtents();
     selected_blobs_cuda_ = gpu_detector_.CopySelectedBlobs();
@@ -551,8 +556,8 @@ class CudaAprilTagDetector {
   // CPU version.  Returns the expected points.
   std::vector<QuadBoundaryPoint> CheckCompressedUnionMarkerPairs(
       const std::vector<QuadBoundaryPoint> &expected_union_marker_pair,
-      const std::vector<QuadBoundaryPoint> &compressed_union_marker_pair,
-      const std::vector<QuadBoundaryPoint> &sorted_union_marker_pair) const {
+      const std::vector<QuadBoundaryPoint> &compressed_union_marker_pair)
+      const {
     std::vector<QuadBoundaryPoint> expected_compressed_union_marker_pair;
     {
       size_t nonzero_count = 0;
@@ -569,7 +574,7 @@ class CudaAprilTagDetector {
         }
       }
 
-      ABSL_CHECK_EQ(static_cast<size_t>(sorted_union_marker_pair.size()),
+      ABSL_CHECK_EQ(compressed_union_marker_pair.size(),
                     expected_compressed_union_marker_pair.size());
     }
 
@@ -584,23 +589,11 @@ class CudaAprilTagDetector {
                 return a < b;
               });
 
-    // The GPU finds points in no particular order, and its sort by blob pair
-    // leaves them in that order within each pair, so compare them as sets.
-    auto CheckSamePoints = [&](std::vector<QuadBoundaryPoint> points) {
-      ABSL_CHECK_EQ(points.size(),
-                    expected_compressed_union_marker_pair.size());
-      std::sort(points.begin(), points.end());
-      for (size_t i = 0; i < points.size(); ++i) {
-        ABSL_CHECK_EQ(expected_compressed_union_marker_pair[i], points[i]);
-      }
-    };
-    CheckSamePoints(compressed_union_marker_pair);
-    CheckSamePoints(sorted_union_marker_pair);
-
-    for (size_t i = 0; i < static_cast<size_t>(sorted_union_marker_pair.size());
-         ++i) {
-      ABSL_CHECK_EQ(expected_compressed_union_marker_pair[i].rep01(),
-                    sorted_union_marker_pair[i].rep01());
+    // The GPU finds points in no particular order, so compare them as sets.
+    std::vector<QuadBoundaryPoint> points = compressed_union_marker_pair;
+    std::sort(points.begin(), points.end());
+    for (size_t i = 0; i < points.size(); ++i) {
+      ABSL_CHECK_EQ(expected_compressed_union_marker_pair[i], points[i]);
     }
 
     return expected_compressed_union_marker_pair;
@@ -1070,8 +1063,6 @@ class CudaAprilTagDetector {
     const size_t max_april_tag_perimeter = 2 * (width_ + height_);
     size_t selected_quads = 0;
     {
-      const size_t num_extents = extents_cuda.size();
-      BlobExtentsIndexFinder finder(extents_cuda.data(), &num_extents);
       size_t i = 0;
       size_t starting_offset = 0;
       ABSL_CHECK_EQ(cuda_grouped_points.size(), extents_cuda.size());
@@ -1098,10 +1089,26 @@ class CudaAprilTagDetector {
         ABSL_CHECK_EQ(extents.starting_offset, starting_offset)
             << " for index " << i;
 
-        float dot = 0;
+        // The GPU appends points in a different order every run, so the sums
+        // are integers, which don't depend on it.
+        int64_t gx_sum = 0;
+        int64_t gy_sum = 0;
+        int64_t pxgx_plus_pygy_sum = 0;
+        for (const QuadBoundaryPoint pt : points) {
+          gx_sum += pt.gx();
+          gy_sum += pt.gy();
+          pxgx_plus_pygy_sum += static_cast<int64_t>(pt.x()) * pt.gx() +
+                                static_cast<int64_t>(pt.y()) * pt.gy();
+        }
+        ABSL_CHECK_EQ(extents.gx_sum, gx_sum) << " for index " << i;
+        ABSL_CHECK_EQ(extents.gy_sum, gy_sum) << " for index " << i;
+        ABSL_CHECK_EQ(extents.pxgx_plus_pygy_sum, pxgx_plus_pygy_sum)
+            << " for index " << i;
 
-        const float cx = (min_x + max_x) * 0.5 + 0.05118;
-        const float cy = (min_y + max_y) * 0.5 - 0.028581;
+        // sum((x - cx) * gx + (y - cy) * gy), without rounding the center.
+        const double cx = (min_x + max_x) * 0.5 + 0.05118;
+        const double cy = (min_y + max_y) * 0.5 - 0.028581;
+        const double dot = pxgx_plus_pygy_sum - cx * gx_sum - cy * gy_sum;
 
         bool good_blob_size =
             points.size() >= 24 && points.size() <= max_april_tag_perimeter &&
@@ -1109,14 +1116,6 @@ class CudaAprilTagDetector {
                 static_cast<size_t>(tag_detector_->qtp.min_cluster_pixels) &&
             static_cast<int>((max_x - min_x) * (max_y - min_y)) >=
                 min_tag_width_;
-
-        for (size_t j = 0; j < points.size(); ++j) {
-          dot += (static_cast<float>(points[j].x()) - cx) * points[j].gx() +
-                 (static_cast<float>(points[j].y()) - cy) * points[j].gy();
-
-          // Make sure our blob finder agrees.
-          ABSL_CHECK_EQ(i, finder.FindBlobIndex(starting_offset + j));
-        }
 
         // Test that the summed dot product is right.
         ABSL_CHECK_LT(std::abs(extents.dot() - dot) / std::abs(dot), 1e-2)
@@ -1926,8 +1925,7 @@ class CudaAprilTagDetector {
         CheckUnionMarkerPairs(blob_sizes);
     const std::vector<QuadBoundaryPoint> expected_compressed_union_marker_pair =
         CheckCompressedUnionMarkerPairs(expected_union_marker_pair,
-                                        compressed_union_marker_pair_,
-                                        sorted_union_marker_pair_);
+                                        compressed_union_marker_pair_);
 
     const std::vector<std::vector<QuadBoundaryPoint>> cuda_grouped_points =
         CudaGroupedPoints(sorted_union_marker_pair_);
@@ -2549,7 +2547,7 @@ class SyntheticImageTest : public ::testing::Test {
 TEST_F(SyntheticImageTest, Blank) {
   for (int i = 0; i < 2; ++i) {
     Detect(UniformImage(128));
-    EXPECT_EQ(gpu_detector_.NumCompressedUnionMarkerPairs(), 0);
+    EXPECT_EQ(gpu_detector_.NumBoundaryPoints(), 0);
     EXPECT_EQ(gpu_detector_.NumQuads(), 0);
     EXPECT_EQ(gpu_detector_.NumSelectedPairs(), 0);
     EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
@@ -2562,9 +2560,11 @@ TEST_F(SyntheticImageTest, Blank) {
 // overrunning the per-blob buffers.
 TEST_F(SyntheticImageTest, TooManyBlobs) {
   // 12 pixel squares on a 24 pixel pitch give 66 x 54 = 3564 black blobs, each
-  // paired with the white background.
+  // paired with the white background.  Past kMaxBlobs, the GPU stops counting
+  // some of them.
   Detect(GridImage(12, 24));
-  EXPECT_EQ(gpu_detector_.NumQuads(), 3564);
+  EXPECT_GT(static_cast<size_t>(gpu_detector_.NumQuads()),
+            GpuDetector::kMaxBlobs);
   EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
   EXPECT_EQ(gpu_detector_.NumSelectedPairs(), 0);
   EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
@@ -2588,6 +2588,22 @@ TEST_F(SyntheticImageTest, TooManyBlobs) {
   EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
   EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
   EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
+
+  // 10 pixel squares on a 16 pixel pitch give 100 x 81 = 8100 blob pairs, more
+  // than the GPU's table of pairs holds.
+  Detect(GridImage(10, 16));
+  EXPECT_GT(static_cast<size_t>(gpu_detector_.NumQuads()),
+            GpuDetector::kMaxBlobs);
+  EXPECT_TRUE(gpu_detector_.last_frame_overflowed());
+  EXPECT_EQ(gpu_detector_.NumFitQuads(), 0);
+  EXPECT_EQ(zarray_size(gpu_detector_.Detections()), 0);
+
+  // The table is empty again for the next frame.
+  Detect(GridImage(12, 24, GpuDetector::kMaxBlobs));
+  EXPECT_EQ(static_cast<size_t>(gpu_detector_.NumQuads()),
+            GpuDetector::kMaxBlobs);
+  EXPECT_FALSE(gpu_detector_.last_frame_overflowed());
+  EXPECT_GT(gpu_detector_.NumFitQuads(), 0);
 }
 
 // The labels LabelImage gives a thresholded image, and the size at each label.

@@ -127,10 +127,9 @@ __host__ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
 
 // Computes the line fit error, filtered error, and peak at every point.  The
 // GPU reads the number of points from num_points_device, so it only has to be
-// written by the time the kernel runs, and max_points bounds it.
+// written by the time the kernel runs.
 void FitLines(
     const LineFitPoint *line_fit_points_device, const int *num_points_device,
-    size_t max_points,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
     double *errs_device, double *filtered_errs_device, Peak *peaks_device,
     CudaStream *stream);

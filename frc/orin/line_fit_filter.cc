@@ -68,14 +68,17 @@ struct TempStorage {
 template <size_t kThreads>
 class ErrorCalculator {
  public:
+  // Calculates the errors of chunk, the chunk'th run of
+  // kPointsPerBlock - 2 * kErrorsBuffer points.
   __host__ __device__ ErrorCalculator(
       const LineFitPoint *line_fit_points_device, size_t points,
       const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-      TempStorage *storage)
+      uint32_t chunk, TempStorage *storage)
       : line_fit_points_device_(line_fit_points_device),
         points_(points),
         selected_extents_device_(selected_extents_device),
-        storage_(storage) {}
+        storage_(storage),
+        chunk_(chunk) {}
 
   __host__ __device__ void Load() {
     constexpr size_t kLoadSize = sizeof(int4);
@@ -110,7 +113,7 @@ class ErrorCalculator {
   // the front of the range we are responsible for computing.
   __host__ __device__ void LoadExtents(size_t index) {
     const size_t current_blob_index =
-        storage_->tmp_storage[index + (blockIdx.x == 0 ? 0 : kErrorsBuffer)]
+        storage_->tmp_storage[index + (chunk_ == 0 ? 0 : kErrorsBuffer)]
             .blob_index;
     if (current_blob_index != blob_index_) {
       starting_offset_ =
@@ -324,17 +327,18 @@ class ErrorCalculator {
   const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device_;
 
   TempStorage *storage_;
+  const uint32_t chunk_;
 
   // Start and end location of the LineFitPoint cache in tmp_storage_.
   const uint32_t global_block_index_cache_start_ =
-      blockIdx.x == 0
+      chunk_ == 0
           ? 0
-          : blockIdx.x * (kPointsPerBlock - 2 * kErrorsBuffer) - kErrorsBuffer;
+          : chunk_ * (kPointsPerBlock - 2 * kErrorsBuffer) - kErrorsBuffer;
   const uint32_t global_block_index_cache_end_ = std::min<uint32_t>(
       global_block_index_cache_start_ + kPointsPerBlock, points_);
 
   const uint32_t global_block_index_start_ =
-      blockIdx.x * (kPointsPerBlock - 2 * kErrorsBuffer);
+      chunk_ * (kPointsPerBlock - 2 * kErrorsBuffer);
   const uint32_t global_block_index_end_ = std::min<uint32_t>(
       global_block_index_start_ + kPointsPerBlock - 2 * kErrorsBuffer, points_);
 
@@ -344,22 +348,17 @@ class ErrorCalculator {
   size_t ksz_ = 0;
 };
 
+// Computes the errors, filtered errors, and peaks of one chunk of points.
+// Every thread in the block calls this, and storage is free again once it
+// returns.
 template <size_t kThreads>
-__global__ void DoFitLines(
-    const LineFitPoint *line_fit_points_device, const int *num_points_device,
+__device__ __forceinline__ void FitLinesChunk(
+    uint32_t chunk, size_t points, const LineFitPoint *line_fit_points_device,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    double *errs_device, double *filtered_errs_device, Peak *peaks_device) {
-  __shared__ TempStorage storage;
-
-  // The grid covers the most points there could be, so blocks past the real
-  // count have nothing to do.
-  const size_t points = *num_points_device;
-  if (blockIdx.x * (kPointsPerBlock - 2 * kErrorsBuffer) >= points) {
-    return;
-  }
-
-  ErrorCalculator<kThreads> calculator(line_fit_points_device, points,
-                                       selected_extents_device, &storage);
+    double *errs_device, double *filtered_errs_device, Peak *peaks_device,
+    TempStorage &storage) {
+  ErrorCalculator<kThreads> calculator(
+      line_fit_points_device, points, selected_extents_device, chunk, &storage);
 
   calculator.Load();
 
@@ -605,25 +604,37 @@ __global__ void DoFitLines(
 
     peaks_device[peak.filtered_point_index] = peak;
   }
+  // The next chunk reuses storage.
+  __syncthreads();
+}
+
+// Fits lines to every chunk of the points, a block at a time.
+template <size_t kThreads>
+__global__ void DoFitLines(
+    const LineFitPoint *line_fit_points_device, const int *num_points_device,
+    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
+    double *errs_device, double *filtered_errs_device, Peak *peaks_device) {
+  __shared__ TempStorage storage;
+
+  const size_t points = *num_points_device;
+  for (uint32_t chunk = blockIdx.x;
+       chunk * (kPointsPerBlock - 2 * kErrorsBuffer) < points;
+       chunk += gridDim.x) {
+    FitLinesChunk<kThreads>(chunk, points, line_fit_points_device,
+                            selected_extents_device, errs_device,
+                            filtered_errs_device, peaks_device, storage);
+  }
 }
 
 void FitLines(
     const LineFitPoint *line_fit_points_device, const int *num_points_device,
-    size_t max_points,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
     double *errs_device, double *filtered_errs_device, Peak *peaks_device,
     CudaStream *stream) {
   constexpr size_t kThreads = 128;
-  const size_t kBlocks =
-      (max_points + kPointsPerBlock - 2 * kErrorsBuffer - 1) /
-      (kPointsPerBlock - 2 * kErrorsBuffer);
-
-  ABSL_VLOG(1) << "Spawning with " << kThreads << " threads, and " << kBlocks
-               << " blocks for up to " << max_points << " points";
-  // A launch with no blocks fails and leaves the error pending.
-  if (kBlocks == 0) {
-    return;
-  }
+  // Only the GPU knows the number of points, so the grid fills the GPU once
+  // and loops over the chunks.
+  static const int kBlocks = ResidentBlocks(DoFitLines<kThreads>, kThreads);
   DoFitLines<kThreads><<<kBlocks, kThreads, 0, stream->get()>>>(
       line_fit_points_device, num_points_device, selected_extents_device,
       errs_device, filtered_errs_device, peaks_device);
