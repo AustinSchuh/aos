@@ -4,6 +4,7 @@
 // and compare that against an earlier run, so a change can be checked for both
 // speed and for whether it changed any detections.
 
+#include <sched.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -82,6 +83,13 @@ ABSL_FLAG(int32_t, nthreads, 6, "Decode threads per detector.");
 ABSL_FLAG(bool, stage_timing, false,
           "Report the time each GPU stage takes.  Recording the events costs "
           "CPU and latency, so leave this off when measuring those.");
+ABSL_FLAG(int32_t, realtime_priority, 0,
+          "If > 0, run each detector's main thread at this SCHED_FIFO "
+          "priority, the way apriltag_detector runs at 21 on the robot.  The "
+          "decode threads stay SCHED_OTHER there and here.");
+ABSL_FLAG(int32_t, host_wait_spin_us, 0,
+          "Microseconds the detector polls each GPU event before it sleeps "
+          "on it.");
 ABSL_FLAG(std::string, detections_out, "",
           "If set, write every detection from the first pass to this file.");
 ABSL_FLAG(std::string, compare_to, "",
@@ -450,6 +458,8 @@ DetectorResults RunDetector(
     GpuDetector detector(width, height, tag_detector, calib.camera_matrix,
                          calib.dist_coeffs, first.format());
     detector.set_stage_timing(stage_timing);
+    detector.set_host_wait_spin(
+        std::chrono::microseconds(absl::GetFlag(FLAGS_host_wait_spin_us)));
     ImageSource source(
         image_bytes, absl::GetFlag(FLAGS_cold_input), [&](size_t sequence) {
           return frame_for(sequence).image.message().data()->data();
@@ -464,6 +474,27 @@ DetectorResults RunDetector(
       detector.SetDistortionCoefficients(calib.dist_coeffs);
       return std::make_pair(image_host, image_device);
     };
+
+    // The decode and input threads already exist, so they keep SCHED_OTHER.
+    // The old policy comes back at the end, or threads this thread starts
+    // later would inherit SCHED_FIFO.
+    struct RestoreScheduler {
+      RestoreScheduler() : policy(sched_getscheduler(0)) {
+        ABSL_PCHECK(policy >= 0);
+        ABSL_PCHECK(sched_getparam(0, &param) == 0);
+      }
+      ~RestoreScheduler() {
+        ABSL_PCHECK(sched_setscheduler(0, policy, &param) == 0);
+      }
+      const int policy;
+      struct sched_param param;
+    } restore_scheduler;
+    if (const int priority = absl::GetFlag(FLAGS_realtime_priority);
+        priority > 0) {
+      struct sched_param param;
+      param.sched_priority = priority;
+      ABSL_PCHECK(sched_setscheduler(0, SCHED_FIFO, &param) == 0);
+    }
 
     for (size_t i = 0; i < warmup; ++i) {
       const auto [image_host, image_device] = prepare(i);

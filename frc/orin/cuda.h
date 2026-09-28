@@ -82,6 +82,26 @@ class CudaEvent {
   // Waits until the event has been triggered.
   void Synchronize() { CHECK_CUDA(cudaEventSynchronize(event_)); }
 
+  // Polls the event for up to spin, then waits for it with Synchronize().
+  // With cudaEventBlockingSync, polling first trades CPU time for the wake-up
+  // latency of the blocking wait on events which trigger soon.
+  void Synchronize(std::chrono::nanoseconds spin) {
+    if (spin > std::chrono::nanoseconds(0)) {
+      const std::chrono::steady_clock::time_point end =
+          std::chrono::steady_clock::now() + spin;
+      do {
+        const cudaError_t result = cudaEventQuery(event_);
+        if (result == cudaSuccess) {
+          return;
+        }
+        if (result != cudaErrorNotReady) {
+          CHECK_CUDA(result);
+        }
+      } while (std::chrono::steady_clock::now() < end);
+    }
+    Synchronize();
+  }
+
  private:
   cudaEvent_t event_;
 };

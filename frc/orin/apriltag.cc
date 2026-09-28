@@ -752,7 +752,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   record_stage(after_memcpy_gray_, &stream_);
 
-  after_memset_.Synchronize();
+  after_memset_.Synchronize(host_wait_spin_);
 
   // Unionfind the image.
   record_stage(before_unionfinding_, &stream_);
@@ -827,7 +827,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     // Now, sort just the keys to group like points.
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     QuadBoundaryPointDecomposer decomposer;
-    after_num_compact_memcpy_.Synchronize();
+    after_num_compact_memcpy_.Synchronize(host_wait_spin_);
     ABSL_CHECK_LE(
         static_cast<size_t>(*num_compressed_union_marker_pair_host_.get()),
         union_marker_pair_device_.size());
@@ -888,7 +888,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   // points in their list at this stage.
   const apriltag_size_t max_april_tag_perimeter = 2 * (width_ + height_);
 
-  after_bounds_memcpy_.Synchronize();
+  after_bounds_memcpy_.Synchronize(host_wait_spin_);
   // selected_extents_device_ and the 12 bit blob index in IndexPoint only hold
   // kMaxBlobs blobs.  Rather than guess which ones to keep, filter them all out
   // so the rest of the pipeline runs with nothing selected.
@@ -973,7 +973,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     num_selected_blobs_device_.MemcpyAsyncTo(&num_selected_blobs_host_,
                                              &stream_);
     after_filter_.Record(&stream_);
-    after_filter_.Synchronize();
+    after_filter_.Synchronize(host_wait_spin_);
     num_selected_blobs_host = *num_selected_blobs_host_.get();
   }
 
@@ -1052,7 +1052,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host_,
                                                &stream_);
     after_peak_count_memcpy_.Record(&stream_);
-    after_peak_count_memcpy_.Synchronize();
+    after_peak_count_memcpy_.Synchronize(host_wait_spin_);
     num_compressed_peaks_host = *num_compressed_peaks_host_.get();
   }
 
@@ -1110,7 +1110,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
                                                 &stream_);
     MaybeCheckAndSynchronize("num_quad_peaked_quads_device_.MemcpyTo");
     after_filtered_peak_host_memcpy_.Record(&stream_);
-    after_filtered_peak_host_memcpy_.Synchronize();
+    after_filtered_peak_host_memcpy_.Synchronize(host_wait_spin_);
     num_quad_peaked_quads_host = *num_quad_peaked_quads_host_.get();
   }
 
@@ -1130,7 +1130,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     fit_quads_device_.MemcpyAsyncTo(fit_quads_host_.get(), num_fit_quads_host_,
                                     &stream_);
     after_quad_fit_memcpy_.Record(&stream_);
-    after_quad_fit_memcpy_.Synchronize();
+    after_quad_fit_memcpy_.Synchronize(host_wait_spin_);
   }
 
   const aos::monotonic_clock::time_point before_fit_quads =

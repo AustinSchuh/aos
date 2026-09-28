@@ -2,6 +2,7 @@
 #define FRC_ORIN_APRILTAG_H_
 
 #include <array>
+#include <chrono>
 #include <cub/iterator/transform_input_iterator.cuh>
 
 #include "third_party/apriltag/apriltag.h"
@@ -158,6 +159,13 @@ class GpuDetector {
   // Host time spent after the GPU finished (quad filtering and decoding) in
   // the last Detect().
   float HostDecodeTimeMs() const { return host_decode_time_ms_; }
+
+  // How long Detect() polls each GPU event before it sleeps on it.  Polling
+  // saves the tens of microseconds a blocking wait takes to wake up, and burns
+  // a core for as long as it polls.  Defaults to 0, sleeping right away.
+  void set_host_wait_spin(std::chrono::nanoseconds host_wait_spin) {
+    host_wait_spin_ = host_wait_spin;
+  }
 
   // True if the last Detect() found more than kMaxBlobs blob pairs and dropped
   // the frame without detecting anything.
@@ -338,26 +346,27 @@ class GpuDetector {
   // Events between the steps.  Detect() always records start_,
   // after_quad_fit_, and the events it waits on, and records the rest only for
   // stage timing.
+  //
+  // Every event the host waits on is a cudaEventBlockingSync event.  Sleeping
+  // there instead of spinning frees the core while the GPU is busy, which
+  // matters most when other processes hold the GPU.
   CudaEvent start_;
   CudaEvent after_image_memcpy_to_device_;
   CudaEvent after_threshold_;
   CudaEvent after_memcpy_gray_;
   CudaEvent memset_start_;
-  CudaEvent after_memset_;
+  CudaEvent after_memset_{cudaEventBlockingSync};
   CudaEvent before_unionfinding_;
   // After each of LabelImage's kernels.
   std::array<CudaEvent, 5> after_labeling_kernel_;
   CudaEvent after_unionfinding_;
   CudaEvent after_diff_;
   CudaEvent after_compact_;
-  CudaEvent after_num_compact_memcpy_;
+  CudaEvent after_num_compact_memcpy_{cudaEventBlockingSync};
   CudaEvent after_sort_;
   CudaEvent after_bounds_;
-  CudaEvent after_bounds_memcpy_;
+  CudaEvent after_bounds_memcpy_{cudaEventBlockingSync};
   CudaEvent after_transform_extents_;
-  // The host waits on the cudaEventBlockingSync events below before reading a
-  // pinned copy.  Sleeping there instead of spinning frees the core while the
-  // GPU is busy, which matters most when other processes hold the GPU.
   CudaEvent after_filter_{cudaEventBlockingSync};
   CudaEvent after_filtered_sort_;
   CudaEvent after_line_fit_;
@@ -505,6 +514,7 @@ class GpuDetector {
   bool first_ = true;
 
   bool stage_timing_ = false;
+  std::chrono::nanoseconds host_wait_spin_{0};
   std::vector<std::pair<std::string_view, float>> stage_times_ms_;
   float gpu_time_ms_ = 0;
   float host_decode_time_ms_ = 0;
