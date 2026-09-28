@@ -159,7 +159,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       temp_storage_compressed_union_marker_pair_device_(
           DeviceSelectIfScratchSpace<QuadBoundaryPoint, QuadBoundaryPoint>(
               union_marker_pair_device_.size(),
-              num_compressed_union_marker_pair_device_.get())),
+              num_compressed_union_marker_pair_.device_ptr())),
       temp_storage_bounds_reduce_by_key_device_(
           DeviceReduceByKeyScratchSpace<uint64_t, MinMaxExtents>(
               union_marker_pair_device_.size())),
@@ -836,34 +836,29 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         temp_storage_compressed_union_marker_pair_device_.get(),
         temp_storage_bytes, union_marker_pair_device_.get(),
         compressed_union_marker_pair_device_.get(),
-        num_compressed_union_marker_pair_device_.get(),
+        num_compressed_union_marker_pair_.device_ptr(),
         union_marker_pair_device_.size(), nz, stream_.get()));
 
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
   }
 
-  record_stage(after_compact_, &stream_);
+  after_compact_.Record(&stream_);
 
-  {
-    num_compressed_union_marker_pair_device_.MemcpyAsyncTo(
-        &num_compressed_union_marker_pair_host_, &stream_);
-  }
-
-  after_num_compact_memcpy_.Record(&stream_);
-
+  int num_compressed_union_marker_pairs;
   {
     // Now, sort just the keys to group like points.
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     QuadBoundaryPointDecomposer decomposer;
-    after_num_compact_memcpy_.Synchronize(host_wait_spin_);
-    ABSL_CHECK_LE(
-        static_cast<size_t>(*num_compressed_union_marker_pair_host_.get()),
-        union_marker_pair_device_.size());
+    after_compact_.Synchronize(host_wait_spin_);
+    num_compressed_union_marker_pairs =
+        *num_compressed_union_marker_pair_.host_ptr();
+    ABSL_CHECK_LE(static_cast<size_t>(num_compressed_union_marker_pairs),
+                  union_marker_pair_device_.size());
     CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
         radix_sort_tmpstorage_device_.get(), temp_storage_bytes,
         compressed_union_marker_pair_device_.get(),
         sorted_union_marker_pair_device_.get(),
-        *num_compressed_union_marker_pair_host_.get(), decomposer,
+        num_compressed_union_marker_pairs, decomposer,
         QuadBoundaryPoint::kRepEndBit, QuadBoundaryPoint::kBitsInKey,
         stream_.get()));
 
@@ -900,7 +895,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         temp_storage_bounds_reduce_by_key_device_.get(), temp_storage_bytes,
         key_input_iterator, key_discard_iterator, value_input_iterator,
         extents_device_.get(), num_quads_device_.get(), reduce,
-        *num_compressed_union_marker_pair_host_.get(), stream_.get()));
+        num_compressed_union_marker_pairs, stream_.get()));
     ReportBlobPairs<<<1, 1, 0, stream_.get()>>>(
         num_quads_device_.get(), &frame_status_.device_ptr()->overflow,
         &frame_status_.device_ptr()->num_blob_pairs);
@@ -979,9 +974,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     CHECK_CUDA(cub::DeviceSelect::If(
         temp_storage_compressed_filtered_blobs_device_.get(),
         temp_storage_bytes, input_iterator, output_iterator,
-        num_selected_blobs_device_.get(),
-        *num_compressed_union_marker_pair_host_.get(), select_blobs,
-        stream_.get()));
+        num_selected_blobs_device_.get(), num_compressed_union_marker_pairs,
+        select_blobs, stream_.get()));
 
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
 
@@ -1171,8 +1165,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   // Report out how long things took.
 
-  ABSL_VLOG(1) << "Found " << *num_compressed_union_marker_pair_host_.get()
-               << " items";
+  ABSL_VLOG(1) << "Found " << num_compressed_union_marker_pairs << " items";
   ABSL_VLOG(1) << "Selected " << num_selected_blobs_host
                << " right side out points";
   ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;

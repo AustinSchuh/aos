@@ -205,7 +205,7 @@ class GpuDetector {
   }
 
   int NumCompressedUnionMarkerPairs() const {
-    return num_compressed_union_marker_pair_device_.Copy()[0];
+    return *num_compressed_union_marker_pair_.host_ptr();
   }
 
   void CopyUnionMarkersSizeTo(uint32_t *output) const {
@@ -364,8 +364,7 @@ class GpuDetector {
   std::array<CudaEvent, 5> after_labeling_kernel_;
   CudaEvent after_unionfinding_;
   CudaEvent after_diff_;
-  CudaEvent after_compact_;
-  CudaEvent after_num_compact_memcpy_{cudaEventBlockingSync};
+  CudaEvent after_compact_{cudaEventBlockingSync};
   CudaEvent after_sort_;
   CudaEvent after_bounds_;
   CudaEvent after_transform_extents_;
@@ -389,7 +388,7 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 27> stages_{{
+  const std::array<Stage, 26> stages_{{
       {"Memset", &memset_start_, &after_memset_},
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
@@ -403,8 +402,7 @@ class GpuDetector {
       {"UF Final", &after_labeling_kernel_[3], &after_labeling_kernel_[4]},
       {"Diff", &after_unionfinding_, &after_diff_},
       {"Compact", &after_diff_, &after_compact_},
-      {"Memcpy Compact", &after_compact_, &after_num_compact_memcpy_},
-      {"Sort", &after_num_compact_memcpy_, &after_sort_},
+      {"Sort", &after_compact_, &after_sort_},
       {"Bounds", &after_sort_, &after_bounds_},
       {"Transform Extents", &after_bounds_, &after_transform_extents_},
       {"Filter by dot product", &after_transform_extents_, &after_filter_},
@@ -450,11 +448,9 @@ class GpuDetector {
   GpuMemory<QuadBoundaryPoint> compressed_union_marker_pair_device_;
   // Blob representation sorted list of points.
   GpuMemory<QuadBoundaryPoint> sorted_union_marker_pair_device_;
-  // Number of compressed points.
-  GpuMemory<int> num_compressed_union_marker_pair_device_{
-      /* allocate 1 integer...*/ 1};
-  HostMemory<int> num_compressed_union_marker_pair_host_{
-      /* allocate 1 integer*/ 1};
+  // Number of compressed points.  Mapped so the host reads the count straight
+  // from where the compaction writes it.
+  MappedHostMemory<int> num_compressed_union_marker_pair_{1};
 
   // Number of unique blob IDs.  Only the GPU reads it during Detect().
   GpuMemory<size_t> num_quads_device_{/* allocate 1 integer...*/ 1};
