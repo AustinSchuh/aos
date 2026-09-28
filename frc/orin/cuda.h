@@ -146,6 +146,42 @@ class HostMemory {
   std::span<T> span_;
 };
 
+// Class to manage the lifetime of page locked host memory which kernels write
+// directly through device_ptr(), with no copy on the stream.  The host may only
+// read it once an event recorded after the writing kernel has completed.
+template <typename T>
+class MappedHostMemory {
+ public:
+  // Allocates a block of memory for holding up to size objects of type T.
+  MappedHostMemory(size_t size) {
+    T *memory;
+    CHECK_CUDA(cudaHostAlloc((void **)(&memory), size * sizeof(T),
+                             cudaHostAllocMapped));
+    span_ = std::span<T>(memory, size);
+    CHECK_CUDA(cudaHostGetDevicePointer((void **)(&device_ptr_), memory, 0));
+  }
+  MappedHostMemory(const MappedHostMemory &) = delete;
+  MappedHostMemory &operator=(const MappedHostMemory &) = delete;
+  MappedHostMemory(const MappedHostMemory &&) noexcept = delete;
+  MappedHostMemory &operator=(const MappedHostMemory &&) noexcept = delete;
+
+  virtual ~MappedHostMemory() { CHECK_CUDA(cudaFreeHost(span_.data())); }
+
+  // Returns the pointer for the host to read through.  Volatile because the
+  // GPU writes it behind the compiler's back.
+  const volatile T *host_ptr() const { return span_.data(); }
+
+  // Returns the pointer for kernels to use.
+  T *device_ptr() { return device_ptr_; }
+
+  // Returns the number of objects the memory can hold.
+  size_t size() const { return span_.size(); }
+
+ private:
+  std::span<T> span_;
+  T *device_ptr_;
+};
+
 // Class to manage the lifetime of device memory.
 template <typename T>
 class GpuMemory {

@@ -1051,7 +1051,8 @@ class CudaAprilTagDetector {
     const size_t max_april_tag_perimeter = 2 * (width_ + height_);
     size_t selected_quads = 0;
     {
-      BlobExtentsIndexFinder finder(extents_cuda.data(), extents_cuda.size());
+      const size_t num_extents = extents_cuda.size();
+      BlobExtentsIndexFinder finder(extents_cuda.data(), &num_extents);
       size_t i = 0;
       size_t starting_offset = 0;
       ABSL_CHECK_EQ(cuda_grouped_points.size(), extents_cuda.size());

@@ -22,23 +22,26 @@ namespace frc::apriltag {
 // Class to find the blob index of a point in a point vector.
 class BlobExtentsIndexFinder {
  public:
+  // num_extents is read when searching, so it may be a device pointer the
+  // GPU fills in after this is constructed.
   BlobExtentsIndexFinder(const MinMaxExtents *extents_device,
-                         apriltag_size_t num_extents)
+                         const size_t *num_extents)
       : extents_device_(extents_device), num_extents_(num_extents) {}
 
   __host__ __device__ apriltag_size_t
   FindBlobIndex(apriltag_size_t point_index) const {
+    const apriltag_size_t num_extents = *num_extents_;
     // Do a binary search for the blob which has the point in it's
     // starting_offset range.
     apriltag_size_t min = 0;
-    apriltag_size_t max = num_extents_;
+    apriltag_size_t max = num_extents;
     while (true) {
       if (min + 1 == max) {
         return min;
       }
 
       apriltag_size_t average = min + (max - min) / 2;
-      if (average < num_extents_ &&
+      if (average < num_extents &&
           extents_device_[average].starting_offset <= point_index) {
         min = average;
       } else {
@@ -54,7 +57,7 @@ class BlobExtentsIndexFinder {
 
  private:
   const MinMaxExtents *extents_device_;
-  apriltag_size_t num_extents_;
+  const size_t *num_extents_;
 
   // TODO(austin): Cache the last one?
 };
@@ -365,7 +368,6 @@ class GpuDetector {
   CudaEvent after_num_compact_memcpy_{cudaEventBlockingSync};
   CudaEvent after_sort_;
   CudaEvent after_bounds_;
-  CudaEvent after_bounds_memcpy_{cudaEventBlockingSync};
   CudaEvent after_transform_extents_;
   CudaEvent after_filter_{cudaEventBlockingSync};
   CudaEvent after_filtered_sort_;
@@ -387,7 +389,7 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 28> stages_{{
+  const std::array<Stage, 27> stages_{{
       {"Memset", &memset_start_, &after_memset_},
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
@@ -404,8 +406,7 @@ class GpuDetector {
       {"Memcpy Compact", &after_compact_, &after_num_compact_memcpy_},
       {"Sort", &after_num_compact_memcpy_, &after_sort_},
       {"Bounds", &after_sort_, &after_bounds_},
-      {"Bounds Memcpy", &after_bounds_, &after_bounds_memcpy_},
-      {"Transform Extents", &after_bounds_memcpy_, &after_transform_extents_},
+      {"Transform Extents", &after_bounds_, &after_transform_extents_},
       {"Filter by dot product", &after_transform_extents_, &after_filter_},
       {"Filtered sort", &after_filter_, &after_filtered_sort_},
       {"Line Fit", &after_filtered_sort_, &after_line_fit_},
@@ -455,9 +456,8 @@ class GpuDetector {
   HostMemory<int> num_compressed_union_marker_pair_host_{
       /* allocate 1 integer*/ 1};
 
-  // Number of unique blob IDs.
+  // Number of unique blob IDs.  Only the GPU reads it during Detect().
   GpuMemory<size_t> num_quads_device_{/* allocate 1 integer...*/ 1};
-  HostMemory<size_t> num_quads_host_{/* allocate 1 integer...*/ 1};
   // Bounds per blob, one blob per ID.
   GpuMemory<MinMaxExtents> extents_device_;
   // Extents of all the blobs under consideration.
@@ -524,6 +524,16 @@ class GpuDetector {
   float gpu_time_ms_ = 0;
   float host_decode_time_ms_ = 0;
   bool last_frame_overflowed_ = false;
+
+  // What the GPU reports about the frame, for the host to read after the last
+  // wait in Detect().
+  struct FrameStatus {
+    // Nonzero if there were more than kMaxBlobs blob pairs.
+    uint32_t overflow;
+    // The number of blob pairs.
+    uint32_t num_blob_pairs;
+  };
+  MappedHostMemory<FrameStatus> frame_status_{1};
 
   // Cached quantities used for tag filtering.
   bool normal_border_ = false;

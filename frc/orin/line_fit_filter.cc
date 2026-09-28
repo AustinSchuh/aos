@@ -603,15 +603,14 @@ __global__ void DoFitLines(
 void FitLines(
     const LineFitPoint *line_fit_points_device, size_t points,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    size_t num_extents, double *errs_device, double *filtered_errs_device,
-    Peak *peaks_device, CudaStream *stream) {
+    double *errs_device, double *filtered_errs_device, Peak *peaks_device,
+    CudaStream *stream) {
   constexpr size_t kThreads = 128;
   const size_t kBlocks = (points + kPointsPerBlock - 2 * kErrorsBuffer - 1) /
                          (kPointsPerBlock - 2 * kErrorsBuffer);
 
   ABSL_VLOG(1) << "Spawning with " << kThreads << " threads, and " << kBlocks
-               << " blocks for " << num_extents << " blob_ids and " << points
-               << " points";
+               << " blocks for " << points << " points";
   // A launch with no blocks fails and leaves the error pending.
   if (kBlocks == 0) {
     return;

@@ -140,8 +140,8 @@ __host__ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
 void FitLines(
     const LineFitPoint *line_fit_points_device, size_t points,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    size_t num_extents, double *errs_device, double *filtered_errs_device,
-    Peak *peaks_device, CudaStream *stream);
+    double *errs_device, double *filtered_errs_device, Peak *peaks_device,
+    CudaStream *stream);
 
 void FitQuads(
     const Peak *peaks_device, size_t peaks, const PeakExtents *peak_extents,

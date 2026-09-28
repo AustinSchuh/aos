@@ -200,6 +200,10 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       stream_.get(), decimated_image_device_.get(), 0, cudaMemAttachSingle));
   CHECK_CUDA(cudaStreamAttachMemAsync(
       stream_.get(), thresholded_image_device_.get(), 0, cudaMemAttachSingle));
+  // The extents scan reads all kMaxBlobs entries each frame and ignores those
+  // past the frame's blob pair count, which start out uninitialized.
+  CHECK_CUDA(cudaMemsetAsync(extents_device_.get(), 0,
+                             kMaxBlobs * sizeof(MinMaxExtents), stream_.get()));
   CHECK_CUDA(cudaStreamSynchronize(stream_.get()));
 
   for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
@@ -396,8 +400,7 @@ struct MaskBlobIndex {
 // center.
 class RewriteToIndexPoint {
  public:
-  RewriteToIndexPoint(MinMaxExtents *extents_device,
-                      apriltag_size_t num_extents)
+  RewriteToIndexPoint(MinMaxExtents *extents_device, const size_t *num_extents)
       : blob_finder_(extents_device, num_extents) {}
 
   __host__ __device__ __forceinline__ IndexPoint
@@ -413,8 +416,7 @@ class RewriteToIndexPoint {
 // Calculates Theta for a given IndexPoint
 class AddThetaToIndexPoint {
  public:
-  AddThetaToIndexPoint(MinMaxExtents *extents_device,
-                       apriltag_size_t num_extents)
+  AddThetaToIndexPoint(MinMaxExtents *extents_device, const size_t *num_extents)
       : blob_finder_(extents_device, num_extents) {}
   __host__ __device__ __forceinline__ IndexPoint operator()(IndexPoint a) {
     MinMaxExtents extents = blob_finder_.Get(a.blob_index());
@@ -545,29 +547,45 @@ class SelectBlobs {
 
 // Class to zero out the count (and clear the starting offset) for each extents
 // which is going to be filtered out.  Used in conjunction with SumPoints to
-// update zero sized blobs.  drop_all filters out every blob.
+// update zero sized blobs.
+//
+// The scan covers all kMaxBlobs entries so the host never needs the blob pair
+// count, and this zeros the ones past *num_quads_device.  Every blob is
+// filtered out if there are more than kMaxBlobs, since there is no good way to
+// pick which to keep.
 struct TransformZeroFilteredBlobSizes {
  public:
-  TransformZeroFilteredBlobSizes(apriltag_size_t tag_width,
+  TransformZeroFilteredBlobSizes(const size_t *num_quads_device,
+                                 apriltag_size_t tag_width,
                                  bool reversed_border, bool normal_border,
                                  apriltag_size_t min_cluster_pixels,
-                                 apriltag_size_t max_cluster_pixels,
-                                 bool drop_all)
-      : select_blobs_(nullptr, tag_width, reversed_border, normal_border,
-                      min_cluster_pixels, max_cluster_pixels),
-        drop_all_(drop_all) {}
+                                 apriltag_size_t max_cluster_pixels)
+      : num_quads_device_(num_quads_device),
+        select_blobs_(nullptr, tag_width, reversed_border, normal_border,
+                      min_cluster_pixels, max_cluster_pixels) {}
 
   __host__ __device__ __forceinline__ cub::KeyValuePair<long, MinMaxExtents>
   operator()(cub::KeyValuePair<long, MinMaxExtents> pt) const {
-    pt.value.count *= !drop_all_ && select_blobs_(pt.value);
+    const size_t num_quads = *num_quads_device_;
+    pt.value.count *= num_quads <= GpuDetector::kMaxBlobs &&
+                      static_cast<size_t>(pt.key) < num_quads &&
+                      select_blobs_(pt.value);
     pt.value.starting_offset = 0;
     return pt;
   }
 
  private:
+  const size_t *num_quads_device_;
   SelectBlobs select_blobs_;
-  bool drop_all_;
 };
+
+// Reports the frame's blob pair count, and whether it overflowed, to the host.
+__global__ void ReportBlobPairs(const size_t *num_quads_device,
+                                uint32_t *overflow, uint32_t *num_blob_pairs) {
+  const size_t num_quads = *num_quads_device;
+  *overflow = num_quads > GpuDetector::kMaxBlobs;
+  *num_blob_pairs = num_quads;
+}
 
 // Class to implement a custom Scan operator which passes through the previous
 // min/max/etc, but re-sums count into starting_offset.  This lets us collapse
@@ -883,10 +901,10 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         key_input_iterator, key_discard_iterator, value_input_iterator,
         extents_device_.get(), num_quads_device_.get(), reduce,
         *num_compressed_union_marker_pair_host_.get(), stream_.get()));
+    ReportBlobPairs<<<1, 1, 0, stream_.get()>>>(
+        num_quads_device_.get(), &frame_status_.device_ptr()->overflow,
+        &frame_status_.device_ptr()->num_blob_pairs);
     record_stage(after_bounds_, &stream_);
-
-    num_quads_device_.MemcpyAsyncTo(&num_quads_host_, &stream_);
-    after_bounds_memcpy_.Record(&stream_);
   }
 
   // Longest april tag will be the full perimeter of the image.  Each point
@@ -898,19 +916,6 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   // points in their list at this stage.
   const apriltag_size_t max_april_tag_perimeter = 2 * (width_ + height_);
 
-  after_bounds_memcpy_.Synchronize(host_wait_spin_);
-  // selected_extents_device_ and the 12 bit blob index in IndexPoint only hold
-  // kMaxBlobs blobs.  Rather than guess which ones to keep, filter them all out
-  // so the rest of the pipeline runs with nothing selected.
-  last_frame_overflowed_ = *num_quads_host_.get() > kMaxBlobs;
-  if (last_frame_overflowed_) {
-    ABSL_LOG_EVERY_N_SEC(ERROR, 1)
-        << "Dropping a frame with " << *num_quads_host_.get()
-        << " blob pairs, more than " << kMaxBlobs;
-  }
-  const size_t num_scanned_quads =
-      std::min<size_t>(*num_quads_host_.get(), kMaxBlobs);
-
   {
     // Now that we have the dot products, we need to rewrite the extents for the
     // post-thresholded world so we can find the start and end address of blobs
@@ -921,9 +926,9 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     cub::ArgIndexInputIterator<MinMaxExtents *> value_index_input_iterator(
         extents_device_.get());
     TransformZeroFilteredBlobSizes rewrite(
-        min_tag_width_, reversed_border_, normal_border_,
-        tag_detector_->qtp.min_cluster_pixels, max_april_tag_perimeter,
-        last_frame_overflowed_);
+        num_quads_device_.get(), min_tag_width_, reversed_border_,
+        normal_border_, tag_detector_->qtp.min_cluster_pixels,
+        max_april_tag_perimeter);
     cub::TransformInputIterator<cub::KeyValuePair<long, MinMaxExtents>,
                                 TransformZeroFilteredBlobSizes,
                                 cub::ArgIndexInputIterator<MinMaxExtents *>>
@@ -941,8 +946,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     CHECK_CUDA(cub::DeviceScan::InclusiveScan(
         temp_storage_selected_extents_scan_device_.get(), temp_storage_bytes,
-        input_iterator, selected_extents_device_.get(), sum_points,
-        num_scanned_quads, stream_.get()));
+        input_iterator, selected_extents_device_.get(), sum_points, kMaxBlobs,
+        stream_.get()));
 
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScan");
   }
@@ -954,14 +959,14 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     // Now, copy over all points which pass our thresholds.
     cub::ArgIndexInputIterator<QuadBoundaryPoint *> value_index_input_iterator(
         sorted_union_marker_pair_device_.get());
-    RewriteToIndexPoint rewrite(extents_device_.get(), *num_quads_host_.get());
+    RewriteToIndexPoint rewrite(extents_device_.get(), num_quads_device_.get());
 
     cub::TransformInputIterator<IndexPoint, RewriteToIndexPoint,
                                 cub::ArgIndexInputIterator<QuadBoundaryPoint *>>
         input_iterator(value_index_input_iterator, rewrite);
 
     AddThetaToIndexPoint add_theta(extents_device_.get(),
-                                   *num_quads_host_.get());
+                                   num_quads_device_.get());
 
     TransformOutputIterator<IndexPoint, IndexPoint, AddThetaToIndexPoint>
         output_iterator(selected_blobs_device_.get(), add_theta);
@@ -1038,9 +1043,9 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   {
     FitLines(line_fit_points_device_.get(), num_selected_blobs_host,
-             selected_extents_device_.get(), num_scanned_quads,
-             errs_device_.get(), filtered_errs_device_.get(),
-             filtered_is_local_peak_device_.get(), &stream_);
+             selected_extents_device_.get(), errs_device_.get(),
+             filtered_errs_device_.get(), filtered_is_local_peak_device_.get(),
+             &stream_);
   }
   record_stage(after_line_filter_, &stream_);
 
@@ -1143,6 +1148,16 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     after_quad_fit_memcpy_.Synchronize(host_wait_spin_);
   }
 
+  // selected_extents_device_ and the 12 bit blob index in IndexPoint only hold
+  // kMaxBlobs blobs, so the GPU filtered every blob out of an overflowing
+  // frame.
+  last_frame_overflowed_ = frame_status_.host_ptr()->overflow != 0;
+  const uint32_t num_blob_pairs = frame_status_.host_ptr()->num_blob_pairs;
+  if (last_frame_overflowed_) {
+    ABSL_LOG_EVERY_N_SEC(ERROR, 1) << "Dropping a frame with " << num_blob_pairs
+                                   << " blob pairs, more than " << kMaxBlobs;
+  }
+
   const aos::monotonic_clock::time_point before_fit_quads =
       aos::monotonic_clock::now();
   UpdateFitQuads();
@@ -1160,7 +1175,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
                << " items";
   ABSL_VLOG(1) << "Selected " << num_selected_blobs_host
                << " right side out points";
-  ABSL_VLOG(1) << "Found compressed runs: " << *num_quads_host_.get();
+  ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;
   ABSL_VLOG(1) << "Peaks " << num_compressed_peaks_host << " peaks";
   ABSL_VLOG(1) << "Peak Selected blobs " << num_quad_peaked_quads_host
                << " quads";
