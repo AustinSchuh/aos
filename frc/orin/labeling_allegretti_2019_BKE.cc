@@ -472,7 +472,15 @@ __global__ void FinalLabeling(GpuImage<uint32_t> labels,
 
 void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> output,
                 GpuImage<uint32_t> union_markers_size_device,
-                cudaStream_t stream) {
+                cudaStream_t stream,
+                std::span<frc::apriltag::CudaEvent> kernel_events) {
+  ABSL_CHECK(kernel_events.empty() || kernel_events.size() == 5u);
+  auto record = [&](size_t index) {
+    if (!kernel_events.empty()) {
+      CHECK_CUDA(cudaEventRecord(kernel_events[index].get(), stream));
+    }
+  };
+
   ABSL_CHECK_NE(input.rows, 1u);
   ABSL_CHECK_NE(input.cols, 1u);
 
@@ -487,13 +495,18 @@ void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> output,
   dim3 block_size = dim3(BLOCK_COLS, BLOCK_ROWS, 1);
 
   InitLabeling<<<grid_size, block_size, 0, stream>>>(input, output);
+  record(0);
 
   Compression<<<grid_size, block_size, 0, stream>>>(output);
+  record(1);
 
   Merge<<<grid_size, block_size, 0, stream>>>(output);
+  record(2);
 
   Compression<<<grid_size, block_size, 0, stream>>>(output);
+  record(3);
 
   FinalLabeling<<<grid_size, block_size, 0, stream>>>(
       output, union_markers_size_device);
+  record(4);
 }

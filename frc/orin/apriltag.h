@@ -1,6 +1,7 @@
 #ifndef FRC_ORIN_APRILTAG_H_
 #define FRC_ORIN_APRILTAG_H_
 
+#include <array>
 #include <cub/iterator/transform_input_iterator.cuh>
 
 #include "third_party/apriltag/apriltag.h"
@@ -135,13 +136,24 @@ class GpuDetector {
 
   const zarray_t *Detections() const { return detections_; }
 
-  // Time each GPU stage of the last Detect() took, in pipeline order, measured
-  // between CUDA events.  For benchmarking; the names may change as the
-  // pipeline does.
+  // Records a CUDA event between every GPU stage of Detect() so StageTimesMs()
+  // can report them.  Off by default because each record costs launch-path CPU
+  // time and the report adds to Detect()'s latency.
+  void set_stage_timing(bool stage_timing) {
+    stage_timing_ = stage_timing;
+    stage_times_ms_.clear();
+  }
+
+  // Time each stage of the last Detect() took, in pipeline order, if stage
+  // timing is on.  For benchmarking; the names may change as the pipeline
+  // does.  "NEON threshold (host)" is host time, "Memset" runs on another
+  // stream, and the "UF" stages split "Unionfinding"; the rest sum to
+  // GpuTimeMs().
   const std::vector<std::pair<std::string_view, float>> &StageTimesMs() const {
     return stage_times_ms_;
   }
-  // GPU time from the first to the last event of the last Detect().
+  // GPU time of the last Detect(), from the first event on the main stream to
+  // the end of FitQuads.
   float GpuTimeMs() const { return gpu_time_ms_; }
   // Host time spent after the GPU finished (quad filtering and decoding) in
   // the last Detect().
@@ -323,12 +335,18 @@ class GpuDetector {
   CudaStream stream_;
   CudaStream memset_stream_;
 
-  // Events for each of the steps for timing.
+  // Events between the steps.  Detect() always records start_,
+  // after_quad_fit_, and the events it waits on, and records the rest only for
+  // stage timing.
   CudaEvent start_;
   CudaEvent after_image_memcpy_to_device_;
   CudaEvent after_threshold_;
   CudaEvent after_memcpy_gray_;
+  CudaEvent memset_start_;
   CudaEvent after_memset_;
+  CudaEvent before_unionfinding_;
+  // After each of LabelImage's kernels.
+  std::array<CudaEvent, 5> after_labeling_kernel_;
   CudaEvent after_unionfinding_;
   CudaEvent after_diff_;
   CudaEvent after_compact_;
@@ -347,7 +365,46 @@ class GpuDetector {
   CudaEvent after_filtered_peak_reduce_;
   CudaEvent after_filtered_peak_host_memcpy_;
   CudaEvent after_quad_fit_;
-  CudaEvent after_quad_fit_memcpy_;
+  CudaEvent after_quad_fit_memcpy_{cudaEventDisableTiming};
+
+  // A stage's time is from begin to end.
+  struct Stage {
+    std::string_view name;
+    CudaEvent *begin;
+    CudaEvent *end;
+  };
+  // The stages StageTimesMs() reports, in order.
+  const std::array<Stage, 28> stages_{{
+      {"Memset", &memset_start_, &after_memset_},
+      {"Memcpy", &start_, &after_image_memcpy_to_device_},
+      {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
+      {"Memcpy Gray", &after_threshold_, &after_memcpy_gray_},
+      {"Wait memset", &after_memcpy_gray_, &before_unionfinding_},
+      {"Unionfinding", &before_unionfinding_, &after_unionfinding_},
+      {"UF Init", &before_unionfinding_, &after_labeling_kernel_[0]},
+      {"UF C1", &after_labeling_kernel_[0], &after_labeling_kernel_[1]},
+      {"UF Merge", &after_labeling_kernel_[1], &after_labeling_kernel_[2]},
+      {"UF C2", &after_labeling_kernel_[2], &after_labeling_kernel_[3]},
+      {"UF Final", &after_labeling_kernel_[3], &after_labeling_kernel_[4]},
+      {"Diff", &after_unionfinding_, &after_diff_},
+      {"Compact", &after_diff_, &after_compact_},
+      {"Memcpy Compact", &after_compact_, &after_num_compact_memcpy_},
+      {"Sort", &after_num_compact_memcpy_, &after_sort_},
+      {"Bounds", &after_sort_, &after_bounds_},
+      {"Bounds Memcpy", &after_bounds_, &after_bounds_memcpy_},
+      {"Transform Extents", &after_bounds_memcpy_, &after_transform_extents_},
+      {"Filter by dot product", &after_transform_extents_, &after_filter_},
+      {"Filtered sort", &after_filter_, &after_filtered_sort_},
+      {"Line Fit", &after_filtered_sort_, &after_line_fit_},
+      {"Error Filter", &after_line_fit_, &after_line_filter_},
+      {"Compress Peaks", &after_line_filter_, &after_peak_compression_},
+      {"Memcpy Peaks", &after_peak_compression_, &after_peak_count_memcpy_},
+      {"Sort Peaks", &after_peak_count_memcpy_, &after_peak_sort_},
+      {"Peak Extents", &after_peak_sort_, &after_filtered_peak_reduce_},
+      {"Memcpy num Extents", &after_filtered_peak_reduce_,
+       &after_filtered_peak_host_memcpy_},
+      {"FitQuads", &after_filtered_peak_host_memcpy_, &after_quad_fit_},
+  }};
 
   // TODO(austin): Remove this...
   HostMemory<uint8_t> gray_image_host_;
@@ -437,6 +494,7 @@ class GpuDetector {
   // True if this is the first detection.
   bool first_ = true;
 
+  bool stage_timing_ = false;
   std::vector<std::pair<std::string_view, float>> stage_times_ms_;
   float gpu_time_ms_ = 0;
   float host_decode_time_ms_ = 0;

@@ -79,7 +79,9 @@ ABSL_FLAG(uint32_t, min_white_black_diff, 20,
 ABSL_FLAG(uint32_t, min_cluster_pixels, 25,
           "Matches --min_cluster_pixels on the robot.");
 ABSL_FLAG(int32_t, nthreads, 6, "Decode threads per detector.");
-ABSL_FLAG(bool, stage_timing, true, "Report the time each GPU stage takes.");
+ABSL_FLAG(bool, stage_timing, false,
+          "Report the time each GPU stage takes.  Recording the events costs "
+          "CPU and latency, so leave this off when measuring those.");
 ABSL_FLAG(std::string, detections_out, "",
           "If set, write every detection from the first pass to this file.");
 ABSL_FLAG(std::string, compare_to, "",
@@ -447,6 +449,7 @@ DetectorResults RunDetector(
     const Calibration &calib = CalibrationFor(calibs, frames.front().camera);
     GpuDetector detector(width, height, tag_detector, calib.camera_matrix,
                          calib.dist_coeffs, first.format());
+    detector.set_stage_timing(stage_timing);
     ImageSource source(
         image_bytes, absl::GetFlag(FLAGS_cold_input), [&](size_t sequence) {
           return frame_for(sequence).image.message().data()->data();
@@ -520,9 +523,7 @@ DetectorResults RunDetector(
               std::chrono::duration<float, std::milli>(end - start).count(),
           .gpu_ms = detector.GpuTimeMs(),
           .host_decode_ms = detector.HostDecodeTimeMs(),
-          .stages = stage_timing
-                        ? detector.StageTimesMs()
-                        : std::vector<std::pair<std::string_view, float>>(),
+          .stages = detector.StageTimesMs(),
       });
 
       const zarray_t *detections = detector.Detections();

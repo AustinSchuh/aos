@@ -49,7 +49,11 @@ class CudaStream {
 // timing events on a stream.
 class CudaEvent {
  public:
-  CudaEvent() { CHECK_CUDA(cudaEventCreate(&event_)); }
+  // flags are the cudaEventCreateWithFlags() flags.  Events which are only
+  // waited on, never timed, should pass cudaEventDisableTiming.
+  explicit CudaEvent(unsigned int flags = cudaEventDefault) {
+    CHECK_CUDA(cudaEventCreateWithFlags(&event_, flags));
+  }
 
   CudaEvent(const CudaEvent &) = delete;
   CudaEvent &operator=(const CudaEvent &) = delete;

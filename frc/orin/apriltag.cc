@@ -697,21 +697,33 @@ struct MergePeakExtents {
 void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   const aos::monotonic_clock::time_point start_time =
       aos::monotonic_clock::now();
+  // Records event on stream if timing every stage.
+  auto record_stage = [this](CudaEvent &event, CudaStream *stream) {
+    if (stage_timing_) {
+      event.Record(stream);
+    }
+  };
 
+  record_stage(memset_start_, &memset_stream_);
   union_markers_size_device_.MemsetAsync(0u, &memset_stream_);
   after_memset_.Record(&memset_stream_);
 
   // Threshold the image.
+  float neon_threshold_ms = 0;
   if (absl::GetFlag(FLAGS_use_neon)) {
     // We are being asked to do this on the CPU.  Use the CPU source image, and
     // put it into unified memory so it gets moved over to the GPU in the
     // background.
+    const aos::monotonic_clock::time_point before_threshold =
+        aos::monotonic_clock::now();
     threshold_->ThresholdAndDecimate(
         image, decimated_image_device_.get(), thresholded_image_device_.get(),
         tag_detector_->qtp.min_white_black_diff, &stream_);
+    neon_threshold_ms =
+        float_milli(aos::monotonic_clock::now() - before_threshold).count();
 
     start_.Record(&stream_);
-    after_image_memcpy_to_device_.Record(&stream_);
+    record_stage(after_image_memcpy_to_device_, &stream_);
   } else {
     start_.Record(&stream_);
     // If the image isn't already in device memory, copy it there and update the
@@ -720,7 +732,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
       color_image_device_.MemcpyAsyncFrom(image, &stream_);
       image_device = color_image_device_.get();
     }
-    after_image_memcpy_to_device_.Record(&stream_);
+    record_stage(after_image_memcpy_to_device_, &stream_);
 
     // Now, threshold on the GPU fully.
     threshold_->ThresholdAndDecimate(
@@ -729,7 +741,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         tag_detector_->qtp.min_white_black_diff, &stream_);
   }
 
-  after_threshold_.Record(&stream_);
+  record_stage(after_threshold_, &stream_);
 
   if (image_format_ != vision::ImageFormat::MONO8) {
     threshold_->ToGreyscale(image_device, gray_image_device_.get(), &stream_);
@@ -739,16 +751,19 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     gray_image_host_ptr_ = image;
   }
 
-  after_memcpy_gray_.Record(&stream_);
+  record_stage(after_memcpy_gray_, &stream_);
 
   after_memset_.Synchronize();
 
   // Unionfind the image.
+  record_stage(before_unionfinding_, &stream_);
   LabelImage(ToGpuImage(thresholded_image_device_),
              ToGpuImage(union_markers_device_),
-             ToGpuImage(union_markers_size_device_), stream_.get());
+             ToGpuImage(union_markers_size_device_), stream_.get(),
+             stage_timing_ ? std::span<CudaEvent>(after_labeling_kernel_)
+                           : std::span<CudaEvent>());
 
-  after_unionfinding_.Record(&stream_);
+  record_stage(after_unionfinding_, &stream_);
 
   ABSL_CHECK((width_ % 8) == 0);
   ABSL_CHECK((height_ % 8) == 0);
@@ -782,7 +797,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   // TODO(austin): Can I do the first step of the zero removal in the BlobDiff
   // kernel?
 
-  after_diff_.Record(&stream_);
+  record_stage(after_diff_, &stream_);
 
   {
     // Remove empty points which aren't to be considered before sorting to speed
@@ -800,7 +815,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
   }
 
-  after_compact_.Record(&stream_);
+  record_stage(after_compact_, &stream_);
 
   {
     num_compressed_union_marker_pair_device_.MemcpyAsyncTo(
@@ -828,7 +843,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     MaybeCheckAndSynchronize("cub::DeviceRadixSort::SortKeys");
   }
 
-  after_sort_.Record(&stream_);
+  record_stage(after_sort_, &stream_);
 
   {
     // Our next step is to compute the extents and dot product so we can filter
@@ -859,7 +874,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         key_input_iterator, key_discard_iterator, value_input_iterator,
         extents_device_.get(), num_quads_device_.get(), reduce,
         *num_compressed_union_marker_pair_host_.get(), stream_.get()));
-    after_bounds_.Record(&stream_);
+    record_stage(after_bounds_, &stream_);
 
     num_quads_device_.MemcpyAsyncTo(&num_quads_host_, &stream_);
     after_bounds_memcpy_.Record(&stream_);
@@ -923,7 +938,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScan");
   }
 
-  after_transform_extents_.Record(&stream_);
+  record_stage(after_transform_extents_, &stream_);
 
   int num_selected_blobs_host;
   {
@@ -976,7 +991,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     MaybeCheckAndSynchronize("cub::DeviceRadixSort::SortKeys");
   }
 
-  after_filtered_sort_.Record(&stream_);
+  record_stage(after_filtered_sort_, &stream_);
 
   {
     // Now that we have the dot products, we need to rewrite the extents for the
@@ -1009,7 +1024,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScanByKey");
   }
-  after_line_fit_.Record(&stream_);
+  record_stage(after_line_fit_, &stream_);
 
   {
     FitLines(line_fit_points_device_.get(), num_selected_blobs_host,
@@ -1017,7 +1032,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
              errs_device_.get(), filtered_errs_device_.get(),
              filtered_is_local_peak_device_.get(), &stream_);
   }
-  after_line_filter_.Record(&stream_);
+  record_stage(after_line_filter_, &stream_);
 
   int num_compressed_peaks_host;
   {
@@ -1032,7 +1047,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         compressed_peaks_device_.get(), num_compressed_peaks_device_.get(),
         num_selected_blobs_host, peak_filter, stream_.get()));
 
-    after_peak_compression_.Record(&stream_);
+    record_stage(after_peak_compression_, &stream_);
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
     num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host,
                                                &stream_);
@@ -1054,7 +1069,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     MaybeCheckAndSynchronize("cub::DeviceRadixSort::SortKeys");
   }
 
-  after_peak_sort_.Record(&stream_);
+  record_stage(after_peak_sort_, &stream_);
 
   int num_quad_peaked_quads_host;
   // Now that we have the peaks sorted, recompute the extents so we can easily
@@ -1088,7 +1103,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
         num_compressed_peaks_host, stream_.get()));
     MaybeCheckAndSynchronize("cub::DeviceReduce::ReduceByKey");
 
-    after_filtered_peak_reduce_.Record(&stream_);
+    record_stage(after_filtered_peak_reduce_, &stream_);
 
     num_quad_peaked_quads_device_.MemcpyAsyncTo(&num_quad_peaked_quads_host,
                                                 &stream_);
@@ -1137,58 +1152,35 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   ABSL_VLOG(1) << "Peaks " << num_compressed_peaks_host << " peaks";
   ABSL_VLOG(1) << "Peak Selected blobs " << num_quad_peaked_quads_host
                << " quads";
-  CudaEvent *previous_event = &start_;
-  stage_times_ms_.clear();
-  for (auto name_event : std::vector<std::tuple<std::string_view, CudaEvent &>>{
-           {"Memcpy", after_image_memcpy_to_device_},
-           {"Threshold", after_threshold_},
-           {"Memcpy Gray", after_memcpy_gray_},
-           {"Memset", after_memset_},
-           {"Unionfinding", after_unionfinding_},
-           {"Diff", after_diff_},
-           {"Compact", after_compact_},
-           {"Memcpy Compact", after_num_compact_memcpy_},
-           {"Sort", after_sort_},
-           {"Bounds", after_bounds_},
-           {"Bounds Memcpy", after_bounds_memcpy_},
-           {"Transform Extents", after_transform_extents_},
-           {"Filter by dot product", after_filter_},
-           {"Filtered sort", after_filtered_sort_},
-           {"Line Fit", after_line_fit_},
-           {"Error Filter", after_line_filter_},
-           {"Compress Peaks", after_peak_compression_},
-           {"Memcpy Peaks", after_peak_count_memcpy_},
-           {"Sort Peaks", after_peak_sort_},
-           {"Peak Extents", after_filtered_peak_reduce_},
-           {"Memcpy num Extents", after_filtered_peak_host_memcpy_},
-           {"FitQuads", after_quad_fit_},
-       }) {
-    std::get<1>(name_event).Synchronize();
-    const float stage_ms =
-        float_milli(std::get<1>(name_event).ElapsedTime(*previous_event))
-            .count();
-    stage_times_ms_.emplace_back(std::get<0>(name_event), stage_ms);
-    ABSL_VLOG(1) << "    " << std::get<0>(name_event) << " " << stage_ms
-                 << "ms";
-    previous_event = &std::get<1>(name_event);
-  }
-  gpu_time_ms_ = float_milli(previous_event->ElapsedTime(start_)).count();
+  const std::chrono::nanoseconds gpu_time = after_quad_fit_.ElapsedTime(start_);
+  gpu_time_ms_ = float_milli(gpu_time).count();
   host_decode_time_ms_ = float_milli(end_time - before_fit_quads).count();
+  if (stage_timing_) {
+    // Every event completed before after_quad_fit_memcpy_, which the host
+    // already waited on.
+    stage_times_ms_.clear();
+    if (absl::GetFlag(FLAGS_use_neon)) {
+      stage_times_ms_.emplace_back("NEON threshold (host)", neon_threshold_ms);
+    }
+    for (const Stage &stage : stages_) {
+      stage_times_ms_.emplace_back(
+          stage.name,
+          float_milli(stage.end->ElapsedTime(*stage.begin)).count());
+      ABSL_VLOG(1) << "    " << stage.name << " "
+                   << stage_times_ms_.back().second << "ms";
+    }
+  }
   ABSL_VLOG(1) << "  FitQuads "
                << float_milli(end_time - before_fit_quads).count()
                << "ms on host";
 
-  ABSL_VLOG(1) << "Overall "
-               << float_milli(previous_event->ElapsedTime(start_)).count()
-               << "ms, " << float_milli(end_time - start_time).count()
-               << "ms on host, "
-               << (1000.0 /
-                   float_milli(previous_event->ElapsedTime(start_)).count())
-               << "hz";
+  ABSL_VLOG(1) << "Overall " << gpu_time_ms_ << "ms, "
+               << float_milli(end_time - start_time).count() << "ms on host, "
+               << (1000.0 / gpu_time_ms_) << "hz";
   // Average.  Skip the first one as the kernel is warming up and is slower.
   if (!first_) {
     ++execution_count_;
-    execution_duration_ += previous_event->ElapsedTime(start_);
+    execution_duration_ += gpu_time;
     ABSL_VLOG(1)
         << "Average overall "
         << float_milli(execution_duration_ / execution_count_).count() << "ms, "
