@@ -68,6 +68,15 @@ struct QuadCorners {
   uint32_t blob_index;
 };
 
+// The selected blobs with points, split by which kernel sorts them, each list
+// in blob order.
+struct BlobWorkList {
+  uint32_t num_small_blobs;
+  uint32_t num_big_blobs;
+  uint16_t small_blobs[IndexPoint::kMaxBlobs];
+  uint16_t big_blobs[IndexPoint::kMaxBlobs];
+};
+
 struct CameraMatrix {
   double fx;
   double cx;
@@ -359,9 +368,9 @@ class GpuDetector {
   CudaEvent after_sort_;
   CudaEvent after_bounds_;
   CudaEvent after_transform_extents_;
-  CudaEvent after_filter_{cudaEventBlockingSync};
-  CudaEvent after_filtered_sort_;
-  CudaEvent after_line_fit_;
+  CudaEvent after_filter_;
+  CudaEvent after_small_blob_sort_;
+  CudaEvent after_big_blob_sort_;
   CudaEvent after_line_filter_;
   CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
@@ -390,9 +399,9 @@ class GpuDetector {
       {"Bounds", &after_sort_, &after_bounds_},
       {"Transform Extents", &after_bounds_, &after_transform_extents_},
       {"Filter by dot product", &after_transform_extents_, &after_filter_},
-      {"Filtered sort", &after_filter_, &after_filtered_sort_},
-      {"Line Fit", &after_filtered_sort_, &after_line_fit_},
-      {"Error Filter", &after_line_fit_, &after_line_filter_},
+      {"Small blob sort", &after_filter_, &after_small_blob_sort_},
+      {"Big blob sort", &after_small_blob_sort_, &after_big_blob_sort_},
+      {"Error Filter", &after_big_blob_sort_, &after_line_filter_},
       {"FitQuads", &after_line_filter_, &after_quad_fit_},
   }};
 
@@ -437,12 +446,14 @@ class GpuDetector {
   // Extents of all the blobs under consideration.
   GpuMemory<cub::KeyValuePair<long, MinMaxExtents>> selected_extents_device_;
 
-  // Number of keys in selected_blobs_device_.
+  // Number of keys in selected_blobs_device_.  Only the GPU reads it during
+  // Detect().
   GpuMemory<int> num_selected_blobs_device_{/* allocate 1 integer...*/ 1};
-  HostMemory<int> num_selected_blobs_host_{/* allocate 1 integer...*/ 1};
 
   // Compacted blobs which pass our threshold.
   GpuMemory<IndexPoint> selected_blobs_device_;
+  // Which selected blobs each sorting kernel handles.
+  GpuMemory<BlobWorkList> blob_work_list_device_{1};
   // Sorted list of those points.
   GpuMemory<IndexPoint> sorted_selected_blobs_device_;
 
@@ -469,7 +480,6 @@ class GpuDetector {
   GpuMemory<uint8_t> temp_storage_bounds_reduce_by_key_device_;
   GpuMemory<uint8_t> temp_storage_compressed_filtered_blobs_device_;
   GpuMemory<uint8_t> temp_storage_selected_extents_scan_device_;
-  GpuMemory<uint8_t> temp_storage_line_fit_scan_device_;
 
   std::unique_ptr<Threshold> threshold_;
 

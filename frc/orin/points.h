@@ -170,9 +170,6 @@ struct IndexPoint {
   // Max number of blob IDs we can hold.
   static constexpr size_t kMaxBlobs = 2048;
 
-  static constexpr size_t kRepEndBit = 24;
-  static constexpr size_t kBitsInKey = 64;
-
   __forceinline__ __host__ __device__ IndexPoint() : key(0) {}
 
   // Constructor to build a point with just the blob index, and point bits.  The
@@ -284,14 +281,6 @@ std::ostream &operator<<(std::ostream &os, const IndexPoint &point);
 struct QuadBoundaryPointDecomposer {
   __host__ __device__ ::cuda::std::tuple<uint64_t &> operator()(
       QuadBoundaryPoint &key) const {
-    return {key.key};
-  }
-};
-
-// Decomposer for sorting which just returns the key.
-struct QuadIndexPointDecomposer {
-  __host__ __device__ ::cuda::std::tuple<uint64_t &> operator()(
-      IndexPoint &key) const {
     return {key.key};
   }
 };

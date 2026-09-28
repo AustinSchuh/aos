@@ -346,10 +346,17 @@ class ErrorCalculator {
 
 template <size_t kThreads>
 __global__ void DoFitLines(
-    const LineFitPoint *line_fit_points_device, size_t points,
+    const LineFitPoint *line_fit_points_device, const int *num_points_device,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
     double *errs_device, double *filtered_errs_device, Peak *peaks_device) {
   __shared__ TempStorage storage;
+
+  // The grid covers the most points there could be, so blocks past the real
+  // count have nothing to do.
+  const size_t points = *num_points_device;
+  if (blockIdx.x * (kPointsPerBlock - 2 * kErrorsBuffer) >= points) {
+    return;
+  }
 
   ErrorCalculator<kThreads> calculator(line_fit_points_device, points,
                                        selected_extents_device, &storage);
@@ -601,23 +608,25 @@ __global__ void DoFitLines(
 }
 
 void FitLines(
-    const LineFitPoint *line_fit_points_device, size_t points,
+    const LineFitPoint *line_fit_points_device, const int *num_points_device,
+    size_t max_points,
     const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
     double *errs_device, double *filtered_errs_device, Peak *peaks_device,
     CudaStream *stream) {
   constexpr size_t kThreads = 128;
-  const size_t kBlocks = (points + kPointsPerBlock - 2 * kErrorsBuffer - 1) /
-                         (kPointsPerBlock - 2 * kErrorsBuffer);
+  const size_t kBlocks =
+      (max_points + kPointsPerBlock - 2 * kErrorsBuffer - 1) /
+      (kPointsPerBlock - 2 * kErrorsBuffer);
 
   ABSL_VLOG(1) << "Spawning with " << kThreads << " threads, and " << kBlocks
-               << " blocks for " << points << " points";
+               << " blocks for up to " << max_points << " points";
   // A launch with no blocks fails and leaves the error pending.
   if (kBlocks == 0) {
     return;
   }
   DoFitLines<kThreads><<<kBlocks, kThreads, 0, stream->get()>>>(
-      line_fit_points_device, points, selected_extents_device, errs_device,
-      filtered_errs_device, peaks_device);
+      line_fit_points_device, num_points_device, selected_extents_device,
+      errs_device, filtered_errs_device, peaks_device);
 }
 
 namespace {
