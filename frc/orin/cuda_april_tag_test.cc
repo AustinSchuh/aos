@@ -2496,6 +2496,358 @@ TEST_F(AprilDetectionTest, UndistortEdge) {
   }
 }
 
+// GpuDetector::UnDistort's iteration, for RefineEdgesReference.
+bool UnDistortReference(double *u, double *v, const CameraMatrix *camera_matrix,
+                        const DistCoeffs *distortion_coefficients) {
+  constexpr int kUndistortIterationThreshold = 100;
+  constexpr double kUndistortConvergenceEpsilon = 1e-6;
+  bool converged = true;
+  const double k1 = distortion_coefficients->k1;
+  const double k2 = distortion_coefficients->k2;
+  const double p1 = distortion_coefficients->p1;
+  const double p2 = distortion_coefficients->p2;
+  const double k3 = distortion_coefficients->k3;
+  const double k4 = distortion_coefficients->k4;
+  const double k5 = distortion_coefficients->k5;
+  const double k6 = distortion_coefficients->k6;
+
+  const double fx = camera_matrix->fx;
+  const double cx = camera_matrix->cx;
+  const double fy = camera_matrix->fy;
+  const double cy = camera_matrix->cy;
+
+  const double xPP = (*u - cx) / fx;
+  const double yPP = (*v - cy) / fy;
+
+  double xP = xPP;
+  double yP = yPP;
+
+  double x0 = xP;
+  double y0 = yP;
+
+  double prev_x = 0, prev_y = 0;
+
+  int iterations = 0;
+  do {
+    prev_x = xP;
+    prev_y = yP;
+    double rSq = xP * xP + yP * yP;
+
+    double radial_distortion =
+        (1 + (k1 * rSq) + (k2 * rSq * rSq) + (k3 * rSq * rSq * rSq)) /
+        (1 + (k4 * rSq) + (k5 * rSq * rSq) + (k6 * rSq * rSq * rSq));
+
+    double radial_distortion_inv = 1 / radial_distortion;
+
+    double tangential_dx = 2 * p1 * xP * yP + p2 * (rSq + 2 * xP * xP);
+    double tangential_dy = p1 * (rSq + 2 * yP * yP) + 2 * p2 * xP * yP;
+
+    xP = (x0 - tangential_dx) * radial_distortion_inv;
+    yP = (y0 - tangential_dy) * radial_distortion_inv;
+
+    if (iterations > kUndistortIterationThreshold) {
+      converged = false;
+      break;
+    }
+
+    iterations++;
+  } while (std::abs(xP - prev_x) > kUndistortConvergenceEpsilon ||
+           std::abs(yP - prev_y) > kUndistortConvergenceEpsilon);
+
+  *u = xP * fx + cx;
+  *v = yP * fy + cy;
+
+  return converged;
+}
+
+// aprilrobotics' refine_edges with the dewarp, written the plain way: one
+// sample and one step at a time, and each sample undistorted on its own.
+// GpuDetector::RefineEdges must match it bit for bit.
+void RefineEdgesReference(const apriltag_detector_t *td,
+                          const image_u8_t *im_orig, struct quad *quad,
+                          const CameraMatrix *camera_matrix,
+                          const DistCoeffs *distortion_coefficients) {
+  double lines[4][4];  // for each line, [Ex Ey nx ny]
+
+  for (int edge = 0; edge < 4; edge++) {
+    int a = edge, b = (edge + 1) & 3;  // indices of the end points.
+
+    // compute the normal to the current line estimate
+    float nx = quad->p[b][1] - quad->p[a][1];
+    float ny = -quad->p[b][0] + quad->p[a][0];
+    float mag = sqrtf(nx * nx + ny * ny);
+    nx /= mag;
+    ny /= mag;
+
+    if (quad->reversed_border) {
+      nx = -nx;
+      ny = -ny;
+    }
+
+    int nsamples = std::max<int>(16, mag / 8);
+
+    double Mx = 0, My = 0, Mxx = 0, Mxy = 0, Myy = 0, N = 0;
+
+    for (int s = 0; s < nsamples; s++) {
+      double alpha = (1.0 + s) / (nsamples + 1);
+      double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
+      double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+
+      double Mn = 0;
+      double Mcount = 0;
+
+      double range = td->quad_decimate + 1;
+
+      for (double n = -range; n <= range; n += 0.25) {
+        double grange = 1;
+        int x1 = x0 + (n + grange) * nx;
+        int y1 = y0 + (n + grange) * ny;
+        if (x1 < 0 || x1 >= im_orig->width || y1 < 0 || y1 >= im_orig->height)
+          continue;
+
+        int x2 = x0 + (n - grange) * nx;
+        int y2 = y0 + (n - grange) * ny;
+        if (x2 < 0 || x2 >= im_orig->width || y2 < 0 || y2 >= im_orig->height)
+          continue;
+
+        int g1 = im_orig->buf[y1 * im_orig->stride + x1];
+        int g2 = im_orig->buf[y2 * im_orig->stride + x2];
+
+        if (g1 < g2) continue;
+
+        double weight = (g2 - g1) * (g2 - g1);
+
+        Mn += weight * n;
+        Mcount += weight;
+      }
+
+      if (Mcount == 0) continue;
+
+      double n0 = Mn / Mcount;
+
+      double bestx = x0 + n0 * nx;
+      double besty = y0 + n0 * ny;
+
+      UnDistortReference(&bestx, &besty, camera_matrix,
+                         distortion_coefficients);
+
+      Mx += bestx;
+      My += besty;
+      Mxx += bestx * bestx;
+      Mxy += bestx * besty;
+      Myy += besty * besty;
+      N++;
+    }
+
+    double Ex = Mx / N, Ey = My / N;
+    double Cxx = Mxx / N - Ex * Ex;
+    double Cxy = Mxy / N - Ex * Ey;
+    double Cyy = Myy / N - Ey * Ey;
+
+    double normal_theta = .5 * atan2f(-2 * Cxy, (Cyy - Cxx));
+    nx = cosf(normal_theta);
+    ny = sinf(normal_theta);
+    lines[edge][0] = Ex;
+    lines[edge][1] = Ey;
+    lines[edge][2] = nx;
+    lines[edge][3] = ny;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    double A00 = lines[i][3], A01 = -lines[(i + 1) & 3][3];
+    double A10 = -lines[i][2], A11 = lines[(i + 1) & 3][2];
+    double B0 = -lines[i][0] + lines[(i + 1) & 3][0];
+    double B1 = -lines[i][1] + lines[(i + 1) & 3][1];
+
+    double det = A00 * A11 - A10 * A01;
+
+    if (fabs(det) > 0.001) {
+      double W00 = A11 / det, W01 = -A01 / det;
+
+      double L0 = W00 * B0 + W01 * B1;
+
+      double px = lines[i][0] + L0 * A00;
+      double py = lines[i][1] + L0 * A10;
+
+      GpuDetector::ReDistort(&px, &py, camera_matrix, distortion_coefficients);
+      quad->p[(i + 1) & 3][0] = px;
+      quad->p[(i + 1) & 3][1] = py;
+    }
+  }
+}
+
+// Tests that RefineEdges matches RefineEdgesReference bit for bit on a real
+// image: on the quads the GPU fits in it, on those quads moved and reshaped a
+// little, and on random quads, some of them hanging off the image and some
+// with edges long enough to sample in several chunks.  Each runs
+// without distortion, with the benchmark's fallback calibration, which fails
+// to converge for much of the image, and with a real 8 parameter calibration.
+TEST_F(AprilDetectionTest, RefineEdgesMatchesReference) {
+  auto image = ReadImage("orin_capture_24_04/file/orin_capture_24_04.bfbs");
+  const int width = image.message().cols();
+  const int height = image.message().rows();
+  cv::Mat gray_image;
+  cv::cvtColor(ToMat(&image.message()), gray_image, cv::COLOR_YUV2GRAY_YUYV);
+  const image_u8_t image_u8{
+      .width = width,
+      .height = height,
+      .stride = width,
+      .buf = gray_image.data,
+  };
+
+  apriltag_family_t *tag_family = tag36h11_create();
+  apriltag_detector_t *tag_detector = MakeTagDetector(tag_family);
+  ASSERT_EQ(tag_detector->quad_decimate, 2);
+
+  std::vector<struct quad> quads;
+  const auto add_quad = [&](const float corners[4][2], bool reversed_border) {
+    struct quad quad = {};
+    std::memcpy(quad.p, corners, sizeof(quad.p));
+    quad.reversed_border = reversed_border;
+    quads.push_back(quad);
+  };
+
+  std::vector<QuadCorners> fit_quads;
+  {
+    GpuDetector gpu_detector(
+        width, height, tag_detector, create_camera_matrix(),
+        create_distortion_coefficients_five(), vision::ImageFormat::YUYV422);
+    gpu_detector.Detect(image.message().data()->data(), nullptr);
+    fit_quads = gpu_detector.FitQuads();
+  }
+  ASSERT_GE(fit_quads.size(), 5u);
+
+  std::mt19937 random(aos::testing::RandomSeed());
+  std::uniform_real_distribution<float> jitter(-3, 3);
+  for (const QuadCorners &fit_quad : fit_quads) {
+    add_quad(fit_quad.corners, fit_quad.reversed_border);
+    add_quad(fit_quad.corners, !fit_quad.reversed_border);
+    for (int i = 0; i < 4; ++i) {
+      float corners[4][2];
+      for (int j = 0; j < 4; ++j) {
+        corners[j][0] = fit_quad.corners[j][0] + jitter(random);
+        corners[j][1] = fit_quad.corners[j][1] + jitter(random);
+      }
+      add_quad(corners, fit_quad.reversed_border);
+    }
+  }
+
+  // Squares with a random center, size, and rotation, reshaped a little.  The
+  // centers reach past the image so that some searches read outside it.
+  std::uniform_real_distribution<float> center_x(-40, width + 40);
+  std::uniform_real_distribution<float> center_y(-40, height + 40);
+  std::uniform_real_distribution<float> half_size(8, 300);
+  std::uniform_real_distribution<float> angle(0, 2 * numbers::pi_v<float>);
+  std::bernoulli_distribution reversed_border;
+  for (int i = 0; i < 1000; ++i) {
+    const float x = center_x(random);
+    const float y = center_y(random);
+    const float size = half_size(random);
+    const float theta = angle(random);
+    float corners[4][2];
+    for (int j = 0; j < 4; ++j) {
+      const float corner_angle = theta + j * numbers::pi_v<float> / 2;
+      corners[j][0] = x + size * std::cos(corner_angle) + jitter(random);
+      corners[j][1] = y + size * std::sin(corner_angle) + jitter(random);
+    }
+    add_quad(corners, reversed_border(random));
+  }
+
+  // RefineEdges samples an edge in chunks of 64, and only edges over about
+  // 520 px have more than one.  Squares of up to 1130 px sides, centered on the
+  // image, reach three chunks with a partial last one.
+  std::uniform_real_distribution<float> large_center_x(width * 0.3f,
+                                                       width * 0.7f);
+  std::uniform_real_distribution<float> large_center_y(height * 0.3f,
+                                                       height * 0.7f);
+  std::uniform_real_distribution<float> large_half_size(380, 800);
+  size_t multi_chunk_edges = 0;
+  for (int i = 0; i < 200; ++i) {
+    const float x = large_center_x(random);
+    const float y = large_center_y(random);
+    const float size = large_half_size(random);
+    const float theta = angle(random);
+    float corners[4][2];
+    for (int j = 0; j < 4; ++j) {
+      const float corner_angle = theta + j * numbers::pi_v<float> / 2;
+      corners[j][0] = x + size * std::cos(corner_angle) + jitter(random);
+      corners[j][1] = y + size * std::sin(corner_angle) + jitter(random);
+    }
+    for (int j = 0; j < 4; ++j) {
+      const float dx = corners[(j + 1) & 3][0] - corners[j][0];
+      const float dy = corners[(j + 1) & 3][1] - corners[j][1];
+      if (std::sqrt(dx * dx + dy * dy) / 8 > 64) {
+        ++multi_chunk_edges;
+      }
+    }
+    add_quad(corners, reversed_border(random));
+  }
+  EXPECT_GT(multi_chunk_edges, 400u);
+
+  const CameraMatrix camera_matrix{
+      .fx = 1000, .cx = width / 2.0, .fy = 1000, .cy = height / 2.0};
+  const CameraMatrix fallback_camera_matrix{
+      .fx = 893.7595, .cx = 645.47076, .fy = 893.22235, .cy = 388.15027};
+  const DistCoeffs fallback_distortion{.k1 = -0.44902,
+                                       .k2 = 0.248409,
+                                       .p1 = -0.000537,
+                                       .p2 = -0.000112,
+                                       .k3 = -0.076989,
+                                       .k4 = 0,
+                                       .k5 = 0,
+                                       .k6 = 0,
+                                       .num_params = 5};
+  const CameraMatrix real_camera_matrix{
+      .fx = 957.48346, .cx = 778.72394, .fy = 957.3993, .cy = 628.59955};
+  const DistCoeffs real_distortion{.k1 = 14.946887,
+                                   .k2 = 21.288757,
+                                   .p1 = 0.00048430284,
+                                   .p2 = 0.00064143946,
+                                   .k3 = 19.788067,
+                                   .k4 = 14.776229,
+                                   .k5 = 18.951693,
+                                   .k6 = 20.182613,
+                                   .num_params = 8};
+  const std::tuple<std::string_view, CameraMatrix, DistCoeffs> calibrations[] =
+      {
+          {"no distortion", camera_matrix, DistCoeffs{.num_params = 5}},
+          {"fallback", fallback_camera_matrix, fallback_distortion},
+          {"real", real_camera_matrix, real_distortion},
+      };
+
+  // The fallback calibration covers UnDistort giving up, which it does at the
+  // far corner of this image.
+  {
+    double u = width - 1, v = height - 1;
+    EXPECT_FALSE(GpuDetector::UnDistort(&u, &v, &fallback_camera_matrix,
+                                        &fallback_distortion));
+  }
+
+  for (const auto &[name, calibration_matrix, distortion] : calibrations) {
+    size_t moved = 0;
+    for (const struct quad &input : quads) {
+      struct quad expected = input;
+      RefineEdgesReference(tag_detector, &image_u8, &expected,
+                           &calibration_matrix, &distortion);
+      struct quad actual = input;
+      GpuDetector::RefineEdges(tag_detector, &image_u8, &actual,
+                               &calibration_matrix, &distortion);
+      EXPECT_EQ(std::memcmp(expected.p, actual.p, sizeof(expected.p)), 0)
+          << name << ": expected " << expected.p[0][0] << ", "
+          << expected.p[0][1] << " ... got " << actual.p[0][0] << ", "
+          << actual.p[0][1];
+      if (std::memcmp(expected.p, input.p, sizeof(input.p)) != 0) {
+        ++moved;
+      }
+    }
+    // Most quads have enough gradient along every edge to move.
+    EXPECT_GT(moved, quads.size() / 2) << name;
+  }
+
+  apriltag_detector_destroy(tag_detector);
+  tag36h11_destroy(tag_family);
+}
+
 // Runs a GpuDetector on synthetic YUYV images the size of the robot's cameras.
 class SyntheticImageTest : public ::testing::Test {
  public:

@@ -274,6 +274,14 @@ class GpuDetector {
   static bool UnDistort(double *u, double *v, const CameraMatrix *camera_matrix,
                         const DistCoeffs *distortion_coefficients);
 
+  // Moves quad's corners onto the strongest gradients in image near its
+  // edges, fitting each edge's line in undistorted pixels.  td->quad_decimate
+  // must be 2.
+  static void RefineEdges(const apriltag_detector_t *td,
+                          const image_u8_t *image, struct quad *quad,
+                          const CameraMatrix *camera_matrix,
+                          const DistCoeffs *distortion_coefficients);
+
  private:
   // Enqueues everything from labeling the thresholded image to fitting quads
   // on stream_, recording the stage events if record_stages.

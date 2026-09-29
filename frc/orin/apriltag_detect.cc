@@ -1,6 +1,8 @@
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
+#include <algorithm>
+#include <array>
 #include <cub/device/device_copy.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_reduce.cuh>
@@ -10,6 +12,7 @@
 #include <cub/device/device_select.cuh>
 #include <cub/iterator/discard_output_iterator.cuh>
 #include <cub/iterator/transform_input_iterator.cuh>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -355,6 +358,203 @@ void GpuDetector::ReDistort(double *x, double *y,
   *y = yPP * fy + cy;
 }
 
+namespace {
+
+// One step of UnDistort's fixed point iteration: moves (*x, *y) closer to the
+// normalized point which distorts to (x0, y0).
+inline void UnDistortStep(const DistCoeffs &distortion_coefficients, double x0,
+                          double y0, double *x, double *y) {
+  const double k1 = distortion_coefficients.k1;
+  const double k2 = distortion_coefficients.k2;
+  const double p1 = distortion_coefficients.p1;
+  const double p2 = distortion_coefficients.p2;
+  const double k3 = distortion_coefficients.k3;
+  const double k4 = distortion_coefficients.k4;
+  const double k5 = distortion_coefficients.k5;
+  const double k6 = distortion_coefficients.k6;
+  const double xP = *x;
+  const double yP = *y;
+
+  double rSq = xP * xP + yP * yP;
+
+  double radial_distortion =
+      (1 + (k1 * rSq) + (k2 * rSq * rSq) + (k3 * rSq * rSq * rSq)) /
+      (1 + (k4 * rSq) + (k5 * rSq * rSq) + (k6 * rSq * rSq * rSq));
+
+  double radial_distortion_inv = 1 / radial_distortion;
+
+  double tangential_dx = 2 * p1 * xP * yP + p2 * (rSq + 2 * xP * xP);
+  double tangential_dy = p1 * (rSq + 2 * yP * yP) + 2 * p2 * xP * yP;
+
+  *x = (x0 - tangential_dx) * radial_distortion_inv;
+  *y = (y0 - tangential_dy) * radial_distortion_inv;
+}
+
+// Undistorts the count pixels in u and v in place, with the same results as
+// GpuDetector::UnDistort on each.  Each pixel's iterations are one chain of
+// dependent divides, so this steps several pixels at once, in lanes which the
+// compiler vectorizes, and starts the next pixel in a lane as soon as the
+// last one there finishes.
+void UnDistortPixels(double *u, double *v, int count,
+                     const CameraMatrix &camera_matrix,
+                     const DistCoeffs &distortion_coefficients) {
+  const double fx = camera_matrix.fx;
+  const double cx = camera_matrix.cx;
+  const double fy = camera_matrix.fy;
+  const double cy = camera_matrix.cy;
+
+  constexpr int kLanes = 8;
+  // The pixel in each lane, or -1 once there are none left for it.
+  int pixel[kLanes];
+  double x0[kLanes], y0[kLanes], xP[kLanes], yP[kLanes];
+  int iterations[kLanes];
+  int next_pixel = 0;
+  int busy_lanes = 0;
+  const auto start_next_pixel = [&](int l) {
+    if (next_pixel == count) {
+      // Idle lanes keep stepping with the rest; 0 is a fixed point.
+      pixel[l] = -1;
+      x0[l] = xP[l] = 0;
+      y0[l] = yP[l] = 0;
+      return;
+    }
+    pixel[l] = next_pixel;
+    x0[l] = xP[l] = (u[next_pixel] - cx) / fx;
+    y0[l] = yP[l] = (v[next_pixel] - cy) / fy;
+    iterations[l] = 0;
+    ++next_pixel;
+    ++busy_lanes;
+  };
+  for (int l = 0; l < kLanes; ++l) {
+    start_next_pixel(l);
+  }
+
+  while (busy_lanes > 0) {
+    bool moved[kLanes];
+    for (int l = 0; l < kLanes; ++l) {
+      double x = xP[l];
+      double y = yP[l];
+      UnDistortStep(distortion_coefficients, x0[l], y0[l], &x, &y);
+      moved[l] = std::abs(x - xP[l]) > kUndistortConvergenceEpsilon ||
+                 std::abs(y - yP[l]) > kUndistortConvergenceEpsilon;
+      xP[l] = x;
+      yP[l] = y;
+    }
+    for (int l = 0; l < kLanes; ++l) {
+      if (pixel[l] < 0) {
+        continue;
+      }
+      // UnDistort's exit tests, in its order.
+      if (iterations[l]++ > kUndistortIterationThreshold || !moved[l]) {
+        u[pixel[l]] = xP[l] * fx + cx;
+        v[pixel[l]] = yP[l] * fy + cy;
+        --busy_lanes;
+        start_next_pixel(l);
+      }
+    }
+  }
+}
+
+// RefineEdges searches along each sample point's normal from -kRefineRange to
+// kRefineRange in quarter pixel steps, comparing the pixels one pixel to
+// either side of each step (aprilrobotics' tunables).  Step j is at
+// n = j / 4 - kRefineRange, and its inner and outer pixels at n - 1 and n + 1
+// are at kRefineOffsets[j] and kRefineOffsets[j + 8].
+constexpr int kRefineRange = 3;
+constexpr int kRefineSteps = 8 * kRefineRange + 1;
+constexpr int kRefineOffsetCount = kRefineSteps + 8;
+constexpr std::array<double, kRefineOffsetCount> kRefineOffsets = [] {
+  std::array<double, kRefineOffsetCount> offsets;
+  for (int k = 0; k < kRefineOffsetCount; ++k) {
+    offsets[k] = -(kRefineRange + 1) + 0.25 * k;
+  }
+  return offsets;
+}();
+
+// The pixels at kRefineOffsets along one sample point's normal.  A step's
+// gradient is its outer pixel minus its inner one.  Pixels outside the image
+// have values which make every gradient involving them negative, since
+// aprilrobotics skips those steps, and negative gradients get no weight.
+struct NormalPixels {
+  int16_t inner[kRefineOffsetCount];
+  int16_t outer[kRefineOffsetCount];
+};
+
+bool InImage(const image_u8_t &image, int x, int y) {
+  return static_cast<uint32_t>(x) < static_cast<uint32_t>(image.width) &&
+         static_cast<uint32_t>(y) < static_cast<uint32_t>(image.height);
+}
+
+// Reads the pixels at kRefineOffsets along (nx, ny) from (x0, y0) the way
+// aprilrobotics does.  kRefineOffsets are exact, so x0 + offset * nx is the
+// same double as its x0 + (n +/- 1) * nx, and truncates to the same pixel.
+// That takes the same shape of expression, which the compiler fuses into a
+// multiply-add on aarch64 in both.
+void ReadNormalPixels(const image_u8_t &image, double x0, double y0, float nx,
+                      float ny, NormalPixels *pixels) {
+  int32_t indices[kRefineOffsetCount];
+
+  // Each coordinate is monotonic in the offset, so if the pixels at both ends
+  // are in the image, they all are.
+  const int x_first = x0 + kRefineOffsets.front() * nx;
+  const int y_first = y0 + kRefineOffsets.front() * ny;
+  const int x_last = x0 + kRefineOffsets.back() * nx;
+  const int y_last = y0 + kRefineOffsets.back() * ny;
+  if (InImage(image, x_first, y_first) && InImage(image, x_last, y_last)) {
+    for (int k = 0; k < kRefineOffsetCount; ++k) {
+      const int x = x0 + kRefineOffsets[k] * nx;
+      const int y = y0 + kRefineOffsets[k] * ny;
+      indices[k] = y * image.stride + x;
+    }
+    for (int k = 0; k < kRefineOffsetCount; ++k) {
+      pixels->inner[k] = pixels->outer[k] = image.buf[indices[k]];
+    }
+    return;
+  }
+
+  // Clamping keeps the conversions to int in range without moving any pixel
+  // into or out of the image.
+  const double x_limit = image.width;
+  const double y_limit = image.height;
+  bool in_image[kRefineOffsetCount];
+  for (int k = 0; k < kRefineOffsetCount; ++k) {
+    const int x = std::clamp(x0 + kRefineOffsets[k] * nx, -1.0, x_limit);
+    const int y = std::clamp(y0 + kRefineOffsets[k] * ny, -1.0, y_limit);
+    in_image[k] = InImage(image, x, y);
+    indices[k] = in_image[k] ? y * image.stride + x : 0;
+  }
+  for (int k = 0; k < kRefineOffsetCount; ++k) {
+    const int16_t pixel = image.buf[indices[k]];
+    pixels->inner[k] = in_image[k] ? pixel : 256;
+    pixels->outer[k] = in_image[k] ? pixel : -256;
+  }
+}
+
+// Returns the offset of the edge along the normal: the mean n of the search's
+// steps, weighted by the square of each step's gradient where it is not
+// negative, or nullopt if every weight is 0.
+//
+// Every weight is an integer below 2^16 and every n a multiple of 1/4, so
+// aprilrobotics' double sums of weight * n and of weight are exact, and match
+// these integer sums of weight * 4n and of weight.
+std::optional<double> EdgeOffset(const NormalPixels &pixels) {
+  // At most 25 * 255^2 * 12 in magnitude.
+  int32_t weighted_n4 = 0;
+  int32_t total_weight = 0;
+  for (int j = 0; j < kRefineSteps; ++j) {
+    const int32_t gradient = pixels.outer[j + 8] - pixels.inner[j];
+    const int32_t weight = gradient >= 0 ? gradient * gradient : 0;
+    weighted_n4 += weight * (j - 4 * kRefineRange);
+    total_weight += weight;
+  }
+  if (total_weight == 0) {
+    return std::nullopt;
+  }
+  return (weighted_n4 * 0.25) / total_weight;
+}
+
+}  // namespace
+
 // We're undistorting using math found from this github page
 // https://yangyushi.github.io/code/2020/03/04/opencv-undistort.html
 // Also, see for reference the source code:
@@ -363,14 +563,6 @@ bool GpuDetector::UnDistort(double *u, double *v,
                             const CameraMatrix *camera_matrix,
                             const DistCoeffs *distortion_coefficients) {
   bool converged = true;
-  const double k1 = distortion_coefficients->k1;
-  const double k2 = distortion_coefficients->k2;
-  const double p1 = distortion_coefficients->p1;
-  const double p2 = distortion_coefficients->p2;
-  const double k3 = distortion_coefficients->k3;
-  const double k4 = distortion_coefficients->k4;
-  const double k5 = distortion_coefficients->k5;
-  const double k6 = distortion_coefficients->k6;
 
   const double fx = camera_matrix->fx;
   const double cx = camera_matrix->cx;
@@ -392,19 +584,8 @@ bool GpuDetector::UnDistort(double *u, double *v,
   do {
     prev_x = xP;
     prev_y = yP;
-    double rSq = xP * xP + yP * yP;
 
-    double radial_distortion =
-        (1 + (k1 * rSq) + (k2 * rSq * rSq) + (k3 * rSq * rSq * rSq)) /
-        (1 + (k4 * rSq) + (k5 * rSq * rSq) + (k6 * rSq * rSq * rSq));
-
-    double radial_distortion_inv = 1 / radial_distortion;
-
-    double tangential_dx = 2 * p1 * xP * yP + p2 * (rSq + 2 * xP * xP);
-    double tangential_dy = p1 * (rSq + 2 * yP * yP) + 2 * p2 * xP * yP;
-
-    xP = (x0 - tangential_dx) * radial_distortion_inv;
-    yP = (y0 - tangential_dy) * radial_distortion_inv;
+    UnDistortStep(*distortion_coefficients, x0, y0, &xP, &yP);
 
     if (iterations > kUndistortIterationThreshold) {
       converged = false;
@@ -434,9 +615,18 @@ bool GpuDetector::UnDistort(double *u, double *v,
 }
 
 // Mostly stolen from aprilrobotics, but modified to implement the dewarp.
-void RefineEdges(apriltag_detector_t *td, image_u8_t *im_orig,
-                 struct quad *quad, CameraMatrix *camera_matrix,
-                 DistCoeffs *distortion_coefficients) {
+void GpuDetector::RefineEdges(const apriltag_detector_t *td,
+                              const image_u8_t *image, struct quad *quad,
+                              const CameraMatrix *camera_matrix,
+                              const DistCoeffs *distortion_coefficients) {
+  // XXX tunable: how far to search?  We want to search far enough that we
+  // find the best edge, but not so far that we hit other edges that aren't
+  // part of the tag. We shouldn't ever have to search more than
+  // quad_decimate, since otherwise we would (ideally) have started our search
+  // on another pixel in the first place. Likewise, for very small tags, we
+  // don't want the range to be too big.
+  ABSL_CHECK_EQ(td->quad_decimate + 1, kRefineRange);
+
   double lines[4][4];  // for each line, [Ex Ey nx ny]
 
   for (int edge = 0; edge < 4; edge++) {
@@ -462,86 +652,60 @@ void RefineEdges(apriltag_detector_t *td, image_u8_t *im_orig,
     // stats for fitting a line...
     double Mx = 0, My = 0, Mxx = 0, Mxy = 0, Myy = 0, N = 0;
 
-    for (int s = 0; s < nsamples; s++) {
-      // compute a point along the line... Note, we're avoiding
-      // sampling *right* at the corners, since those points are
-      // the least reliable.
-      double alpha = (1.0 + s) / (nsamples + 1);
-      double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
-      double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+    // Each stage below runs over a chunk of samples before the next starts,
+    // so the work for different samples overlaps.  The points still go into
+    // the stats in sample order.
+    constexpr int kChunk = 64;
+    for (int chunk_start = 0; chunk_start < nsamples; chunk_start += kChunk) {
+      const int chunk_size = std::min(kChunk, nsamples - chunk_start);
+
+      double x0[kChunk], y0[kChunk];
+      for (int i = 0; i < chunk_size; ++i) {
+        // compute a point along the line... Note, we're avoiding
+        // sampling *right* at the corners, since those points are
+        // the least reliable.
+        const int s = chunk_start + i;
+        double alpha = (1.0 + s) / (nsamples + 1);
+        x0[i] = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
+        y0[i] = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+      }
 
       // search along the normal to this line, looking at the
       // gradients along the way. We're looking for a strong
-      // response.
-      double Mn = 0;
-      double Mcount = 0;
-
-      // XXX tunable: how far to search?  We want to search far
-      // enough that we find the best edge, but not so far that
-      // we hit other edges that aren't part of the tag. We
-      // shouldn't ever have to search more than quad_decimate,
-      // since otherwise we would (ideally) have started our
-      // search on another pixel in the first place. Likewise,
-      // for very small tags, we don't want the range to be too
-      // big.
-      double range = td->quad_decimate + 1;
-
-      // XXX tunable step size.
-      for (double n = -range; n <= range; n += 0.25) {
-        // Because of the guaranteed winding order of the
-        // points in the quad, we will start inside the white
-        // portion of the quad and work our way outward.
-        //
-        // sample to points (x1,y1) and (x2,y2) XXX tunable:
-        // how far +/- to look? Small values compute the
-        // gradient more precisely, but are more sensitive to
-        // noise.
-        double grange = 1;
-        int x1 = x0 + (n + grange) * nx;
-        int y1 = y0 + (n + grange) * ny;
-        if (x1 < 0 || x1 >= im_orig->width || y1 < 0 || y1 >= im_orig->height)
-          continue;
-
-        int x2 = x0 + (n - grange) * nx;
-        int y2 = y0 + (n - grange) * ny;
-        if (x2 < 0 || x2 >= im_orig->width || y2 < 0 || y2 >= im_orig->height)
-          continue;
-
-        int g1 = im_orig->buf[y1 * im_orig->stride + x1];
-        int g2 = im_orig->buf[y2 * im_orig->stride + x2];
-
-        if (g1 < g2)  // reject points whose gradient is "backwards". They can
-                      // only hurt us.
-          continue;
-
-        double weight =
-            (g2 - g1) *
-            (g2 - g1);  // XXX tunable. What shape for weight=f(g2-g1)?
-
-        // compute weighted average of the gradient at this point.
-        Mn += weight * n;
-        Mcount += weight;
+      // response.  Because of the guaranteed winding order of the points in
+      // the quad, the search starts inside the white portion of the quad and
+      // works its way outward.
+      NormalPixels pixels[kChunk];
+      for (int i = 0; i < chunk_size; ++i) {
+        ReadNormalPixels(*image, x0[i], y0[i], nx, ny, &pixels[i]);
       }
 
-      // what was the average point along the line?
-      if (Mcount == 0) continue;
+      double bestx[kChunk], besty[kChunk];
+      int npoints = 0;
+      for (int i = 0; i < chunk_size; ++i) {
+        const std::optional<double> n0 = EdgeOffset(pixels[i]);
+        if (!n0.has_value()) {
+          continue;
+        }
 
-      double n0 = Mn / Mcount;
+        // where is the point along the line?
+        bestx[npoints] = x0[i] + *n0 * nx;
+        besty[npoints] = y0[i] + *n0 * ny;
+        ++npoints;
+      }
 
-      // where is the point along the line?
-      double bestx = x0 + n0 * nx;
-      double besty = y0 + n0 * ny;
-
-      GpuDetector::UnDistort(&bestx, &besty, camera_matrix,
-                             distortion_coefficients);
+      UnDistortPixels(bestx, besty, npoints, *camera_matrix,
+                      *distortion_coefficients);
 
       // update our line fit statistics
-      Mx += bestx;
-      My += besty;
-      Mxx += bestx * bestx;
-      Mxy += bestx * besty;
-      Myy += besty * besty;
-      N++;
+      for (int i = 0; i < npoints; ++i) {
+        Mx += bestx[i];
+        My += besty[i];
+        Mxx += bestx[i] * bestx[i];
+        Mxy += bestx[i] * besty[i];
+        Myy += besty[i] * besty[i];
+        N++;
+      }
     }
 
     // fit a line
