@@ -2,7 +2,6 @@
 
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
-#include <cub/warp/warp_scan.cuh>
 #include <cuda/atomic>
 #include <numbers>
 #include <vector>
@@ -36,11 +35,13 @@ GpuDetector::GpuDetector(size_t width, size_t height,
                          apriltag_detector_t *tag_detector,
                          CameraMatrix camera_matrix,
                          DistCoeffs distortion_coefficients,
-                         vision::ImageFormat image_format)
+                         vision::ImageFormat image_format,
+                         bool keep_intermediates)
     : width_(width),
       height_(height),
       tag_detector_(tag_detector),
       use_neon_(absl::GetFlag(FLAGS_use_neon)),
+      keep_intermediates_(keep_intermediates),
       gray_image_host_(width * height),
       color_image_device_(BytesPerPixel(image_format) * width * height),
       gray_image_device_(width * height),
@@ -48,6 +49,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       union_markers_size_device_(width / 2 * height / 2),
       label_tile_roots_device_(width / 4 * height / 4),
       label_forest_device_(width / 2 * height / 2),
+      label_roots_device_(3 * label_tile_roots_device_.size()),
       // Up to 4 points for each pixel off the image's edge.
       boundary_points_device_((width / 2 - 2) * (height / 2 - 2) * 4),
       extents_device_(kMaxBlobs),
@@ -102,6 +104,9 @@ GpuDetector::GpuDetector(size_t width, size_t height,
     CHECK_CUDA(cudaMemsetAsync(blob_pairs + offset, 0xff,
                                sizeof(BlobPairTable::min_xs), stream_.get()));
   }
+  // Every frame leaves LabelImage's list of roots empty for the next.
+  CHECK_CUDA(cudaMemsetAsync(label_num_roots_device_.get(), 0, sizeof(uint32_t),
+                             stream_.get()));
   // selected_extents_device_ starts out uninitialized, so the first frame
   // writes all of it.
   const uint32_t num_nonempty_selected_extents = kMaxBlobs;
@@ -322,127 +327,6 @@ struct BlobPairSums {
   int32_t pxgx_plus_pygy_sum;
 };
 
-// Finds a QuadBoundaryPoint for each pixel pair which crosses the boundary
-// between two blobs of kMinBlobPixels or more, and appends their keys to
-// points in no particular order, counting them in pairs->num_points.
-//
-// Each block row is one warp.  Blocks overlap by 1 column on each side and 1
-// row below, so each pixel's neighbors are in shared memory.
-template <int kBlockWidth, int kBlockHeight>
-__global__ void __launch_bounds__(kBlockWidth *kBlockHeight)
-    BlobDiff(const uint8_t *thresholded_image, const uint32_t *blobs,
-             const uint32_t *union_markers_size, BlobPairTable *pairs,
-             uint64_t *points, apriltag_size_t width, apriltag_size_t height) {
-  static_assert(kBlockWidth == 32);
-  constexpr uint32_t kMinBlobPixels = 25;
-  __shared__ uint8_t thresholded[kBlockHeight][kBlockWidth];
-  typedef cub::WarpScan<uint32_t> WarpScan;
-  __shared__ typename WarpScan::TempStorage scan_storage[kBlockHeight];
-
-  const uint x = blockIdx.x * (kBlockWidth - 2) + threadIdx.x;
-  const uint y = blockIdx.y * (kBlockHeight - 1) + threadIdx.y;
-  const bool in_image = x < width && y < height;
-  thresholded[threadIdx.y][threadIdx.x] =
-      in_image ? thresholded_image[x + y * width] : 127;
-  __syncthreads();
-
-  // We search the following 4 neighbors.
-  //      ________
-  //      | x | 0 |
-  //  -------------
-  //  | 3 | 2 | 1 |
-  //  -------------
-  //
-  // The pixels along the image's edges and the block's overlap have no point
-  // of their own.
-  QuadBoundaryPoint point[4];
-  const uint8_t v0 = thresholded[threadIdx.y][threadIdx.x];
-  if (in_image && threadIdx.x != 0 && threadIdx.x != kBlockWidth - 1 &&
-      threadIdx.y != kBlockHeight - 1 && y != 0 && x != width - 1 &&
-      y != height - 1 && v0 != 127) {
-    const uint8_t v1[4] = {
-        thresholded[threadIdx.y][threadIdx.x + 1],
-        thresholded[threadIdx.y + 1][threadIdx.x + 1],
-        thresholded[threadIdx.y + 1][threadIdx.x],
-        thresholded[threadIdx.y + 1][threadIdx.x - 1],
-    };
-    const uint8_t v_left = thresholded[threadIdx.y][threadIdx.x - 1];
-    bool crosses[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      crosses[i] = v0 + v1[i] == 255;
-    }
-
-    // Most pixels are inside a blob, and need nothing more.
-    if (crosses[0] || crosses[1] || crosses[2] || crosses[3]) {
-      // When the left pixel and 2 have different colors, the left pixel's
-      // point across 1 is at the same place as ours across 3, between the
-      // same two blobs, so ours is left out.  Pixels on the image's edge have
-      // no points.
-      const bool maybe_duplicate = crosses[3] && v_left != 127 &&
-                                   v1[2] != 127 && v_left != v1[2] && x != 1;
-      const uint index0 = x + y * width;
-      const uint index1[4] = {index0 + 1, index0 + width + 1, index0 + width,
-                              index0 + width - 1};
-      // Issue every load before using any, since each is a round trip to
-      // memory.
-      const uint32_t rep0 = blobs[index0];
-      uint32_t rep1[4];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        rep1[i] =
-            crosses[i] || (i == 2 && maybe_duplicate) ? blobs[index1[i]] : 0;
-      }
-      const uint32_t rep_left = maybe_duplicate ? blobs[index0 - 1] : 0;
-      const uint32_t size0 = union_markers_size[rep0];
-      uint32_t size1[4];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        size1[i] = crosses[i] || (i == 2 && maybe_duplicate)
-                       ? union_markers_size[rep1[i]]
-                       : 0;
-      }
-      const uint32_t size_left =
-          maybe_duplicate ? union_markers_size[rep_left] : 0;
-
-      if (size0 >= kMinBlobPixels) {
-        const bool duplicate = maybe_duplicate && size_left >= kMinBlobPixels &&
-                               size1[2] >= kMinBlobPixels;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          if (crosses[i] && size1[i] >= kMinBlobPixels &&
-              !(i == 3 && duplicate)) {
-            point[i].set_rep0(min(rep0, rep1[i]));
-            point[i].set_rep1(max(rep0, rep1[i]));
-            point[i].set_base_xy(x, y);
-            point[i].set_dxy(i);
-            point[i].set_black_to_white(v1[i] > v0);
-          }
-        }
-      }
-    }
-  }
-
-  // Each warp claims space for its points with one atomic.
-  const uint32_t num_thread_points = point[0].nonzero() + point[1].nonzero() +
-                                     point[2].nonzero() + point[3].nonzero();
-  uint32_t offset;
-  uint32_t num_warp_points;
-  WarpScan(scan_storage[threadIdx.y])
-      .ExclusiveSum(num_thread_points, offset, num_warp_points);
-  uint32_t warp_start = 0;
-  if (threadIdx.x == 0 && num_warp_points > 0) {
-    warp_start = atomicAdd(&pairs->num_points, num_warp_points);
-  }
-  offset += __shfl_sync(0xffffffffu, warp_start, 0);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    if (point[i].nonzero()) {
-      points[offset++] = point[i].key;
-    }
-  }
-}
-
 constexpr int kBinThreads = 256;
 
 // Sums up the points between blobs by blob pair in pairs, and replaces each
@@ -450,8 +334,8 @@ constexpr int kBinThreads = 256;
 // 32 points at a time, and the first lane with points from each pair sums them
 // up and adds them to the pair's slot.
 //
-// This is its own kernel so BlobDiff keeps few enough registers to hide its
-// loads behind other blocks.
+// This is its own kernel so LabelAndDiff keeps few enough registers to hide
+// its loads behind other blocks.
 __global__ void __launch_bounds__(kBinThreads)
     BinBlobPairs(BlobPairTable *pairs, uint64_t *points) {
   const uint32_t num_points = pairs->num_points;
@@ -1532,21 +1416,27 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
     }
   };
 
-  // Unionfind the image.
-  LabelImage(
-      ToDecimatedGpuImage(thresholded_image_device_),
-      ToGpuImage(union_markers_device_), ToGpuImage(union_markers_size_device_),
-      label_tile_roots_device_.get(), label_forest_device_.get(), stream_.get(),
-      record_stages ? std::span<CudaEvent>(after_labeling_kernel_)
-                    : std::span<CudaEvent>());
+  //  Make sure we fit in our mask.
+  ABSL_CHECK_LT(width_ * height_, static_cast<size_t>(1 << 22));
 
-  record_stage(after_unionfinding_, &stream_);
+  // Unionfind the image, and find the points between blobs.
+  LabelImage(ToDecimatedGpuImage(thresholded_image_device_),
+             ToGpuImage(union_markers_size_device_),
+             keep_intermediates_ ? union_markers_device_.get() : nullptr,
+             LabelScratch{
+                 .tile_roots = label_tile_roots_device_.get(),
+                 .forest = label_forest_device_.get(),
+                 .roots = label_roots_device_.get(),
+                 .num_roots = label_num_roots_device_.get(),
+             },
+             boundary_points_device_.get(),
+             &blob_pairs_device_.get()->num_points, stream_.get(),
+             record_stages ? std::span<CudaEvent>(after_labeling_kernel_)
+                           : std::span<CudaEvent>());
+  MaybeCheckAndSynchronize("LabelImage");
 
   ABSL_CHECK((width_ % 8) == 0);
   ABSL_CHECK((height_ % 8) == 0);
-
-  size_t decimated_width = width_ / 2;
-  size_t decimated_height = height_ / 2;
 
   // TODO(austin): Tune for the global shutter camera.
   // 1280 -> 2 * 128 * 5
@@ -1564,26 +1454,6 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
   ABSL_CHECK_LE(
       max_april_tag_perimeter,
       static_cast<apriltag_size_t>(kBigBlobThreads * kBigBlobPointsPerThread));
-
-  // Find the points between blobs.
-  {
-    constexpr int kBlockWidth = 32;
-    constexpr int kBlockHeight = 8;
-    dim3 threads(kBlockWidth, kBlockHeight, 1);
-    // Overlap 1 on each side in x, and 1 in y.
-    dim3 blocks((decimated_width + threads.x - 3) / (threads.x - 2),
-                (decimated_height + threads.y - 2) / (threads.y - 1), 1);
-
-    //  Make sure we fit in our mask.
-    ABSL_CHECK_LT(width_ * height_, static_cast<size_t>(1 << 22));
-
-    BlobDiff<kBlockWidth, kBlockHeight><<<blocks, threads, 0, stream_.get()>>>(
-        thresholded_image_device_, union_markers_device_.get(),
-        union_markers_size_device_.get(), blob_pairs_device_.get(),
-        boundary_points_device_.get(), decimated_width, decimated_height);
-    MaybeCheckAndSynchronize("BlobDiff");
-  }
-  record_stage(after_diff_, &stream_);
 
   // Sum them up by blob pair.
   {

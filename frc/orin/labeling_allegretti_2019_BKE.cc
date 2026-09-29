@@ -16,19 +16,25 @@
 //  * Blob size is also computed in parallel to aid blob size filtering.
 //  * Each 32x32 pixel tile is labeled in shared memory first, and only the
 //    links between tiles go through global memory.
+//  * The last pass labels each tile and finds the points between its blobs
+//    from shared memory.
 //
 
 #include "frc/orin/labeling_allegretti_2019_BKE.h"
+
+#include <cub/warp/warp_scan.cuh>
 
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include "frc/orin/apriltag_types.h"
 #include "frc/orin/cuda.h"
+#include "frc/orin/points.h"
 
 namespace {
+
+using frc::apriltag::QuadBoundaryPoint;
 
 //         This is a block-based algorithm.
 // Blocks are 2x2 sized, with internal pixels named as:
@@ -201,14 +207,15 @@ __device__ __forceinline__ bool Bit(uint32_t mask, uint32_t i) {
 
 // Labels each tile on its own, one thread per block.  Writes each block's three
 // tile-local roots to tile_roots, and for each tile-local root, its own index
-// to forest and its pixel count to sizes.  Zeros the sizes an all 127 block's
-// pixels are labeled with.
+// to forest and its pixel count to sizes, and appends its index to roots.
+// Zeros the sizes an all 127 block's pixels are labeled with.
 //
 // Nodes linked to their left neighbor form runs along each block row, which
 // ballots find, and the union-find only joins the runs to the runs above.
 __global__ void __launch_bounds__(kTileThreads, 6)
     TileLabel(const GpuImage<uint8_t> image, uint32_t label_step,
-              uint32_t *tile_roots, uint32_t *forest, uint32_t *sizes) {
+              uint32_t *tile_roots, uint32_t *forest, uint32_t *sizes,
+              uint32_t *roots, uint32_t *num_roots) {
   __shared__ uint8_t pixels[kTilePixels][kTilePixels];
   __shared__ uint32_t parent[kTileNodes];
   // The root of each run start, once the unions are done.
@@ -418,6 +425,38 @@ __global__ void __launch_bounds__(kTileThreads, 6)
   }
   __syncthreads();
 
+  const bool fg_is_root = in_image && fg_count && fg_root == fg;
+  const bool bgl_is_root = in_image && bgl_count && bgl_root == bgl;
+  const bool bgr_is_root = in_image && bgr_count && bgr_root == bgr;
+  {
+    // Each warp lists its roots with one atomic, the foreground ones first.
+    const uint32_t fg_roots = __ballot_sync(~0u, fg_is_root);
+    const uint32_t bgl_roots = __ballot_sync(~0u, bgl_is_root);
+    const uint32_t bgr_roots = __ballot_sync(~0u, bgr_is_root);
+    const uint32_t lane = half + tx;
+    const uint32_t lanes_below = (1u << lane) - 1;
+    const uint32_t bgl_offset = __popc(fg_roots);
+    const uint32_t bgr_offset = bgl_offset + __popc(bgl_roots);
+    const uint32_t num_warp_roots = bgr_offset + __popc(bgr_roots);
+    uint32_t start = 0;
+    if (lane == 0 && num_warp_roots > 0) {
+      start = atomicAdd(num_roots, num_warp_roots);
+    }
+    start = __shfl_sync(~0u, start, 0);
+    if (fg_is_root) {
+      roots[start + __popc(fg_roots & lanes_below)] =
+          ImageNode(blockIdx.x, blockIdx.y, fg, label_step);
+    }
+    if (bgl_is_root) {
+      roots[start + bgl_offset + __popc(bgl_roots & lanes_below)] =
+          ImageNode(blockIdx.x, blockIdx.y, bgl, label_step);
+    }
+    if (bgr_is_root) {
+      roots[start + bgr_offset + __popc(bgr_roots & lanes_below)] =
+          ImageNode(blockIdx.x, blockIdx.y, bgr, label_step);
+    }
+  }
+
   if (!in_image) {
     return;
   }
@@ -431,17 +470,17 @@ __global__ void __launch_bounds__(kTileThreads, 6)
     forest[node] = node;
     sizes[node] = local_size[local];
   };
-  if (fg_count && fg_root == fg) {
+  if (fg_is_root) {
     write_root(fg);
   }
-  if (bgl_count && bgl_root == bgl) {
+  if (bgl_is_root) {
     write_root(bgl);
   }
-  if (bgr_count && bgr_root == bgr) {
+  if (bgr_is_root) {
     write_root(bgr);
   }
   if (fg_count + bgl_count + bgr_count == 0) {
-    // FinalLabel labels each pixel of an all 127 block with its own index.
+    // LabelAndDiff labels each pixel of an all 127 block with its own index.
     *reinterpret_cast<uint64_t *>(sizes + row * label_step + col) = 0;
     *reinterpret_cast<uint64_t *>(sizes + (row + 1) * label_step + col) = 0;
   } else if (bx == 0 && by == 0 && fg_count == 0) {
@@ -616,25 +655,103 @@ __global__ void BorderMerge(const GpuImage<uint8_t> image, uint32_t label_step,
   }
 }
 
-// Labels every pixel with its component's root, and adds each tile-local
-// component's size into its root's.  One thread per block, a tile per thread
-// block, so only the tile's local roots look up their roots.
+constexpr uint32_t kResolveThreads = 256;
+
+// Points each tile-local root TileLabel listed straight at its component's
+// root, and adds its size into the root's, so every size at a root is final.
+// Other threads point nodes on the way at the root at the same time, which
+// only shortens the walk, and nothing adds to a node which isn't a root.
+__global__ void __launch_bounds__(kResolveThreads)
+    Resolve(const uint32_t *roots, const uint32_t *num_roots, uint32_t *forest,
+            uint32_t *sizes) {
+  const uint32_t count = *num_roots;
+  for (uint32_t i = blockIdx.x * kResolveThreads + threadIdx.x; i < count;
+       i += gridDim.x * kResolveThreads) {
+    const uint32_t node = roots[i];
+    const uint32_t parent = forest[node];
+    if (parent != node) {
+      const uint32_t root = GlobalFind(forest, parent);
+      atomicAdd(sizes + root, sizes[node]);
+      if (root != parent) {
+        forest[node] = root;
+      }
+    }
+  }
+}
+
+// The bit LabelAndDiff sets on a label in shared memory when its blob has
+// kMinBlobPixels or more.  Labels are under 2^20.
+constexpr uint32_t kBigBlob = 1u << 31;
+constexpr uint32_t kTileWarps = kTileThreads / 32;
+
+// Labels each pixel of a tile with its component's root, and finds the points
+// between the tile's blobs of kMinBlobPixels or more.  One thread per block, a
+// tile per thread block.  Resolve pointed every tile-local root straight at
+// its root and finished the sizes, so each tile-local root looks up its label
+// and size once, and the rest comes from shared memory.
+//
+// A pixel has a point with each of these 4 neighbors of the other color, when
+// both are in big blobs.  Each point's key is its two blobs' labels, the
+// pixel, the neighbor it is with, and which way the color changes.
+//      ________
+//      | x | 0 |
+//  -------------
+//  | 3 | 2 | 1 |
+//  -------------
+//
+// The pixels along the image's edges have no points of their own.
+template <bool kWriteLabels>
 __global__ void __launch_bounds__(kTileThreads)
-    FinalLabel(const GpuImage<uint8_t> image, GpuImage<uint32_t> labels,
-               const uint32_t *tile_roots, const uint32_t *forest,
-               uint32_t *sizes) {
+    LabelAndDiff(const GpuImage<uint8_t> image, uint32_t label_step,
+                 const uint32_t *tile_roots, const uint32_t *forest,
+                 const uint32_t *sizes, uint32_t *labels, uint32_t *num_roots,
+                 uint64_t *points, uint32_t *num_points) {
+  // The tile's pixels, and those next to it which its points need: the column
+  // on either side and the row below.  [r][c] is the pixel c - 1 right of the
+  // tile's left edge and r below its top.  Pixels off the image are 127.
+  __shared__ uint8_t pixels[kTilePixels + 1][kTilePixels + 2];
+  // Their labels, with kBigBlob.
+  __shared__ uint32_t blobs[kTilePixels + 1][kTilePixels + 2];
+  // The label of each of the tile's tile-local roots, with kBigBlob.
   __shared__ uint32_t roots[kTileNodes];
+  // Each warp's pixels with points, as i << 5 | column for row warp + i *
+  // kTileWarps.
+  __shared__ uint8_t queue[kTileWarps][kTileNodes / kTileWarps];
+  typedef cub::WarpScan<uint32_t> WarpScan;
+  __shared__ typename WarpScan::TempStorage scan_storage[kTileWarps];
 
   const uint32_t tx = threadIdx.x;
   const uint32_t ty = threadIdx.y;
-  const uint32_t bx = blockIdx.x * kTileBlocks + tx;
-  const uint32_t by = blockIdx.y * kTileBlocks + ty;
+  const uint32_t thread = ty * kTileBlocks + tx;
+  const uint32_t width = image.cols;
+  const uint32_t height = image.rows;
+  const uint32_t block_cols = width / 2;
+  const uint32_t block_rows = height / 2;
+  const uint32_t tile_bx = blockIdx.x * kTileBlocks;
+  const uint32_t tile_by = blockIdx.y * kTileBlocks;
+  const uint32_t bx = tile_bx + tx;
+  const uint32_t by = tile_by + ty;
   const uint32_t col = 2 * bx;
   const uint32_t row = 2 * by;
-  const bool in_image = row < image.rows && col < image.cols;
-  const uint32_t fg = 2 * ty * kTilePixels + 2 * tx;
+  const bool in_image = row < height && col < width;
+  const uint32_t lx = 2 * tx;
+  const uint32_t ly = 2 * ty;
+  const uint32_t fg = ly * kTilePixels + lx;
   const uint32_t bgl = fg + kTilePixels;
   const uint32_t bgr = bgl + 1;
+
+  // Resolve, the last to read the count, ran before this, and the next
+  // TileLabel runs after.
+  if (blockIdx.x == 0 && blockIdx.y == 0 && thread == 0) {
+    *num_roots = 0;
+  }
+
+  // Returns the label of the tile-local root `local` of tile (tile_x, tile_y),
+  // with kBigBlob.
+  auto lookup = [&](uint32_t tile_x, uint32_t tile_y, uint32_t local) {
+    const uint32_t root = forest[ImageNode(tile_x, tile_y, local, label_step)];
+    return root | (sizes[root] >= kMinBlobPixels ? kBigBlob : 0u);
+  };
 
   uint16_t top = 0x7f7f;
   uint16_t bottom = 0x7f7f;
@@ -644,8 +761,78 @@ __global__ void __launch_bounds__(kTileThreads)
                                               col);
     bottom = *reinterpret_cast<const uint16_t *>(image.data +
                                                  (row + 1) * image.step + col);
-    local_roots = tile_roots[by * (image.cols / 2) + bx];
+    local_roots = tile_roots[by * block_cols + bx];
   }
+  pixels[ly][lx + 1] = top & 0xff;
+  pixels[ly][lx + 2] = top >> 8;
+  pixels[ly + 1][lx + 1] = bottom & 0xff;
+  pixels[ly + 1][lx + 2] = bottom >> 8;
+
+  // The pixels around the tile come from the right column of the 17 blocks on
+  // the left, the left column of the 17 on the right, and the top row of the
+  // 16 below, a thread each.
+  constexpr uint32_t kSideBlocks = kTileBlocks + 1;
+  if (thread < 2 * kSideBlocks + kTileBlocks) {
+    int32_t halo_bx;
+    uint32_t halo_by;
+    if (thread < kSideBlocks) {
+      halo_bx = static_cast<int32_t>(tile_bx) - 1;
+      halo_by = tile_by + thread;
+    } else if (thread < 2 * kSideBlocks) {
+      halo_bx = static_cast<int32_t>(tile_bx + kTileBlocks);
+      halo_by = tile_by + thread - kSideBlocks;
+    } else {
+      halo_bx = static_cast<int32_t>(tile_bx + thread - 2 * kSideBlocks);
+      halo_by = tile_by + kTileBlocks;
+    }
+    uint16_t halo_top = 0x7f7f;
+    uint16_t halo_bottom = 0x7f7f;
+    uint32_t halo_roots = 0;
+    if (halo_bx >= 0 && static_cast<uint32_t>(halo_bx) < block_cols &&
+        halo_by < block_rows) {
+      halo_top = *reinterpret_cast<const uint16_t *>(
+          image.data + 2 * halo_by * image.step + 2 * halo_bx);
+      halo_bottom = *reinterpret_cast<const uint16_t *>(
+          image.data + (2 * halo_by + 1) * image.step + 2 * halo_bx);
+      halo_roots = tile_roots[halo_by * block_cols + halo_bx];
+    }
+    // Returns the label of the pixel with value v in column `column` of the
+    // block, with kBigBlob.
+    auto halo_label = [&](uint32_t v, uint32_t column) -> uint32_t {
+      if (v == 127) {
+        return 0;
+      }
+      const uint32_t kind = v == 255      ? kForeground
+                            : column == 0 ? kLeftBackground
+                                          : kRightBackground;
+      return lookup(static_cast<uint32_t>(halo_bx) / kTileBlocks,
+                    halo_by / kTileBlocks,
+                    (halo_roots >> (kLocalBits * kind)) & kLocalMask);
+    };
+    if (thread < 2 * kSideBlocks) {
+      const uint32_t column = thread < kSideBlocks ? 1 : 0;
+      const uint32_t c = thread < kSideBlocks ? 0 : kTilePixels + 1;
+      const uint32_t r = 2 * (halo_by - tile_by);
+      const uint32_t v_top = (halo_top >> (8 * column)) & 0xff;
+      pixels[r][c] = v_top;
+      blobs[r][c] = halo_label(v_top, column);
+      // The 17th block's bottom row is past the row below the tile.
+      if (r < kTilePixels) {
+        const uint32_t v_bottom = (halo_bottom >> (8 * column)) & 0xff;
+        pixels[r + 1][c] = v_bottom;
+        blobs[r + 1][c] = halo_label(v_bottom, column);
+      }
+    } else {
+      const uint32_t c = 2 * (static_cast<uint32_t>(halo_bx) - tile_bx) + 1;
+      const uint32_t v_left = halo_top & 0xff;
+      const uint32_t v_right = halo_top >> 8;
+      pixels[kTilePixels][c] = v_left;
+      pixels[kTilePixels][c + 1] = v_right;
+      blobs[kTilePixels][c] = halo_label(v_left, 0);
+      blobs[kTilePixels][c + 1] = halo_label(v_right, 1);
+    }
+  }
+
   const bool a_fg = (top & 0xff) == 255u;
   const bool b_fg = (top >> 8) == 255u;
   const bool c_fg = (bottom & 0xff) == 255u;
@@ -662,37 +849,25 @@ __global__ void __launch_bounds__(kTileThreads)
       (local_roots >> (kLocalBits * kLeftBackground)) & kLocalMask;
   const uint32_t bgr_root =
       (local_roots >> (kLocalBits * kRightBackground)) & kLocalMask;
-
-  auto resolve = [&](uint32_t local) {
-    const uint32_t node = ImageNode(blockIdx.x, blockIdx.y, local, labels.step);
-    const uint32_t root = GlobalFind(forest, node);
-    roots[local] = root;
-    if (root != node) {
-      atomicAdd(sizes + root, sizes[node]);
-    }
-  };
   if (has_fg && fg_root == fg) {
-    resolve(fg);
+    roots[fg] = lookup(blockIdx.x, blockIdx.y, fg);
   }
   if (has_bgl && bgl_root == bgl) {
-    resolve(bgl);
+    roots[bgl] = lookup(blockIdx.x, blockIdx.y, bgl);
   }
   if (has_bgr && bgr_root == bgr) {
-    resolve(bgr);
+    roots[bgr] = lookup(blockIdx.x, blockIdx.y, bgr);
   }
   __syncthreads();
 
-  if (!in_image) {
-    return;
-  }
   uint32_t a_label;
   uint32_t b_label;
   uint32_t c_label;
   uint32_t d_label;
   if (!has_fg && !has_bgl && !has_bgr) {
-    a_label = row * labels.step + col;
+    a_label = row * label_step + col;
     b_label = a_label + 1;
-    c_label = a_label + labels.step;
+    c_label = a_label + label_step;
     d_label = c_label + 1;
   } else {
     const uint32_t f = has_fg ? roots[fg_root] : 0;
@@ -703,19 +878,113 @@ __global__ void __launch_bounds__(kTileThreads)
     c_label = c_fg ? f : c_bg ? l : 0;
     d_label = d_fg ? f : d_bg ? r : 0;
   }
-  *reinterpret_cast<uint64_t *>(labels.data + row * labels.step + col) =
-      (static_cast<uint64_t>(b_label) << 32) | a_label;
-  *reinterpret_cast<uint64_t *>(labels.data + (row + 1) * labels.step + col) =
-      (static_cast<uint64_t>(d_label) << 32) | c_label;
+  blobs[ly][lx + 1] = a_label;
+  blobs[ly][lx + 2] = b_label;
+  blobs[ly + 1][lx + 1] = c_label;
+  blobs[ly + 1][lx + 2] = d_label;
+  if constexpr (kWriteLabels) {
+    if (in_image) {
+      *reinterpret_cast<uint64_t *>(labels + row * label_step + col) =
+          (static_cast<uint64_t>(b_label & ~kBigBlob) << 32) |
+          (a_label & ~kBigBlob);
+      *reinterpret_cast<uint64_t *>(labels + (row + 1) * label_step + col) =
+          (static_cast<uint64_t>(d_label & ~kBigBlob) << 32) |
+          (c_label & ~kBigBlob);
+    }
+  }
+  __syncthreads();
+
+  // Each warp takes 4 rows of pixels.  Only a few pixels are on a boundary, so
+  // the warp queues those first, and then finds their points 32 at a time.
+  const uint32_t lane = thread % 32;
+  const uint32_t warp = thread / 32;
+  const uint32_t lanes_below = (1u << lane) - 1;
+  const uint32_t x = blockIdx.x * kTilePixels + lane;
+  uint32_t num_queued = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < kTilePixels / kTileWarps; ++i) {
+    const uint32_t r = warp + i * kTileWarps;
+    const uint32_t y = blockIdx.y * kTilePixels + r;
+    const uint32_t v0 = pixels[r][lane + 1];
+    const uint32_t other = 255 - v0;
+    const bool boundary =
+        x != 0 && y != 0 && x + 1 < width && y + 1 < height && v0 != 127 &&
+        (blobs[r][lane + 1] & kBigBlob) &&
+        (pixels[r][lane + 2] == other || pixels[r + 1][lane + 2] == other ||
+         pixels[r + 1][lane + 1] == other || pixels[r + 1][lane] == other);
+    const uint32_t queued = __ballot_sync(~0u, boundary);
+    if (boundary) {
+      queue[warp][num_queued + __popc(queued & lanes_below)] = (i << 5) | lane;
+    }
+    num_queued += __popc(queued);
+  }
+  __syncwarp();
+
+#pragma unroll 1
+  for (uint32_t first = 0; first < num_queued; first += 32) {
+    QuadBoundaryPoint point[4];
+    if (first + lane < num_queued) {
+      const uint32_t entry = queue[warp][first + lane];
+      const uint32_t r = warp + (entry >> 5) * kTileWarps;
+      const uint32_t c = (entry & 31) + 1;
+      const uint32_t v0 = pixels[r][c];
+      const uint32_t v1[4] = {pixels[r][c + 1], pixels[r + 1][c + 1],
+                              pixels[r + 1][c], pixels[r + 1][c - 1]};
+      const uint32_t v_left = pixels[r][c - 1];
+      const uint32_t blob0 = blobs[r][c] & ~kBigBlob;
+      const uint32_t blob1[4] = {blobs[r][c + 1], blobs[r + 1][c + 1],
+                                 blobs[r + 1][c], blobs[r + 1][c - 1]};
+      const uint32_t px = blockIdx.x * kTilePixels + c - 1;
+      const uint32_t py = blockIdx.y * kTilePixels + r;
+      // When the left pixel and 2 have different colors, one is in this
+      // pixel's blob and the other in 3's, since each touches the one of its
+      // color.  So the left pixel's point across 1 is at the same place as ours
+      // across 3, between the same two big blobs, and ours is left out.  Pixels
+      // on the image's edge have no points.
+      const bool duplicate = v0 + v1[3] == 255 && v_left != 127 &&
+                             v1[2] != 127 && v_left != v1[2] && px != 1;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if (v0 + v1[i] == 255 && (blob1[i] & kBigBlob) &&
+            !(i == 3 && duplicate)) {
+          const uint32_t rep1 = blob1[i] & ~kBigBlob;
+          point[i].set_rep0(min(blob0, rep1));
+          point[i].set_rep1(max(blob0, rep1));
+          point[i].set_base_xy(px, py);
+          point[i].set_dxy(i);
+          point[i].set_black_to_white(v1[i] > v0);
+        }
+      }
+    }
+
+    // Each warp claims space for its points with one atomic.
+    const uint32_t num_thread_points = point[0].nonzero() + point[1].nonzero() +
+                                       point[2].nonzero() + point[3].nonzero();
+    uint32_t offset;
+    uint32_t num_warp_points;
+    WarpScan(scan_storage[warp])
+        .ExclusiveSum(num_thread_points, offset, num_warp_points);
+    uint32_t warp_start = 0;
+    if (lane == 0 && num_warp_points > 0) {
+      warp_start = atomicAdd(num_points, num_warp_points);
+    }
+    offset += __shfl_sync(~0u, warp_start, 0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      if (point[i].nonzero()) {
+        points[offset++] = point[i].key;
+      }
+    }
+  }
 }
 
 }  // namespace
 
-void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> output,
-                GpuImage<uint32_t> union_markers_size_device,
-                uint32_t *tile_roots, uint32_t *forest, cudaStream_t stream,
+void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> sizes,
+                uint32_t *labels, const LabelScratch &scratch, uint64_t *points,
+                uint32_t *num_points, cudaStream_t stream,
                 std::span<frc::apriltag::CudaEvent> kernel_events) {
-  ABSL_CHECK(kernel_events.empty() || kernel_events.size() == 3u);
+  ABSL_CHECK(kernel_events.empty() || kernel_events.size() == 4u);
   auto record = [&](size_t index) {
     if (!kernel_events.empty()) {
       CHECK_CUDA(cudaEventRecord(kernel_events[index].get(), stream));
@@ -729,10 +998,8 @@ void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> output,
   // hard problems...
   ABSL_CHECK_EQ(input.rows % 2, 0u);
   ABSL_CHECK_EQ(input.cols % 2, 0u);
-  ABSL_CHECK_EQ(output.rows, input.rows);
-  ABSL_CHECK_EQ(output.cols, input.cols);
-  // Labels index the sizes.
-  ABSL_CHECK_EQ(union_markers_size_device.step, output.step);
+  ABSL_CHECK_EQ(sizes.rows, input.rows);
+  ABSL_CHECK_EQ(sizes.cols, input.cols);
 
   const uint32_t block_cols = input.cols / 2;
   const uint32_t block_rows = input.rows / 2;
@@ -741,7 +1008,8 @@ void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> output,
   const dim3 tile_threads(kTileBlocks, kTileBlocks, 1);
 
   TileLabel<<<tiles, tile_threads, 0, stream>>>(
-      input, output.step, tile_roots, forest, union_markers_size_device.data);
+      input, sizes.step, scratch.tile_roots, scratch.forest, sizes.data,
+      scratch.roots, scratch.num_roots);
   record(0);
 
   const uint32_t border_blocks =
@@ -749,12 +1017,27 @@ void LabelImage(const GpuImage<uint8_t> input, GpuImage<uint32_t> output,
   if (border_blocks > 0) {
     constexpr uint32_t kBorderThreads = 128;
     BorderMerge<<<(border_blocks + kBorderThreads - 1) / kBorderThreads,
-                  kBorderThreads, 0, stream>>>(input, output.step, tile_roots,
-                                               forest);
+                  kBorderThreads, 0, stream>>>(
+        input, sizes.step, scratch.tile_roots, scratch.forest);
   }
   record(1);
 
-  FinalLabel<<<tiles, tile_threads, 0, stream>>>(
-      input, output, tile_roots, forest, union_markers_size_device.data);
+  // Only the GPU knows the number of roots, so the grid fills the GPU once and
+  // loops over them.
+  static const int kResolveBlocks =
+      frc::apriltag::ResidentBlocks(Resolve, kResolveThreads);
+  Resolve<<<kResolveBlocks, kResolveThreads, 0, stream>>>(
+      scratch.roots, scratch.num_roots, scratch.forest, sizes.data);
   record(2);
+
+  if (labels != nullptr) {
+    LabelAndDiff<true><<<tiles, tile_threads, 0, stream>>>(
+        input, sizes.step, scratch.tile_roots, scratch.forest, sizes.data,
+        labels, scratch.num_roots, points, num_points);
+  } else {
+    LabelAndDiff<false><<<tiles, tile_threads, 0, stream>>>(
+        input, sizes.step, scratch.tile_roots, scratch.forest, sizes.data,
+        labels, scratch.num_roots, points, num_points);
+  }
+  record(3);
 }

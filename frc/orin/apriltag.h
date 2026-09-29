@@ -67,7 +67,7 @@ struct BlobPairTable {
   // How many of each blob's selected points have been placed.
   uint32_t cursors[IndexPoint::kMaxBlobs];
 
-  // The number of pairs BinBlobPairs found, and of points BlobDiff found.
+  // The number of pairs BinBlobPairs found, and of points LabelImage found.
   uint32_t num_pairs;
   uint32_t num_points;
   // Nonzero if BinBlobPairs could not fit every pair.
@@ -138,9 +138,14 @@ class GpuDetector {
 
   // Constructs a detector, reserving space for detecting tags of the provided
   // with and height, using the provided detector options.
+  //
+  // With keep_intermediates, Detect() also writes the intermediate results
+  // which only the debug methods read and which it otherwise skips: the label
+  // image CopyUnionMarkersTo() copies.
   GpuDetector(size_t width, size_t height, apriltag_detector_t *tag_detector,
               CameraMatrix camera_matrix, DistCoeffs distortion_coefficients,
-              vision::ImageFormat image_format);
+              vision::ImageFormat image_format,
+              bool keep_intermediates = false);
   virtual ~GpuDetector();
 
   size_t width() const { return width_; }
@@ -214,7 +219,9 @@ class GpuDetector {
       thresholded_image_gpu_->MemcpyTo(output);
     }
   }
+  // Only with keep_intermediates.
   void CopyUnionMarkersTo(uint32_t *output) const {
+    ABSL_CHECK(keep_intermediates_);
     union_markers_device_.MemcpyTo(output);
   }
 
@@ -370,6 +377,10 @@ class GpuDetector {
   // --use_neon when constructed, which picks the threshold and how the
   // decimated and thresholded images are allocated.
   const bool use_neon_;
+  // Whether Detect() writes the intermediates only the debug methods read.
+  // frame_graph_ and launching each stage on its own both read it, so they
+  // always agree.
+  const bool keep_intermediates_;
 
   // Stream to operate on.
   CudaStream stream_;
@@ -392,9 +403,7 @@ class GpuDetector {
   CudaEvent after_threshold_;
   CudaEvent after_memcpy_gray_;
   // After each of LabelImage's kernels.
-  std::array<CudaEvent, 3> after_labeling_kernel_;
-  CudaEvent after_unionfinding_;
-  CudaEvent after_diff_;
+  std::array<CudaEvent, 4> after_labeling_kernel_;
   CudaEvent after_bin_pairs_;
   CudaEvent after_rank_pairs_;
   CudaEvent after_pair_extents_;
@@ -428,12 +437,13 @@ class GpuDetector {
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
       {"Memcpy Gray", &after_threshold_, &after_memcpy_gray_},
-      {"Unionfinding", &after_memcpy_gray_, &after_unionfinding_},
+      {"Unionfinding", &after_memcpy_gray_, &after_labeling_kernel_[2]},
       {"UF Tile", &after_memcpy_gray_, &after_labeling_kernel_[0]},
       {"UF Border", &after_labeling_kernel_[0], &after_labeling_kernel_[1]},
-      {"UF Final", &after_labeling_kernel_[1], &after_labeling_kernel_[2]},
-      {"Diff", &after_unionfinding_, &after_diff_},
-      {"Bin pairs", &after_diff_, &after_bin_pairs_},
+      {"UF Resolve", &after_labeling_kernel_[1], &after_labeling_kernel_[2]},
+      {"Label and diff", &after_labeling_kernel_[2],
+       &after_labeling_kernel_[3]},
+      {"Bin pairs", &after_labeling_kernel_[3], &after_bin_pairs_},
       {"Rank pairs", &after_bin_pairs_, &after_rank_pairs_},
       {"Pair extents", &after_rank_pairs_, &after_pair_extents_},
       {"Scatter selected", &after_pair_extents_, &after_scatter_},
@@ -475,18 +485,21 @@ class GpuDetector {
   uint8_t *decimated_image_device_ = nullptr;
   uint8_t *thresholded_image_device_ = nullptr;
 
-  // The union markers for each pixel.
+  // The union markers for each pixel, only written with keep_intermediates.
   GpuMemory<uint32_t> union_markers_device_;
   // The size of each blob.  The blob size is stored at the index of the stored
   // union marker id in union_markers_device_ aboe.  Entries no union marker
   // points to hold whatever an earlier frame left there.
   GpuMemory<uint32_t> union_markers_size_device_;
-  // LabelImage's scratch: each 2x2 block's roots within its tile, and the
-  // union-find forest joining the tiles.
+  // LabelImage's scratch: each 2x2 block's roots within its tile, the
+  // union-find forest joining the tiles, and the list of the tile-local roots
+  // and its length.
   GpuMemory<uint32_t> label_tile_roots_device_;
   GpuMemory<uint32_t> label_forest_device_;
+  GpuMemory<uint32_t> label_roots_device_;
+  GpuMemory<uint32_t> label_num_roots_device_{1};
 
-  // The points between blobs, in the order BlobDiff found them.  BlobDiff
+  // The points between blobs, in the order LabelImage found them.  LabelImage
   // writes each one's key, and BinBlobPairs replaces it with its blob pair's
   // slot in blob_pairs_device_ << 32 | its point_bits().
   GpuMemory<uint64_t> boundary_points_device_;

@@ -299,7 +299,8 @@ class CudaAprilTagDetector {
         union_markers_(decimated_cuda_.size(), CV_32SC1),
         union_markers_size_(decimated_cuda_.size(), CV_32SC1),
         gpu_detector_(width, height, tag_detector_, create_camera_matrix(),
-                      create_distortion_coefficients_five(), image_format),
+                      create_distortion_coefficients_five(), image_format,
+                      /*keep_intermediates=*/true),
         width_(width),
         height_(height) {
     // Report out info about our GPU.
@@ -3437,20 +3438,88 @@ std::vector<std::vector<uint8_t>> LabelTestImages(size_t rows, size_t cols) {
   return result;
 }
 
-// Tests that LabelImage matches the reference labels, and the reference sizes
-// at every label, on images of several sizes.  The scratch and output memory
-// starts as garbage and carries over between images, like it does between
-// frames.
+// The points LabelImage finds between the blobs of a thresholded image with
+// the reference labels, as sorted keys.  Each pixel off the image's edge has a
+// point with each of the pixel right of it and the 3 below it which has the
+// other color, when both of their blobs have kMinBlobPixels or more, except
+// the one across to the pixel below and left when the pixel on the left has a
+// point at the same place between the same blobs.
+std::vector<uint64_t> ReferenceBoundaryPoints(const std::vector<uint8_t> &image,
+                                              const ReferenceLabels &reference,
+                                              size_t rows, size_t cols) {
+  auto value = [&](size_t x, size_t y) { return image[y * cols + x]; };
+  auto label = [&](size_t x, size_t y) {
+    return reference.labels[y * cols + x];
+  };
+  auto big = [&](size_t x, size_t y) {
+    return reference.sizes.at(label(x, y)) >= kMinBlobPixels;
+  };
+  std::vector<uint64_t> result;
+  for (size_t y = 1; y + 1 < rows; ++y) {
+    for (size_t x = 1; x + 1 < cols; ++x) {
+      const uint8_t v0 = value(x, y);
+      if (v0 == 127 || !big(x, y)) {
+        continue;
+      }
+      const std::array<std::pair<size_t, size_t>, 4> neighbors{
+          {{x + 1, y}, {x + 1, y + 1}, {x, y + 1}, {x - 1, y + 1}}};
+      for (size_t i = 0; i < neighbors.size(); ++i) {
+        const auto [x1, y1] = neighbors[i];
+        const uint8_t v1 = value(x1, y1);
+        if (v0 + v1 != 255 || !big(x1, y1)) {
+          continue;
+        }
+        // The left pixel's point with the pixel below this one.
+        if (i == 3 && x != 1 && value(x - 1, y) != 127 &&
+            value(x, y + 1) != 127 && value(x - 1, y) != value(x, y + 1) &&
+            big(x - 1, y) && big(x, y + 1)) {
+          continue;
+        }
+        QuadBoundaryPoint point;
+        point.set_rep0(std::min(label(x, y), label(x1, y1)));
+        point.set_rep1(std::max(label(x, y), label(x1, y1)));
+        point.set_base_xy(x, y);
+        point.set_dxy(i);
+        point.set_black_to_white(v1 > v0);
+        result.push_back(point.key);
+      }
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+// Tests that LabelImage matches the reference labels, the reference sizes at
+// every label, and the reference points, on images of several sizes, with and
+// without writing the labels.  The sizes include partial tiles, down to a
+// single block wide or tall, so the pixels around a tile cross the image's
+// edge every way they can.  The scratch and output memory starts as garbage
+// and carries over between images, like it does between frames, so a call
+// which left a root listed would break the next.
 TEST(LabelImageTest, MatchesReference) {
   CudaStream stream;
   std::mt19937 random(aos::testing::RandomSeed());
-  for (auto [rows, cols] : std::vector<std::pair<size_t, size_t>>{
-           {652, 800}, {70, 100}, {32, 32}, {2, 66}, {36, 2}}) {
+  for (auto [rows, cols] : std::vector<std::pair<size_t, size_t>>{{652, 800},
+                                                                  {70, 100},
+                                                                  {32, 32},
+                                                                  {2, 66},
+                                                                  {36, 2},
+                                                                  {4, 4},
+                                                                  {34, 34},
+                                                                  {64, 96},
+                                                                  {70, 30},
+                                                                  {30, 70}}) {
+    const size_t blocks = rows / 2 * cols / 2;
     GpuMemory<uint8_t> input(rows * cols);
     GpuMemory<uint32_t> labels(rows * cols);
     GpuMemory<uint32_t> sizes(rows * cols);
-    GpuMemory<uint32_t> tile_roots(rows / 2 * cols / 2);
+    GpuMemory<uint32_t> tile_roots(blocks);
     GpuMemory<uint32_t> forest(rows * cols);
+    GpuMemory<uint32_t> roots(3 * blocks);
+    GpuMemory<uint32_t> num_roots(1);
+    GpuMemory<uint64_t> points(
+        std::max<size_t>(1, (rows - 2) * (cols - 2) * 4));
+    GpuMemory<uint32_t> num_points(1);
     std::vector<uint32_t> garbage(rows * cols);
     for (uint32_t &g : garbage) {
       g = random();
@@ -3459,38 +3528,67 @@ TEST(LabelImageTest, MatchesReference) {
     sizes.MemcpyFrom(garbage.data());
     forest.MemcpyFrom(garbage.data());
     tile_roots.MemcpyFrom(garbage.data());
+    roots.MemcpyFrom(garbage.data());
+    const uint32_t zero = 0;
+    num_roots.MemcpyFrom(&zero);
+    const LabelScratch scratch{
+        .tile_roots = tile_roots.get(),
+        .forest = forest.get(),
+        .roots = roots.get(),
+        .num_roots = num_roots.get(),
+    };
 
     int image_index = 0;
     for (const std::vector<uint8_t> &image : LabelTestImages(rows, cols)) {
-      SCOPED_TRACE(::testing::Message()
-                   << cols << "x" << rows << " image " << image_index++);
-      input.MemcpyFrom(image.data());
-      LabelImage(GpuImage<uint8_t>{input.get(), rows, cols, cols},
-                 GpuImage<uint32_t>{labels.get(), rows, cols, cols},
-                 GpuImage<uint32_t>{sizes.get(), rows, cols, cols},
-                 tile_roots.get(), forest.get(), stream.get());
-      ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
-
       const ReferenceLabels expected = ReferenceLabelImage(image, rows, cols);
-      const std::vector<uint32_t> gpu_labels = labels.Copy();
-      const std::vector<uint32_t> gpu_sizes = sizes.Copy();
-      size_t mismatches = 0;
-      for (size_t i = 0; i < rows * cols && mismatches < 10; ++i) {
-        if (gpu_labels[i] != expected.labels[i]) {
-          ADD_FAILURE() << "Label at (" << i % cols << ", " << i / cols
-                        << "), pixel " << static_cast<int>(image[i]) << ", is "
-                        << gpu_labels[i] << ", expected " << expected.labels[i];
-          ++mismatches;
+      const std::vector<uint64_t> expected_points =
+          ReferenceBoundaryPoints(image, expected, rows, cols);
+      input.MemcpyFrom(image.data());
+      for (const bool write_labels : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << cols << "x" << rows << " image " << image_index
+                     << (write_labels ? " with" : " without") << " labels");
+        num_points.MemcpyFrom(&zero);
+        LabelImage(GpuImage<uint8_t>{input.get(), rows, cols, cols},
+                   GpuImage<uint32_t>{sizes.get(), rows, cols, cols},
+                   write_labels ? labels.get() : nullptr, scratch, points.get(),
+                   num_points.get(), stream.get());
+        ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
+
+        size_t mismatches = 0;
+        if (write_labels) {
+          const std::vector<uint32_t> gpu_labels = labels.Copy();
+          for (size_t i = 0; i < rows * cols && mismatches < 10; ++i) {
+            if (gpu_labels[i] != expected.labels[i]) {
+              ADD_FAILURE()
+                  << "Label at (" << i % cols << ", " << i / cols << "), pixel "
+                  << static_cast<int>(image[i]) << ", is " << gpu_labels[i]
+                  << ", expected " << expected.labels[i];
+              ++mismatches;
+            }
+          }
+        }
+        const std::vector<uint32_t> gpu_sizes = sizes.Copy();
+        for (const auto &[label, size] : expected.sizes) {
+          if (gpu_sizes[label] != size && mismatches < 10) {
+            ADD_FAILURE() << "Size at " << label << " is " << gpu_sizes[label]
+                          << ", expected " << size;
+            ++mismatches;
+          }
+        }
+        ASSERT_EQ(mismatches, 0u);
+
+        const uint32_t num_gpu_points = num_points.Copy()[0];
+        ASSERT_LE(num_gpu_points, points.size());
+        std::vector<uint64_t> gpu_points = points.Copy(num_gpu_points);
+        std::sort(gpu_points.begin(), gpu_points.end());
+        ASSERT_EQ(gpu_points.size(), expected_points.size());
+        for (size_t i = 0; i < gpu_points.size(); ++i) {
+          ASSERT_EQ(gpu_points[i], expected_points[i])
+              << ": point " << i << " of " << gpu_points.size();
         }
       }
-      for (const auto &[label, size] : expected.sizes) {
-        if (gpu_sizes[label] != size && mismatches < 10) {
-          ADD_FAILURE() << "Size at " << label << " is " << gpu_sizes[label]
-                        << ", expected " << size;
-          ++mismatches;
-        }
-      }
-      ASSERT_EQ(mismatches, 0u);
+      ++image_index;
     }
   }
 }
