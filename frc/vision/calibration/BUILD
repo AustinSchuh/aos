@@ -181,11 +181,14 @@ cc_binary(
     srcs = ["camera_constants_formatter.cc"],
     visibility = ["//visibility:public"],
     deps = [
+        ":calibration_validator",
         "//aos:init",
         "//aos:json_to_flatbuffer",
+        "//aos/util:file",
         "//frc/vision:camera_constants_list_fbs",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
     ],
 )
 

@@ -3,12 +3,25 @@ include "frc/vision/camera_settings.fbs";
 
 namespace frc.vision;
 
+// Names one calibration by the fields intrinsics_calibration stamps it with.
+table CalibrationId {
+  camera_id:string (id: 0);
+  calibration_timestamp:int64 (id: 1);
+}
+
 table CameraConstants {
   calibration:[frc.vision.calibration.CameraCalibration] (id: 0);
   // Default settings to use for the cameras.
   // If we ever encounter a use-case for having multiple different types of
   // cameras plugged in, we can add camera-specific settings as well.
   default_camera_stream_settings:CameraStreamSettings (id: 1);
+  // Calibrations which frc::vision::ValidateCalibration rejects, but which the
+  // build and apriltag_detector accept anyway, with a warning.  A waiver
+  // covers only the calibration with that camera_id and
+  // calibration_timestamp, so a new calibration of the camera has to pass or
+  // be waived again, and covers it at any image size.  Each needs a comment
+  // in constants.jinja2.json saying why; recalibrating the camera is the fix.
+  waived_calibrations:[CalibrationId] (id: 2);
 }
 
 root_type CameraConstants;

@@ -65,6 +65,21 @@
           {% include 'frc/vision/constants/calibration_orin-4646-3_cam-25-10_2025-03-06_15-37-04.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-0_cam-25-12_2025-02-18_13-08-36.json' %}
         ],
+        /* 25-09's rational model nearly cancels (N and D are both 0.03-0.05)
+           just past the image.  At 1600x1304, UnDistort fails on 3537 of the
+           2092212 points ValidateCalibration checks, 1016 px or more from the
+           principal point and at most 36 px inside the image's edges.  On
+           2933 of them, in the top right and bottom right corners, the
+           iteration repels and gives up 19-35 px off.  The rest, there and 1
+           in the top left corner, converge too slowly.  The default
+           --pixel_border of 50 would drop every tag they touch, but the
+           robots run with 25, so a tag reaching 25-34 px from the edges in
+           the right corners is dropped when its corners don't converge, or
+           refined from edge samples which didn't.  Recalibrate 25-09 and
+           remove this. */
+        "waived_calibrations": [
+          {"camera_id": "25-09", "calibration_timestamp": 1741304224499387712}
+        ],
         "default_camera_stream_settings": {
           "image_width": 1600,
           "image_height": 1304,
