@@ -3317,6 +3317,85 @@ TEST_F(SyntheticImageTest, DetectionOrderRepeats) {
   }
 }
 
+// Tests a 1920x1200 frame, a common global shutter camera size, where a blob
+// can have more boundary points than the big-blob quad fit holds.  The frame
+// has a tag and a black rectangle with a slot cut into it, whose outline has
+// more than kMaxBlobPoints points but no more than 2 * (width + height).  The
+// rectangle must be rejected as too big to be a tag, and the tag still found.
+TEST(LargeImageTest, Detect1920x1200) {
+  constexpr size_t kWidth = 1920;
+  constexpr size_t kHeight = 1200;
+  static_assert(2 * (kWidth + kHeight) > kMaxBlobPoints);
+  absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_use_neon, false);
+
+  apriltag_family_t *tag_family = tag16h5_create();
+  apriltag_detector_t *tag_detector = MakeTagDetector(tag_family);
+
+  std::vector<uint8_t> image(kWidth * kHeight, 255);
+  constexpr int kId = 3;
+  constexpr size_t kScale = 32;
+  constexpr size_t kTagX = 64;
+  constexpr size_t kTagY = 64;
+  image_u8_t *tag = apriltag_to_image(tag_family, kId);
+  const double tag_center_x = kTagX + tag->width * kScale / 2.0;
+  const double tag_center_y = kTagY + tag->height * kScale / 2.0;
+  for (size_t y = 0; y < tag->height * kScale; ++y) {
+    for (size_t x = 0; x < tag->width * kScale; ++x) {
+      image[(kTagY + y) * kWidth + kTagX + x] =
+          tag->buf[y / kScale * tag->stride + x / kScale];
+    }
+  }
+  image_u8_destroy(tag);
+  // A 1408x1072 rectangle is 4960 pixels around, and the slot's sides add
+  // 1232 more.
+  constexpr size_t kRectX0 = 448, kRectX1 = 1856;
+  constexpr size_t kRectY0 = 64, kRectY1 = 1136;
+  constexpr size_t kSlotX0 = 1120, kSlotX1 = 1184;
+  constexpr size_t kSlotY0 = kRectY1 - 616;
+  for (size_t y = kRectY0; y < kRectY1; ++y) {
+    for (size_t x = kRectX0; x < kRectX1; ++x) {
+      if (y < kSlotY0 || x < kSlotX0 || x >= kSlotX1) {
+        image[y * kWidth + x] = 0;
+      }
+    }
+  }
+
+  GpuDetector gpu_detector(
+      kWidth, kHeight, tag_detector, create_camera_matrix(),
+      create_distortion_coefficients_five(), vision::ImageFormat::MONO8);
+  for (const bool stage_timing : {false, true}) {
+    SCOPED_TRACE(stage_timing ? "stage timing" : "graph");
+    gpu_detector.set_stage_timing(stage_timing);
+    gpu_detector.Detect(image.data(), nullptr);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(cudaPeekAtLastError(), cudaSuccess);
+    ASSERT_FALSE(gpu_detector.last_frame_overflowed());
+
+    uint32_t max_count = 0;
+    for (const MinMaxExtents &extents : gpu_detector.CopyExtents()) {
+      max_count = std::max(max_count, extents.count);
+    }
+    EXPECT_GT(max_count, kMaxBlobPoints);
+    EXPECT_LE(max_count, 2 * (kWidth + kHeight));
+    for (const auto &selected : gpu_detector.CopySelectedExtents()) {
+      EXPECT_LE(selected.value.count, kMaxBlobPoints);
+    }
+
+    const zarray_t *detections = gpu_detector.Detections();
+    ASSERT_EQ(zarray_size(detections), 1);
+    apriltag_detection_t *det;
+    zarray_get(const_cast<zarray_t *>(detections), 0, &det);
+    EXPECT_EQ(det->id, kId);
+    EXPECT_EQ(det->hamming, 0);
+    EXPECT_NEAR(det->c[0], tag_center_x, 1.0);
+    EXPECT_NEAR(det->c[1], tag_center_y, 1.0);
+  }
+
+  apriltag_detector_destroy(tag_detector);
+  tag16h5_destroy(tag_family);
+}
+
 // The labels LabelImage gives a thresholded image, and the size at each label.
 struct ReferenceLabels {
   std::vector<uint32_t> labels;
