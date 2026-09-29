@@ -194,6 +194,13 @@ jinja2_template(
     ]),
 )
 
+# The calibration files, for tests elsewhere that check each one.
+filegroup(
+    name = "calibration_files",
+    srcs = glob(["constants/*.json"]),
+    visibility = ["//visibility:public"],
+)
+
 camera_constants_json(
     name = "camera_constants_json",
     src = ":constants_unvalidated.json",

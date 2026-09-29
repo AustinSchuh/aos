@@ -232,3 +232,38 @@ cc_binary(
         "@eigen",
     ],
 )
+
+cc_library(
+    name = "calibration_validator",
+    srcs = ["calibration_validator.cc"],
+    hdrs = ["calibration_validator.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//frc/orin:distortion",
+        "//frc/vision:calibration_fbs",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_test(
+    name = "calibration_validator_test",
+    srcs = ["calibration_validator_test.cc"],
+    data = [
+        "//frc/vision:calibration_files",
+        "//frc/vision:constants.json",
+    ],
+    deps = [
+        ":calibration_validator",
+        "//aos:flatbuffers",
+        "//aos:json_to_flatbuffer",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//frc/orin:distortion",
+        "//frc/vision:calibration_fbs",
+        "//frc/vision:camera_constants_list_fbs",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/status",
+    ],
+)
