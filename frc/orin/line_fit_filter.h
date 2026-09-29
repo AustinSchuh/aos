@@ -164,6 +164,20 @@ __host__ __device__ inline uint64_t PeakSortKey(float error, uint32_t index) {
   return (static_cast<uint64_t>(bits) << 32) | index;
 }
 
+// Returns a key which orders doubles the way < does, with -0.0 equal to +0.0,
+// so comparing keys as integers picks the same minimum as comparing the
+// doubles.  NaNs get keys too, but < doesn't order them.
+__host__ __device__ inline uint64_t DoubleOrderKey(double d) {
+  uint64_t bits = std::bit_cast<uint64_t>(d);
+  if (bits == 0x8000000000000000ull) {
+    bits = 0;
+  }
+  // Negative doubles order backwards by their bits, and below positive ones.
+  bits ^= (bits & 0x8000000000000000ull) ? 0xffffffffffffffffull
+                                         : 0x8000000000000000ull;
+  return bits;
+}
+
 // Returns the m0, m1, m2, m3 indices for the provided index.  The index is the
 // inner loop number when you process the 4 for loops in order and count.  See
 // FilterTest.Unrank for an example.

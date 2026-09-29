@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cub/device/device_radix_sort.cuh>
 #include <map>
@@ -2558,6 +2559,69 @@ TEST(FilterTest, PeakSortKey) {
   for (size_t i = 0; i < peaks.size(); ++i) {
     EXPECT_EQ(sorted_peaks[i].filtered_point_index, expected_order[i])
         << ": at " << i;
+  }
+}
+
+// Tests that DoubleOrderKey orders doubles the way < does, with -0.0 equal to
+// +0.0, which the quad fit relies on to pick its best quad with integer
+// compares.
+TEST(FilterTest, DoubleOrderKey) {
+  const double denorm = std::numeric_limits<double>::denorm_min();
+  const double min_normal = std::numeric_limits<double>::min();
+  const double max = std::numeric_limits<double>::max();
+  const double inf = std::numeric_limits<double>::infinity();
+  std::vector<double> values = {
+      0.0,
+      -0.0,
+      denorm,
+      -denorm,
+      2 * denorm,
+      -2 * denorm,
+      std::nextafter(min_normal, 0.0),
+      -std::nextafter(min_normal, 0.0),
+      min_normal,
+      -min_normal,
+      1.0,
+      -1.0,
+      std::nextafter(1.0, 2.0),
+      std::nextafter(1.0, 0.0),
+      -std::nextafter(1.0, 2.0),
+      -std::nextafter(1.0, 0.0),
+      std::numeric_limits<float>::max(),
+      -std::numeric_limits<float>::max(),
+      std::nextafter(max, 0.0),
+      max,
+      -max,
+      inf,
+      -inf,
+  };
+
+  std::mt19937_64 random(aos::testing::RandomSeed());
+  // Random bits cover every exponent and both signs.
+  std::uniform_int_distribution<uint64_t> bits;
+  while (values.size() < 500) {
+    const double value = std::bit_cast<double>(bits(random));
+    if (!std::isnan(value)) {
+      values.push_back(value);
+    }
+  }
+  // Quad fit errors are sums of floats, often close together.
+  std::uniform_real_distribution<float> error(-10.0f, 10.0f);
+  for (int i = 0; i < 100; ++i) {
+    const double value = error(random);
+    values.push_back(value);
+    values.push_back(std::nextafter(value, inf));
+    values.push_back(std::nextafter(value, -inf));
+  }
+
+  EXPECT_EQ(DoubleOrderKey(0.0), DoubleOrderKey(-0.0));
+  for (const double a : values) {
+    for (const double b : values) {
+      ASSERT_EQ(DoubleOrderKey(a) < DoubleOrderKey(b), a < b)
+          << ": " << std::hexfloat << a << " vs " << b;
+      ASSERT_EQ(DoubleOrderKey(a) == DoubleOrderKey(b), a == b)
+          << ": " << std::hexfloat << a << " vs " << b;
+    }
   }
 }
 

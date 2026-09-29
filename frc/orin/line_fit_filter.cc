@@ -1,6 +1,5 @@
 #include "frc/orin/line_fit_filter.h"
 
-#include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 #include <iomanip>
 
@@ -864,8 +863,11 @@ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
   // TODO(austin): Are floats good enough?  Hard to tell what the "right answer"
   // actually is...
   const float hypot_cached = std::hypotf((Cxx - Cyy), 2 * Cxy);
+  // A blob's W is at most 5808 * 361, so 8 W^2 is an integer below 2^53.
+  // Converting it straight to float rounds it once, exactly as converting it
+  // to double (exact) and then to float would, without the FP64 pipe.
   const float eight_w_squared = static_cast<float>(
-      static_cast<int64_t>(moments.W) * static_cast<int64_t>(moments.W) * 8.0);
+      static_cast<int64_t>(moments.W) * static_cast<int64_t>(moments.W) * 8);
   const float eig_small = (Cxx + Cyy - hypot_cached) / eight_w_squared;
   if (print) {
     printf("Block %d Thread %d   eig_small: (%ld + %ld - %f) / %f -> %f\n",
@@ -926,54 +928,77 @@ __device__ __forceinline__ void FitLine(
   FitLine(moments, lineparam01, lineparam23, err, mse, print);
 }
 
-struct QuadError {
-  uint8_t m0;
-  uint8_t m1;
-  uint8_t m2;
-  uint8_t m3;
-  double error;
-};
-
-struct MinQuadError {
-  __host__ __device__ QuadError operator()(const QuadError &a,
-                                           const QuadError &b) {
-    if (a.error <= b.error) {
-      return a;
-    } else {
-      return b;
-    }
-  }
-};
-
 namespace {
 
-// Threads per DoFitQuads block.  Each combination of 4 peaks gets its own
-// thread.
+// Threads per DoFitQuads block.
 constexpr uint32_t kFitQuadsThreads = 256;
-static_assert(kFitQuadsThreads >= MaxRankedIndex());
 
-// Unrank() for each DoFitQuads thread, so the threads look their combination up
-// instead of computing it.
-__constant__ std::array<uint32_t, MaxRankedIndex()> kPackedUnrank =
+// Unrank() for each combination of 4 peaks, so the quad fit's threads look
+// their combinations up instead of computing them.  Every thread reads a
+// different entry, which __constant__ memory would serialize.
+__device__ const std::array<uint32_t, MaxRankedIndex()> kPackedUnrank =
     MakePackedUnrank();
 
-// A line fit to the points between two peaks.
-struct SegmentFit {
-  double err;
-  double mse;
-  // Only set for segments which don't wrap around the end of the blob.
-  double lineparam23[2];
+// The peaks at a quad's corners, as indices into the best peaks.
+struct QuadCorners {
+  uint32_t m0;
+  uint32_t m1;
+  uint32_t m2;
+  uint32_t m3;
 };
 
-struct FitQuadsStorage {
-  typedef cub::BlockScan<int, kFitQuadsThreads> BlockScan;
-  typedef cub::BlockReduce<QuadError, kFitQuadsThreads> BlockReduce;
+__device__ __forceinline__ QuadCorners UnrankCorners(uint32_t combination) {
+  const uint32_t packed = __ldg(&kPackedUnrank[combination]);
+  return QuadCorners{packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff,
+                     packed >> 24};
+}
 
-  union {
-    typename BlockScan::TempStorage scan;
-    typename BlockReduce::TempStorage reduce;
-  } cub;
+// A line fit to the points between two peaks.  FitLine computes all of these
+// in float, so storing them as floats loses nothing.
+struct SegmentFit {
+  float err;
+  float mse;
+  // Only set for segments which don't wrap around the end of the blob.
+  float lineparam23[2];
+};
 
+// A combination of 4 peaks and its quad fit error.
+struct QuadCandidate {
+  // DoubleOrderKey(error).
+  uint64_t key;
+  double error;
+  uint32_t combination;
+};
+
+// Returns whether a has a smaller error than b, or the same error and an
+// earlier combination.
+__device__ __forceinline__ bool BetterQuad(const QuadCandidate &a,
+                                           const QuadCandidate &b) {
+  return a.key < b.key || (a.key == b.key && a.combination < b.combination);
+}
+
+// Returns the best of the candidates in the warp's first kLanes lanes to lane
+// 0.
+template <int kLanes>
+__device__ __forceinline__ QuadCandidate WarpBestQuad(QuadCandidate candidate) {
+  static_assert(kLanes <= 32 && (kLanes & (kLanes - 1)) == 0);
+#pragma unroll
+  for (int offset = kLanes / 2; offset > 0; offset /= 2) {
+    QuadCandidate other;
+    other.key = __shfl_down_sync(0xffffffffu, candidate.key, offset);
+    other.error = __shfl_down_sync(0xffffffffu, candidate.error, offset);
+    other.combination =
+        __shfl_down_sync(0xffffffffu, candidate.combination, offset);
+    if (BetterQuad(other, candidate)) {
+      candidate = other;
+    }
+  }
+  return candidate;
+}
+
+// Shared memory for QuadFitTail.
+template <int kThreads>
+struct QuadFitTailStorage {
   // The best kNMaxima peaks' point indices, by rank.
   uint16_t best_peaks[kNMaxima];
   // The same point indices, in point order.
@@ -982,45 +1007,186 @@ struct FitQuadsStorage {
   // segments[a][b] fits the points from point_indices[a] to point_indices[b],
   // wrapping around the end of the blob when a > b.
   SegmentFit segments[kNMaxima][kNMaxima];
+
+  // Each warp's best quad.
+  QuadCandidate warp_best[kThreads / 32];
 };
 
 // Returns the error of the quad with corners at the peaks quad.m0-m3, or the
 // max double if they don't make a quad, checking the segments in the same
-// order aprilrobotics does.
-__device__ double QuadFitError(const FitQuadsStorage &storage,
-                               const QuadError &quad, uint32_t num_maxima,
+// order aprilrobotics does.  The mse limit is a float too, so comparing it in
+// float decides the same way as comparing in double.
+__device__ double QuadFitError(const SegmentFit (&segments)[kNMaxima][kNMaxima],
+                               const QuadCorners &quad, uint32_t num_maxima,
                                float max_line_fit_mse, double max_dot) {
   constexpr double kMaxError = std::numeric_limits<double>::max();
   if (quad.m3 >= num_maxima) {
     return kMaxError;
   }
 
-  const SegmentFit &segment01 = storage.segments[quad.m0][quad.m1];
+  const SegmentFit &segment01 = segments[quad.m0][quad.m1];
   if (segment01.mse > max_line_fit_mse) {
     return kMaxError;
   }
-  const SegmentFit &segment12 = storage.segments[quad.m1][quad.m2];
+  const SegmentFit &segment12 = segments[quad.m1][quad.m2];
   if (segment12.mse > max_line_fit_mse) {
     return kMaxError;
   }
 
-  const double dot = segment01.lineparam23[0] * segment12.lineparam23[0] +
-                     segment01.lineparam23[1] * segment12.lineparam23[1];
+  const double dot =
+      static_cast<double>(segment01.lineparam23[0]) * segment12.lineparam23[0] +
+      static_cast<double>(segment01.lineparam23[1]) * segment12.lineparam23[1];
   if (fabs(dot) > max_dot) {
     return kMaxError;
   }
 
-  const SegmentFit &segment23 = storage.segments[quad.m2][quad.m3];
+  const SegmentFit &segment23 = segments[quad.m2][quad.m3];
   if (segment23.mse > max_line_fit_mse) {
     return kMaxError;
   }
-  const SegmentFit &segment30 = storage.segments[quad.m3][quad.m0];
+  const SegmentFit &segment30 = segments[quad.m3][quad.m0];
   if (segment30.mse > max_line_fit_mse) {
     return kMaxError;
   }
 
-  return segment01.err + segment12.err + segment23.err + segment30.err;
+  return static_cast<double>(segment01.err) + segment12.err + segment23.err +
+         segment30.err;
 }
+
+// Fits a quad to blob blob_index, which has count points, from its best
+// kNMaxima peaks, the way aprilrobotics' fit_quad does, and writes it to the
+// blob's slots in fit_quads_device and fit_quad_valid_device.  peak_keys holds
+// the PeakSortKey()s of the blob's first min(num_peaks, max_peaks) peaks.
+// Every thread of a kThreads thread block calls this.
+template <int kThreads>
+__device__ __forceinline__ void QuadFitTail(
+    QuadFitTailStorage<kThreads> &storage, uint32_t blob_index, uint32_t count,
+    const LineFitPoint *line_fit_points, const uint64_t *peak_keys,
+    uint32_t num_peaks, uint32_t max_peaks, float max_line_fit_mse,
+    double max_dot, FitQuad *fit_quads_device, bool *fit_quad_valid_device) {
+  static_assert(kThreads % 32 == 0);
+  constexpr int kWarps = kThreads / 32;
+
+  // It takes 4 peaks to make a quad.
+  if (num_peaks < 4) {
+    if (threadIdx.x == 0) {
+      fit_quad_valid_device[blob_index] = false;
+    }
+    return;
+  }
+  num_peaks = min(num_peaks, max_peaks);
+  const uint32_t num_maxima = min(num_peaks, static_cast<uint32_t>(kNMaxima));
+
+  // Rank each peak against the others to pick the best num_maxima.  Keys are
+  // unique, so the ranks are too.
+  for (uint32_t i = threadIdx.x; i < num_peaks; i += kThreads) {
+    const uint64_t key = peak_keys[i];
+    uint32_t rank = 0;
+    for (uint32_t j = 0; j < num_peaks && rank < kNMaxima; ++j) {
+      rank += peak_keys[j] < key;
+    }
+    if (rank < kNMaxima) {
+      storage.best_peaks[rank] = static_cast<uint16_t>(key);
+    }
+  }
+  __syncthreads();
+
+  // And put them back in point order.
+  if (threadIdx.x < num_maxima) {
+    const uint16_t index = storage.best_peaks[threadIdx.x];
+    uint32_t position = 0;
+    for (uint32_t j = 0; j < num_maxima; ++j) {
+      position += storage.best_peaks[j] < index;
+    }
+    storage.point_indices[position] = index;
+  }
+  __syncthreads();
+
+  // Fit each segment between two of the peaks once, for all the combinations
+  // to share.  Only the forward segments' line parameters get used.
+  for (uint32_t i = threadIdx.x; i < kNMaxima * kNMaxima; i += kThreads) {
+    const uint32_t a = i / kNMaxima;
+    const uint32_t b = i % kNMaxima;
+    if (a != b && a < num_maxima && b < num_maxima) {
+      double lineparam23[2];
+      double err;
+      double mse;
+      FitLine(line_fit_points, count, storage.point_indices[a],
+              storage.point_indices[b], nullptr, a < b ? lineparam23 : nullptr,
+              &err, &mse);
+      SegmentFit &segment = storage.segments[a][b];
+      segment.err = err;
+      segment.mse = mse;
+      if (a < b) {
+        segment.lineparam23[0] = lineparam23[0];
+        segment.lineparam23[1] = lineparam23[1];
+      }
+    }
+  }
+  __syncthreads();
+
+  // aprilrobotics keeps the first of equally good quads.  The errors are
+  // finite (W >= 1), so the smallest (DoubleOrderKey(error), combination) is
+  // that quad, and comparing the keys keeps the search off the FP64 pipe.  Each
+  // thread's combinations ascend, so it keeps the first of its best.
+  QuadCandidate best{.key = std::numeric_limits<uint64_t>::max(),
+                     .error = std::numeric_limits<double>::max(),
+                     .combination = static_cast<uint32_t>(MaxRankedIndex())};
+  for (uint32_t combination = threadIdx.x; combination < MaxRankedIndex();
+       combination += kThreads) {
+    const double error =
+        QuadFitError(storage.segments, UnrankCorners(combination), num_maxima,
+                     max_line_fit_mse, max_dot);
+    const uint64_t key = DoubleOrderKey(error);
+    if (key < best.key) {
+      best =
+          QuadCandidate{.key = key, .error = error, .combination = combination};
+    }
+  }
+  best = WarpBestQuad<32>(best);
+  if (threadIdx.x % 32 == 0) {
+    storage.warp_best[threadIdx.x / 32] = best;
+  }
+  __syncthreads();
+
+  if (threadIdx.x >= 32) {
+    return;
+  }
+  if (threadIdx.x < kWarps) {
+    best = storage.warp_best[threadIdx.x];
+  }
+  best = WarpBestQuad<kWarps>(best);
+
+  if (threadIdx.x == 0) {
+    const bool valid = best.error < max_line_fit_mse * count;
+    fit_quad_valid_device[blob_index] = valid;
+    if (valid) {
+      const QuadCorners corners = UnrankCorners(best.combination);
+      FitQuad &fit_quad = fit_quads_device[blob_index];
+      fit_quad.blob_index = blob_index;
+      fit_quad.valid = true;
+      const uint32_t i0 = storage.point_indices[corners.m0];
+      const uint32_t i1 = storage.point_indices[corners.m1];
+      const uint32_t i2 = storage.point_indices[corners.m2];
+      const uint32_t i3 = storage.point_indices[corners.m3];
+      fit_quad.indices[0] = i0;
+      fit_quad.indices[1] = i1;
+      fit_quad.indices[2] = i2;
+      fit_quad.indices[3] = i3;
+      fit_quad.moments[0] = ReadMoments(line_fit_points, count, i0, i1);
+      fit_quad.moments[1] = ReadMoments(line_fit_points, count, i1, i2);
+      fit_quad.moments[2] = ReadMoments(line_fit_points, count, i2, i3);
+      fit_quad.moments[3] = ReadMoments(line_fit_points, count, i3, i0);
+    }
+  }
+}
+
+struct FitQuadsStorage {
+  typedef cub::BlockScan<int, kFitQuadsThreads> BlockScan;
+
+  typename BlockScan::TempStorage scan;
+  QuadFitTailStorage<kFitQuadsThreads> tail;
+};
 
 // Fits a quad to blob blockIdx.x from its best kNMaxima peaks.  peak_keys has
 // room for max_peaks keys.
@@ -1058,7 +1224,7 @@ __global__ void __launch_bounds__(kFitQuadsThreads) DoFitQuads(
     }
     int offset;
     int chunk_peaks;
-    FitQuadsStorage::BlockScan(storage.cub.scan)
+    FitQuadsStorage::BlockScan(storage.scan)
         .ExclusiveSum(is_peak, offset, chunk_peaks);
     // Two neighboring points can't both be peaks, so this always holds.
     if (is_peak && num_peaks + offset < max_peaks) {
@@ -1068,94 +1234,10 @@ __global__ void __launch_bounds__(kFitQuadsThreads) DoFitQuads(
     __syncthreads();
   }
 
-  // It takes 4 peaks to make a quad.
-  if (num_peaks < 4) {
-    if (threadIdx.x == 0) {
-      fit_quad_valid_device[blob_index] = false;
-    }
-    return;
-  }
-  num_peaks = min(num_peaks, max_peaks);
-  const uint32_t num_maxima = min(num_peaks, static_cast<uint32_t>(kNMaxima));
-
-  // Rank each peak against the others to pick the best num_maxima.  Keys are
-  // unique, so the ranks are too.
-  for (uint32_t i = threadIdx.x; i < num_peaks; i += kFitQuadsThreads) {
-    const uint64_t key = peak_keys[i];
-    uint32_t rank = 0;
-    for (uint32_t j = 0; j < num_peaks && rank < kNMaxima; ++j) {
-      rank += peak_keys[j] < key;
-    }
-    if (rank < kNMaxima) {
-      storage.best_peaks[rank] = static_cast<uint16_t>(key);
-    }
-  }
-  __syncthreads();
-
-  // And put them back in point order.
-  if (threadIdx.x < num_maxima) {
-    const uint16_t index = storage.best_peaks[threadIdx.x];
-    uint32_t position = 0;
-    for (uint32_t j = 0; j < num_maxima; ++j) {
-      position += storage.best_peaks[j] < index;
-    }
-    storage.point_indices[position] = index;
-  }
-  __syncthreads();
-
-  // Fit each segment between two of the peaks once, for all the combinations
-  // to share.  Only the forward segments' line parameters get used.
-  if (threadIdx.x < kNMaxima * kNMaxima) {
-    const uint32_t a = threadIdx.x / kNMaxima;
-    const uint32_t b = threadIdx.x % kNMaxima;
-    if (a != b && a < num_maxima && b < num_maxima) {
-      SegmentFit &segment = storage.segments[a][b];
-      FitLine(line_fit_points, count, storage.point_indices[a],
-              storage.point_indices[b], nullptr,
-              a < b ? segment.lineparam23 : nullptr, &segment.err,
-              &segment.mse);
-    }
-  }
-  __syncthreads();
-
-  // Threads past the combinations contribute the max error, and come after
-  // them, so the reduction still picks the first of equally good quads.
-  QuadError quad;
-  quad.m0 = quad.m1 = quad.m2 = quad.m3 = 0;
-  quad.error = std::numeric_limits<double>::max();
-  if (threadIdx.x < MaxRankedIndex()) {
-    const uint32_t packed = kPackedUnrank[threadIdx.x];
-    quad.m0 = packed;
-    quad.m1 = packed >> 8;
-    quad.m2 = packed >> 16;
-    quad.m3 = packed >> 24;
-    quad.error =
-        QuadFitError(storage, quad, num_maxima, max_line_fit_mse, max_dot);
-  }
-  const QuadError best = FitQuadsStorage::BlockReduce(storage.cub.reduce)
-                             .Reduce(quad, MinQuadError());
-
-  if (threadIdx.x == 0) {
-    const bool valid = best.error < max_line_fit_mse * count;
-    fit_quad_valid_device[blob_index] = valid;
-    if (valid) {
-      FitQuad &fit_quad = fit_quads_device[blob_index];
-      fit_quad.blob_index = blob_index;
-      fit_quad.valid = true;
-      const uint32_t i0 = storage.point_indices[best.m0];
-      const uint32_t i1 = storage.point_indices[best.m1];
-      const uint32_t i2 = storage.point_indices[best.m2];
-      const uint32_t i3 = storage.point_indices[best.m3];
-      fit_quad.indices[0] = i0;
-      fit_quad.indices[1] = i1;
-      fit_quad.indices[2] = i2;
-      fit_quad.indices[3] = i3;
-      fit_quad.moments[0] = ReadMoments(line_fit_points, count, i0, i1);
-      fit_quad.moments[1] = ReadMoments(line_fit_points, count, i1, i2);
-      fit_quad.moments[2] = ReadMoments(line_fit_points, count, i2, i3);
-      fit_quad.moments[3] = ReadMoments(line_fit_points, count, i3, i0);
-    }
-  }
+  QuadFitTail<kFitQuadsThreads>(storage.tail, blob_index, count,
+                                line_fit_points, peak_keys, num_peaks,
+                                max_peaks, max_line_fit_mse, max_dot,
+                                fit_quads_device, fit_quad_valid_device);
 }
 
 }  // namespace
