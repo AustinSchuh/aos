@@ -501,25 +501,25 @@
     {
       "name": "apriltag_detector0",
       "executable_name": "apriltag_detector",
-      "args": ["--channel", "/camera0/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--use_neon", "--max_image_age_ms=55", "--pixel_border=25"],
+      "args": ["--channel", "/camera0/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--max_image_age_ms=55", "--pixel_border=25"],
       "nodes": ["orin"]
     },
     {
       "name": "apriltag_detector1",
       "executable_name": "apriltag_detector",
-      "args": ["--channel", "/camera1/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--use_neon", "--max_image_age_ms=55", "--pixel_border=25"],
+      "args": ["--channel", "/camera1/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--max_image_age_ms=55", "--pixel_border=25"],
       "nodes": ["orin"]
     },
     {
       "name": "apriltag_detector2",
       "executable_name": "apriltag_detector",
-      "args": ["--channel", "/camera2/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--use_neon", "--max_image_age_ms=55", "--pixel_border=25"],
+      "args": ["--channel", "/camera2/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--max_image_age_ms=55", "--pixel_border=25"],
       "nodes": ["orin"]
     },
     {
       "name": "apriltag_detector3",
       "executable_name": "apriltag_detector",
-      "args": ["--channel", "/camera3/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--use_neon", "--max_image_age_ms=55", "--pixel_border=25"],
+      "args": ["--channel", "/camera3/gray", "--image_format=MONO8", "--min_white_black_diff=20", "--max_image_age_ms=55", "--pixel_border=25"],
       "nodes": ["orin"]
     },
     {
