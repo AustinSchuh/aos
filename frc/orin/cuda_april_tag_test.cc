@@ -3151,6 +3151,43 @@ TEST_F(SyntheticImageTest, TooManyBlobs) {
   EXPECT_GT(gpu_detector_.NumFitQuads(), 0);
 }
 
+// Tests that selected_extents is empty past each frame's blob pairs, whether
+// the frame before had more pairs, fewer, or overflowed.  BlobPairExtents only
+// rewrites the entries either frame could have used.
+TEST_F(SyntheticImageTest, SelectedExtentsEmptyPastPairs) {
+  for (size_t squares :
+       {size_t{10}, GpuDetector::kMaxBlobs, size_t{10}, size_t{1500},
+        GpuDetector::kMaxBlobs + 1, size_t{700}, size_t{0}}) {
+    Detect(GridImage(12, 24, squares));
+    ASSERT_EQ(static_cast<size_t>(gpu_detector_.NumQuads()), squares);
+    const size_t num_pairs =
+        gpu_detector_.last_frame_overflowed() ? 0 : squares;
+    const std::vector<cub::KeyValuePair<long, MinMaxExtents>> selected =
+        gpu_detector_.CopyAllSelectedExtents();
+    ASSERT_EQ(selected.size(), GpuDetector::kMaxBlobs);
+    size_t selected_blobs = 0;
+    for (size_t i = 0; i < selected.size(); ++i) {
+      const MinMaxExtents &extents = selected[i].value;
+      EXPECT_EQ(selected[i].key, static_cast<long>(i));
+      if (i < num_pairs) {
+        selected_blobs += extents.count > 0;
+        continue;
+      }
+      EXPECT_EQ(extents.min_x, 0) << " for extent " << i;
+      EXPECT_EQ(extents.min_y, 0) << " for extent " << i;
+      EXPECT_EQ(extents.max_x, 0) << " for extent " << i;
+      EXPECT_EQ(extents.max_y, 0) << " for extent " << i;
+      EXPECT_EQ(extents.starting_offset, 0u) << " for extent " << i;
+      EXPECT_EQ(extents.count, 0u) << " for extent " << i;
+      EXPECT_EQ(extents.gx_sum, 0) << " for extent " << i;
+      EXPECT_EQ(extents.gy_sum, 0) << " for extent " << i;
+      EXPECT_EQ(extents.pxgx_plus_pygy_sum, 0) << " for extent " << i;
+    }
+    // Every square is big enough to select.
+    EXPECT_EQ(selected_blobs, num_pairs);
+  }
+}
+
 // Tests that Detections() comes out in the same order every time, including
 // among tags with the same id, although the decode threads finish the quads in
 // a different order each time.

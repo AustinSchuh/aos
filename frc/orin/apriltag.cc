@@ -99,6 +99,13 @@ GpuDetector::GpuDetector(size_t width, size_t height,
     CHECK_CUDA(cudaMemsetAsync(blob_pairs + offset, 0xff,
                                sizeof(BlobPairTable::min_xs), stream_.get()));
   }
+  // selected_extents_device_ starts out uninitialized, so the first frame
+  // writes all of it.
+  const uint32_t num_nonempty_selected_extents = kMaxBlobs;
+  CHECK_CUDA(cudaMemcpyAsync(
+      blob_pairs + offsetof(BlobPairTable, num_nonempty_selected_extents),
+      &num_nonempty_selected_extents, sizeof(num_nonempty_selected_extents),
+      cudaMemcpyHostToDevice, stream_.get()));
   CHECK_CUDA(cudaStreamSynchronize(stream_.get()));
 
   for (int i = 0; i < zarray_size(tag_detector_->tag_families); i++) {
@@ -643,20 +650,63 @@ __global__ void __launch_bounds__(kRankThreads)
 constexpr int kExtentsThreads = 1024;
 constexpr int kExtentsPerThread = GpuDetector::kMaxBlobs / kExtentsThreads;
 static_assert(kExtentsPerThread * kExtentsThreads == GpuDetector::kMaxBlobs);
+// Each thread zeros its cursors with one uint2 store.
+static_assert(kExtentsPerThread == 2);
+static_assert(offsetof(BlobPairTable, cursors) % sizeof(uint2) == 0);
+
+using SelectedExtents = cub::KeyValuePair<long, MinMaxExtents>;
+// BlobPairExtents builds selected_extents in shared memory a part at a time,
+// since all 80 KB of it is more than a block gets without opting in.
+constexpr int kSelectedExtentsParts = 2;
+constexpr int kSelectedExtentsPerPart =
+    GpuDetector::kMaxBlobs / kSelectedExtentsParts;
+constexpr int kThreadsPerSelectedExtentsPart =
+    kExtentsThreads / kSelectedExtentsParts;
+// Each thread's entries, and each part, are whole uint4s.
+static_assert(kExtentsPerThread * sizeof(SelectedExtents) % sizeof(uint4) == 0);
+static_assert(sizeof(MinMaxExtents) % sizeof(uint4) == 0);
+
+// Stores value with one 16 byte store.  Clang copies a uint4 as two 8 byte
+// halves, so this builds a new one from its fields.
+__device__ __forceinline__ void StoreUint4(uint4 value, uint4 *destination) {
+  *destination = make_uint4(value.x, value.y, value.z, value.w);
+}
+
+// Stores kBytes of source to a 16 byte aligned destination as uint4s.  The
+// structs here are only 8 byte aligned, so the compiler stores them 8 bytes at
+// a time.
+template <size_t kBytes>
+__device__ __forceinline__ void StoreAsUint4s(const void *source,
+                                              void *destination) {
+  static_assert(kBytes % sizeof(uint4) == 0);
+  uint4 words[kBytes / sizeof(uint4)];
+  memcpy(words, source, kBytes);
+#pragma unroll
+  for (size_t i = 0; i < kBytes / sizeof(uint4); ++i) {
+    StoreUint4(words[i], reinterpret_cast<uint4 *>(destination) + i);
+  }
+}
 
 // Fills in each blob pair's starting offset in extents, where sorting the
 // points by pair would put it, and writes the extents of the selected blobs,
 // with their offsets once the rest are left out.  selected_extents covers all
-// kMaxBlobs blobs, and those past the last pair have no points.  Then reports
-// on the frame and zeros the table's counts for the next one.
+// kMaxBlobs blobs, and those past the last pair are zero but for their keys.
+// Then reports on the frame and zeros the table's counts for the next one.
 __global__ void __launch_bounds__(kExtentsThreads)
     BlobPairExtents(BlobPairTable *pairs, SelectBlobs select_blobs,
-                    MinMaxExtents *extents,
-                    cub::KeyValuePair<long, MinMaxExtents> *selected_extents,
+                    MinMaxExtents *extents, SelectedExtents *selected_extents,
                     int *num_selected_points, uint32_t *overflow,
                     uint32_t *num_blob_pairs, uint32_t *num_boundary_points) {
   typedef cub::BlockScan<unsigned long long, kExtentsThreads> BlockScan;
-  __shared__ typename BlockScan::TempStorage scan_storage;
+  // Written from each thread, selected_extents' 40 byte entries leave a warp's
+  // stores 80 bytes apart, so they go through shared memory and out as
+  // consecutive uint4s.  KeyValuePair's constructor keeps it out of the union.
+  union Storage {
+    typename BlockScan::TempStorage scan;
+    uint4 selected_extents[kSelectedExtentsPerPart * sizeof(SelectedExtents) /
+                           sizeof(uint4)];
+  };
+  __shared__ Storage storage;
 
   const uint32_t num_pairs = pairs->num_pairs;
   const uint32_t num_points = pairs->num_points;
@@ -684,26 +734,60 @@ __global__ void __launch_bounds__(kExtentsThreads)
   }
   unsigned long long offsets[kExtentsPerThread];
   unsigned long long total;
-  BlockScan(scan_storage).ExclusiveSum(counts, offsets, total);
+  BlockScan(storage.scan).ExclusiveSum(counts, offsets, total);
 
+  SelectedExtents selected[kExtentsPerThread];
 #pragma unroll
   for (int i = 0; i < kExtentsPerThread; ++i) {
     const uint32_t rank = threadIdx.x * kExtentsPerThread + i;
     if (!overflowed && rank < num_pairs) {
       blob[i].starting_offset = offsets[i] & 0xffffffffu;
-      extents[rank] = blob[i];
+      StoreAsUint4s<sizeof(MinMaxExtents)>(&blob[i], &extents[rank]);
     }
-    cub::KeyValuePair<long, MinMaxExtents> selected;
-    selected.key = rank;
-    selected.value = MinMaxExtents{};
-    selected.value.min_x = blob[i].min_x;
-    selected.value.min_y = blob[i].min_y;
-    selected.value.max_x = blob[i].max_x;
-    selected.value.max_y = blob[i].max_y;
-    selected.value.count = counts[i] >> 32;
-    selected.value.starting_offset = offsets[i] >> 32;
-    selected_extents[rank] = selected;
-    pairs->cursors[rank] = 0;
+    selected[i].key = rank;
+    selected[i].value = MinMaxExtents{};
+    selected[i].value.min_x = blob[i].min_x;
+    selected[i].value.min_y = blob[i].min_y;
+    selected[i].value.max_x = blob[i].max_x;
+    selected[i].value.max_y = blob[i].max_y;
+    selected[i].value.count = counts[i] >> 32;
+    // Past the pairs, every field but the key is zero, the same every frame.
+    selected[i].value.starting_offset = rank < num_pairs ? offsets[i] >> 32 : 0;
+  }
+  reinterpret_cast<uint2 *>(pairs->cursors)[threadIdx.x] = make_uint2(0, 0);
+
+  // Entries past both this frame's pairs and the last frame's are still
+  // empty.
+  const uint32_t num_selected_extents = std::min<uint32_t>(
+      GpuDetector::kMaxBlobs,
+      std::max(num_pairs, pairs->num_nonempty_selected_extents));
+#pragma unroll
+  for (int part = 0; part < kSelectedExtentsParts; ++part) {
+    const uint32_t first = part * kSelectedExtentsPerPart;
+    if (num_selected_extents <= first) {
+      break;
+    }
+    // The first part reuses the scan's storage, and the rest the last part's.
+    __syncthreads();
+    const int part_thread =
+        static_cast<int>(threadIdx.x) - part * kThreadsPerSelectedExtentsPart;
+    if (part_thread >= 0 && part_thread < kThreadsPerSelectedExtentsPart) {
+      StoreAsUint4s<sizeof(selected)>(
+          selected, &storage.selected_extents[part_thread * sizeof(selected) /
+                                              sizeof(uint4)]);
+    }
+    __syncthreads();
+    uint4 *destination = reinterpret_cast<uint4 *>(selected_extents + first);
+    // Rounding up rewrites the start of the next entry with its own value.
+    const uint32_t num_words = std::min<uint32_t>(
+        sizeof(storage.selected_extents) / sizeof(uint4),
+        ((num_selected_extents - first) * sizeof(SelectedExtents) +
+         sizeof(uint4) - 1) /
+            sizeof(uint4));
+    for (uint32_t word = threadIdx.x; word < num_words;
+         word += kExtentsThreads) {
+      StoreUint4(storage.selected_extents[word], destination + word);
+    }
   }
 
   // RankBlobPairs emptied every slot of a frame which fits.  One which
@@ -723,6 +807,7 @@ __global__ void __launch_bounds__(kExtentsThreads)
     *num_boundary_points = num_points;
     pairs->frame_num_points = num_points;
     pairs->frame_overflowed = overflowed;
+    pairs->num_nonempty_selected_extents = overflowed ? 0 : num_pairs;
     pairs->num_pairs = 0;
     pairs->num_points = 0;
     pairs->overflow = 0;

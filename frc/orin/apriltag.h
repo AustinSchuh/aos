@@ -76,6 +76,9 @@ struct BlobPairTable {
   // BlobPairExtents, which zeros the counts above for the next frame.
   uint32_t frame_num_points;
   uint32_t frame_overflowed;
+  // How many of selected_extents' leading entries may hold a blob.  The rest
+  // are empty, so BlobPairExtents skips them.
+  uint32_t num_nonempty_selected_extents;
 };
 
 struct CameraMatrix {
@@ -239,6 +242,12 @@ class GpuDetector {
       const {
     return selected_extents_device_.Copy(
         std::min<size_t>(NumQuads(), kMaxBlobs));
+  }
+
+  // Every entry, including the empty ones past the blob pairs.
+  std::vector<cub::KeyValuePair<long, MinMaxExtents>> CopyAllSelectedExtents()
+      const {
+    return selected_extents_device_.Copy(kMaxBlobs);
   }
 
   int NumSelectedPairs() const { return num_selected_blobs_device_.Copy()[0]; }
