@@ -20,18 +20,34 @@ constexpr size_t kBeforeBuffer = 4;
 constexpr size_t kAfterBuffer = 4;
 constexpr size_t kErrorsBuffer = kBeforeBuffer + kAfterBuffer;
 
+// Half width of the window FitLineError fits a line to around each point.
+constexpr uint32_t kMaxKsz = 20;
+// A point's W is at most hypot(255, 255) + 1 (see LineFitPoint).
+constexpr uint64_t kMaxPointW = 361;
+// FitLineError computes 8 W^2 in uint32.  Blobs have at least 24 points
+// (min_cluster_pixels), so ksz is at least 2 and a window holds 2 * ksz + 1
+// distinct points.
+static_assert(8 * ((2 * kMaxKsz + 1) * kMaxPointW) *
+                  ((2 * kMaxKsz + 1) * kMaxPointW) <
+              (uint64_t{1} << 32));
+
 __device__ double FitLineError(size_t N, int64_t Mx, int64_t My, int64_t Mxx,
                                int64_t Myy, int64_t Mxy, int64_t W) {
   int64_t Cxx = Mxx * W - Mx * Mx;
   int64_t Cxy = Mxy * W - Mx * My;
   int64_t Cyy = Myy * W - My * My;
+  // 8 W^2 is an exact uint32 (see kMaxKsz).  Converting it to float rounds it
+  // once, as converting the exact double W * W * 8.0 to float does, without
+  // the FP64 pipe.
+  const uint32_t w = static_cast<uint32_t>(W);
+  const float eight_w_squared = static_cast<float>(w * w * 8u);
 
   // Pose it as an eigenvalue problem.
   //
   // TODO(austin): Are floats good enough?  Hard to tell what the "right answer"
   // actually is...
-  float eig_small = ((Cxx + Cyy) - std::hypotf((Cxx - Cyy), 2 * Cxy)) /
-                    static_cast<float>(W * W * 8.0);
+  float eig_small =
+      ((Cxx + Cyy) - std::hypotf((Cxx - Cyy), 2 * Cxy)) / eight_w_squared;
   return N * eig_small;
 }
 
@@ -127,7 +143,7 @@ class ErrorCalculator {
           selected_extents_device_[current_blob_index].value.starting_offset;
       count_ = selected_extents_device_[current_blob_index].value.count;
       blob_index_ = current_blob_index;
-      ksz_ = std::min<int>(20, count_ / 12);
+      ksz_ = std::min<uint32_t>(kMaxKsz, count_ / 12);
     }
   }
 
@@ -136,7 +152,10 @@ class ErrorCalculator {
   // right index, and proceed from there.
   __host__ __device__ double LoadError(ssize_t index) const {
     // Index into the current blob.  Should be between 0 and count_.
-    const uint32_t positive_blob_index = (index + count_) % count_;
+    // Blobs have at most 2 * (width + height) points, so 32 bit division is
+    // exact here and below, and much cheaper than 64 bit division on the GPU.
+    const uint32_t positive_blob_index =
+        static_cast<uint32_t>(index + count_) % static_cast<uint32_t>(count_);
 
     // This one is a normal one, it's global index is inside our range or
     // contiguously just before our range.  Just do it.
@@ -170,8 +189,9 @@ class ErrorCalculator {
   // the right index, and proceed from there.
   __host__ __device__ double LoadFilteredError(ssize_t index) const {
     const uint32_t positive_blob_index =
-        (index + global_block_index_start_ + count_ - starting_offset_) %
-        count_;
+        static_cast<uint32_t>(index + global_block_index_start_ + count_ -
+                              starting_offset_) %
+        static_cast<uint32_t>(count_);
     // This one is a normal one, it's global index is inside our range or
     // contiguously just before our range.  Just do it.
     if (positive_blob_index + starting_offset_ + 1 >=
@@ -235,8 +255,10 @@ class ErrorCalculator {
   __device__ double CalculateError(ssize_t blob_index,
                                    bool print = false) const {
     // Index into the blob list for the current key.
-    const size_t i0 = (blob_index + 2 * count_ - ksz_) % count_;
-    const size_t i1 = (blob_index + count_ + ksz_) % count_;
+    const size_t i0 = static_cast<uint32_t>(blob_index + 2 * count_ - ksz_) %
+                      static_cast<uint32_t>(count_);
+    const size_t i1 = static_cast<uint32_t>(blob_index + count_ + ksz_) %
+                      static_cast<uint32_t>(count_);
 
     const size_t global_i0 = i0 + starting_offset_;
     const size_t global_i1 = i1 + starting_offset_;
