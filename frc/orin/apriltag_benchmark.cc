@@ -22,6 +22,7 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <regex>
 #include <set>
@@ -63,11 +64,15 @@ ABSL_FLAG(int32_t, measured_frames, 0,
           "passes over it.");
 ABSL_FLAG(int32_t, warmup, 10, "Untimed detections to run before measuring.");
 ABSL_FLAG(int32_t, parallel, 1,
-          "Detectors to run at once, each in its own process the way the "
-          "robot runs one detector per camera.  They have to be processes: "
-          "the Orin can't do concurrent managed memory access, so the CPU "
-          "touching managed memory while another detector's kernel runs in "
-          "the same process faults.");
+          "Processes to run detectors in at once, the way the robot runs one "
+          "detector process per camera.  Each process has its own CUDA "
+          "context, and the GPU time slices between them.");
+ABSL_FLAG(int32_t, detectors_per_process, 1,
+          "Detectors each --parallel process runs at once, each on a thread "
+          "of its own with its own streams.  They share the process's CUDA "
+          "context, so the GPU can run their kernels side by side instead of "
+          "switching contexts.  --parallel=1 --detectors_per_process=4 runs "
+          "four cameras the way one process for all of them would.");
 ABSL_FLAG(double, pace_hz, 0,
           "If > 0, feed each detector frames at this rate the way a camera "
           "does, instead of as fast as it can take them.  Each detector gets "
@@ -162,7 +167,9 @@ struct DetectorResults {
   std::vector<FrameTiming> timings;
   // Arrival times of the frames --pace_hz dropped.
   std::vector<int64_t> dropped_ticks_ns;
-  // CPU time of the whole process while measuring.
+  // CPU time of the whole process while measuring.  With several detectors in
+  // a process, the first one's results carry it and the rest have 0, so the
+  // sum counts each process once.
   double cpu_s = 0;
   // The part of cpu_s spent copying images in, which the robot doesn't do.
   double input_cpu_s = 0;
@@ -507,19 +514,20 @@ class GpuKeepalive {
   std::thread thread_;
 };
 
-// Runs detector `index` of `parallel` over the corpus.  Each one starts at a
+// Runs detector `index` of `detectors` over the corpus.  Each one starts at a
 // different place in the corpus so parallel detectors aren't all looking at
 // the same frame.  After warming up, it calls `ready`, which returns when to
-// start measuring.
+// start measuring, and it calls `finished` once it has measured every frame.
 DetectorResults RunDetector(
     const std::vector<Frame> &frames, const std::map<int, Calibration> &calibs,
-    int index, int parallel, uint32_t pace_seed, bool record_detections,
-    const std::function<aos::monotonic_clock::time_point()> &ready) {
+    int index, int detectors, uint32_t pace_seed, bool record_detections,
+    const std::function<aos::monotonic_clock::time_point()> &ready,
+    const std::function<void()> &finished) {
   const vision::CameraImage &first = frames.front().image.message();
   const size_t width = first.cols();
   const size_t height = first.rows();
   const size_t image_bytes = first.data()->size();
-  const size_t offset = index * frames.size() / parallel;
+  const size_t offset = index * frames.size() / detectors;
   const size_t warmup = absl::GetFlag(FLAGS_warmup);
   const size_t total = absl::GetFlag(FLAGS_measured_frames) > 0
                            ? absl::GetFlag(FLAGS_measured_frames)
@@ -556,9 +564,6 @@ DetectorResults RunDetector(
         image_bytes, absl::GetFlag(FLAGS_cold_input), [&](size_t sequence) {
           return frame_for(sequence).image.message().data()->data();
         });
-    // Started before the realtime priority below, which it doesn't need.
-    GpuKeepalive keepalive(
-        std::chrono::microseconds(absl::GetFlag(FLAGS_gpu_keepalive_us)));
 
     // Makes image `sequence` and its calibration ready for Detect().
     auto prepare = [&](size_t sequence) {
@@ -671,12 +676,78 @@ DetectorResults RunDetector(
         results.detections[frame.name] = std::move(formatted);
       }
     }
+    finished();
     results.cpu_s = CpuSeconds() - cpu_start;
     results.input_cpu_s = source.CopyCpuSeconds() - input_cpu_start;
   }
 
   apriltag_detector_destroy(tag_detector);
   tag36h11_destroy(tag_family);
+  return results;
+}
+
+// Runs detectors [first_index, first_index + count) of `detectors` in this
+// process, each on a thread of its own.  Once all of them have warmed up, one
+// calls `ready`, which returns when to start measuring.
+std::vector<DetectorResults> RunDetectorsInProcess(
+    const std::vector<Frame> &frames, const std::map<int, Calibration> &calibs,
+    int first_index, int count, int detectors, uint32_t pace_seed,
+    bool record_detections,
+    const std::function<aos::monotonic_clock::time_point()> &ready) {
+  // Started before any detector's realtime priority, which it doesn't need.
+  GpuKeepalive keepalive(
+      std::chrono::microseconds(absl::GetFlag(FLAGS_gpu_keepalive_us)));
+  if (count == 1) {
+    return {RunDetector(frames, calibs, first_index, detectors, pace_seed,
+                        record_detections, ready, []() {})};
+  }
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  int warm = 0;
+  int done = 0;
+  std::optional<aos::monotonic_clock::time_point> epoch;
+  double cpu_start = 0;
+  double cpu_end = 0;
+  std::vector<DetectorResults> results(count);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < count; ++i) {
+    threads.emplace_back([&, i]() {
+      results[i] = RunDetector(
+          frames, calibs, first_index + i, detectors, pace_seed,
+          record_detections,
+          [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (++warm == count) {
+              epoch = ready();
+              cpu_start = CpuSeconds();
+              changed.notify_all();
+            }
+            changed.wait(lock, [&]() { return epoch.has_value(); });
+            return *epoch;
+          },
+          // Every detector keeps its GPU memory until all of them are done,
+          // because freeing it synchronizes the whole device.
+          [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (++done == count) {
+              cpu_end = CpuSeconds();
+              changed.notify_all();
+            }
+            changed.wait(lock, [&]() { return done == count; });
+          });
+    });
+  }
+  for (std::thread &thread : threads) {
+    thread.join();
+  }
+  // Each detector measured the whole process's CPU time over its own frames,
+  // which overlap.  Count the process once, from when they all started until
+  // the last one finished.
+  for (DetectorResults &result : results) {
+    result.cpu_s = 0;
+  }
+  results.front().cpu_s = cpu_end - cpu_start;
   return results;
 }
 
@@ -711,7 +782,9 @@ void PrintStats(std::string_view label, const std::vector<float> &values) {
 // Reports on the frames inside the window where every detector of a run was
 // measuring, so setup, warmup, and whichever detectors finish first don't
 // dilute the contended numbers.  The runs' windows are reported together.
-void Report(const std::vector<std::vector<DetectorResults>> &runs) {
+// `processes` is how many processes the detectors ran in.
+void Report(const std::vector<std::vector<DetectorResults>> &runs,
+            int processes) {
   size_t frames = 0;
   size_t detections = 0;
   double cpu_s = 0;
@@ -773,10 +846,11 @@ void Report(const std::vector<std::vector<DetectorResults>> &runs) {
   }
 
   std::cout << absl::StrFormat(
-      "%zu frames across %zu detector(s), %zu detections, %.1f frames/s, "
-      "%.3f ms CPU/frame, %.3f without copying the input in\n",
-      frames, runs.front().size(), detections, window_frames / window_s,
-      1000.0 * cpu_s / frames, 1000.0 * (cpu_s - input_cpu_s) / frames);
+      "%zu frames across %zu detector(s) in %d process(es), %zu detections, "
+      "%.1f frames/s, %.3f ms CPU/frame, %.3f without copying the input in\n",
+      frames, runs.front().size(), processes, detections,
+      window_frames / window_s, 1000.0 * cpu_s / frames,
+      1000.0 * (cpu_s - input_cpu_s) / frames);
   std::cout << absl::StrFormat(
       "  Steady state: %zu frames in the %.3f s all detectors ran\n",
       window_frames, window_s);
@@ -906,38 +980,48 @@ bool Compare(const DetectorResults &results, const std::string &path) {
   return count_mismatches == 0 && missing_frames == 0 && max_diff <= tolerance;
 }
 
-// Timings go from a child detector back to the parent as text: a "D <count>"
-// line with the number of detections, a "C <seconds>" line with its CPU time,
-// an "I <seconds>" line with the part of that spent copying images in, an
+// Timings go from a child process back to the parent as text.  Per detector,
+// an "R" line starts its results, followed by a "D <count>" line with the
+// number of detections, a "C <seconds>" line with its CPU time, an
+// "I <seconds>" line with the part of that spent copying images in, an
 // "X <tick>" line per dropped frame, then per frame a "F <tick> <start>
 // <end> <wall> <gpu> <host> <stages>" line followed by that many
 // "<name>\t<ms>" lines.
-std::string SerializeTimings(const DetectorResults &results) {
-  std::string out =
-      absl::StrCat("D ", results.num_detections, "\n", "C ",
-                   absl::StrFormat("%.9g", results.cpu_s), "\n", "I ",
-                   absl::StrFormat("%.9g", results.input_cpu_s), "\n");
-  for (const int64_t tick_ns : results.dropped_ticks_ns) {
-    absl::StrAppend(&out, "X ", tick_ns, "\n");
-  }
-  for (const FrameTiming &timing : results.timings) {
-    absl::StrAppend(&out, "F ", timing.tick_ns, " ", timing.start_ns, " ",
-                    timing.end_ns, " ", timing.wall_ms, " ", timing.gpu_ms, " ",
-                    timing.host_decode_ms, " ", timing.stages.size(), "\n");
-    for (const auto &[name, ms] : timing.stages) {
-      absl::StrAppend(&out, name, "\t", ms, "\n");
+std::string SerializeTimings(const std::vector<DetectorResults> &all) {
+  std::string out;
+  for (const DetectorResults &results : all) {
+    absl::StrAppend(&out, "R\n", "D ", results.num_detections, "\n", "C ",
+                    absl::StrFormat("%.9g", results.cpu_s), "\n", "I ",
+                    absl::StrFormat("%.9g", results.input_cpu_s), "\n");
+    for (const int64_t tick_ns : results.dropped_ticks_ns) {
+      absl::StrAppend(&out, "X ", tick_ns, "\n");
+    }
+    for (const FrameTiming &timing : results.timings) {
+      absl::StrAppend(&out, "F ", timing.tick_ns, " ", timing.start_ns, " ",
+                      timing.end_ns, " ", timing.wall_ms, " ", timing.gpu_ms,
+                      " ", timing.host_decode_ms, " ", timing.stages.size(),
+                      "\n");
+      for (const auto &[name, ms] : timing.stages) {
+        absl::StrAppend(&out, name, "\t", ms, "\n");
+      }
     }
   }
   return out;
 }
 
 // `names` owns the stage names the returned string_views point at.
-DetectorResults DeserializeTimings(std::string_view data,
-                                   std::set<std::string, std::less<>> *names) {
-  DetectorResults results;
+std::vector<DetectorResults> DeserializeTimings(
+    std::string_view data, std::set<std::string, std::less<>> *names) {
+  std::vector<DetectorResults> all;
   std::istringstream in{std::string(data)};
   std::string tag;
   while (in >> tag) {
+    if (tag == "R") {
+      all.emplace_back();
+      continue;
+    }
+    ABSL_CHECK(!all.empty()) << ": Detector results without an R line";
+    DetectorResults &results = all.back();
     if (tag == "D") {
       in >> results.num_detections;
       continue;
@@ -974,7 +1058,7 @@ DetectorResults DeserializeTimings(std::string_view data,
     results.timings.push_back(std::move(timing));
   }
   ABSL_CHECK(in.eof()) << ": Failed to parse detector results";
-  return results;
+  return all;
 }
 
 void WriteAll(int fd, const void *data, size_t size) {
@@ -998,12 +1082,12 @@ void ReadAll(int fd, void *data, size_t size) {
   }
 }
 
-// Runs `parallel` detectors in child processes and collects their timings.
-// All of them warm up before any starts measuring, so they measure together.
-// CUDA must not have been touched yet in this process.
+// Runs `parallel` child processes of `per_process` detectors each and
+// collects their timings.  All of them warm up before any starts measuring, so
+// they measure together.  CUDA must not have been touched yet in this process.
 std::vector<DetectorResults> RunInChildren(
     const std::vector<Frame> &frames, const std::map<int, Calibration> &calibs,
-    int parallel, uint32_t pace_seed,
+    int parallel, int per_process, uint32_t pace_seed,
     std::set<std::string, std::less<>> *names) {
   struct Child {
     pid_t pid;
@@ -1026,8 +1110,9 @@ std::vector<DetectorResults> RunInChildren(
         close(child.from_child);
         close(child.to_child);
       }
-      const std::string data = SerializeTimings(RunDetector(
-          frames, calibs, i, parallel, pace_seed, /*record=*/false, [&]() {
+      const std::string data = SerializeTimings(RunDetectorsInProcess(
+          frames, calibs, i * per_process, per_process, parallel * per_process,
+          pace_seed, /*record_detections=*/false, [&]() {
             WriteAll(from_child[1], "W", 1);
             int64_t epoch_ns;
             ReadAll(to_child[0], &epoch_ns, sizeof(epoch_ns));
@@ -1073,7 +1158,9 @@ std::vector<DetectorResults> RunInChildren(
     ABSL_PCHECK(waitpid(child.pid, &status, 0) == child.pid);
     ABSL_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0)
         << ": Detector process " << child.pid << " failed";
-    results.push_back(DeserializeTimings(data, names));
+    for (DetectorResults &detector : DeserializeTimings(data, names)) {
+      results.push_back(std::move(detector));
+    }
   }
   return results;
 }
@@ -1090,6 +1177,10 @@ int Main() {
   std::cout << "Calibration: " << calibration_source << "\n";
 
   const int parallel = absl::GetFlag(FLAGS_parallel);
+  const int per_process = absl::GetFlag(FLAGS_detectors_per_process);
+  ABSL_CHECK_GE(parallel, 1);
+  ABSL_CHECK_GE(per_process, 1);
+  const int detectors = parallel * per_process;
   const bool record = !absl::GetFlag(FLAGS_detections_out).empty() ||
                       !absl::GetFlag(FLAGS_compare_to).empty();
   ABSL_CHECK(parallel == 1 || !record)
@@ -1113,22 +1204,22 @@ int Main() {
     if (absl::GetFlag(FLAGS_pace_hz) > 0) {
       std::cout << absl::StrFormat("Paced at %g Hz, phases",
                                    absl::GetFlag(FLAGS_pace_hz));
-      for (int i = 0; i < parallel; ++i) {
+      for (int i = 0; i < detectors; ++i) {
         std::cout << absl::StrFormat(" %.2f",
                                      1e-6 * PacePhase(pace_seed, i).count());
       }
       std::cout << " ms\n";
     }
     if (parallel == 1) {
-      runs.push_back(
-          {RunDetector(frames, calibs, 0, 1, pace_seed, record,
-                       []() { return aos::monotonic_clock::now(); })});
+      runs.push_back(RunDetectorsInProcess(
+          frames, calibs, 0, per_process, detectors, pace_seed, record,
+          []() { return aos::monotonic_clock::now(); }));
     } else {
-      runs.push_back(
-          RunInChildren(frames, calibs, parallel, pace_seed, &stage_names));
+      runs.push_back(RunInChildren(frames, calibs, parallel, per_process,
+                                   pace_seed, &stage_names));
     }
   }
-  Report(runs);
+  Report(runs, parallel);
   const std::vector<DetectorResults> &results = runs.front();
 
   if (!absl::GetFlag(FLAGS_timing_csv).empty()) {
@@ -1143,7 +1234,13 @@ int Main() {
     WriteDetections(results[0], absl::GetFlag(FLAGS_detections_out));
   }
   if (!absl::GetFlag(FLAGS_compare_to).empty()) {
-    return Compare(results[0], absl::GetFlag(FLAGS_compare_to)) ? 0 : 1;
+    // Detectors sharing a process must not change each other's detections,
+    // so every one of them has to match.
+    bool matched = true;
+    for (const DetectorResults &detector : results) {
+      matched &= Compare(detector, absl::GetFlag(FLAGS_compare_to));
+    }
+    return matched ? 0 : 1;
   }
   return 0;
 }
