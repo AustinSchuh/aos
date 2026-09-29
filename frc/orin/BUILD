@@ -223,6 +223,7 @@ cuda_library(
         "//third_party/apriltag",
         "@bazel_tools//tools/cpp/runfiles",
         "@com_google_absl//absl/flags:reflection",
+        "@com_google_absl//absl/strings",
     ],
     alwayslink = True,
 )

@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cub/device/device_radix_sort.cuh>
@@ -9,8 +10,10 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
@@ -18,6 +21,7 @@
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "absl/log/absl_vlog_is_on.h"
+#include "absl/strings/str_join.h"
 #include "gtest/gtest.h"
 #include "opencv2/calib3d.hpp"
 #include "opencv2/highgui.hpp"
@@ -285,6 +289,371 @@ DistCoeffs create_distortion_coefficients_eight() {
   return DistCoeffs{0, 0, 0, 0, 0, 0, 0, 0, 8};
 }
 
+// The GPU functions the exact references below call, which the host can't
+// reproduce bit for bit: clang's CUDA hypotf() takes an approximate square
+// root (sqrt.approx.f32), and its atan2f() is not glibc's.
+enum class GpuMathFunction : uint32_t { kHypotf, kAtan2f };
+
+struct GpuMathCall {
+  GpuMathFunction function;
+  float a;
+  float b;
+};
+
+__global__ void EvaluateGpuMathCalls(const GpuMathCall *calls, float *results,
+                                     uint32_t num_calls) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < num_calls) {
+    const GpuMathCall call = calls[i];
+    results[i] = call.function == GpuMathFunction::kHypotf
+                     ? hypotf(call.a, call.b)
+                     : atan2f(call.a, call.b);
+  }
+}
+
+// Evaluates GpuMathFunctions on the GPU, a batch at a time, for references
+// which do the rest of their math on the host.
+class GpuMath {
+ public:
+  // Return the GPU's result, or 0 until Run() has evaluated the call.
+  float Hypotf(float x, float y) {
+    return Call(GpuMathFunction::kHypotf, x, y);
+  }
+  float Atan2f(float y, float x) {
+    return Call(GpuMathFunction::kAtan2f, y, x);
+  }
+
+  // Returns reference(), once every call it makes has been evaluated.  It runs
+  // again after each batch, so it must not have side effects.
+  template <typename Reference>
+  auto Run(Reference reference) {
+    auto result = reference();
+    while (EvaluateNewCalls()) {
+      result = reference();
+    }
+    return result;
+  }
+
+ private:
+  static uint64_t Key(float a, float b) {
+    return static_cast<uint64_t>(std::bit_cast<uint32_t>(a)) << 32 |
+           std::bit_cast<uint32_t>(b);
+  }
+
+  float Call(GpuMathFunction function, float a, float b) {
+    const auto [it, inserted] =
+        results_[static_cast<size_t>(function)].try_emplace(Key(a, b), 0.0f);
+    if (inserted) {
+      new_calls_.push_back(GpuMathCall{.function = function, .a = a, .b = b});
+    }
+    return it->second;
+  }
+
+  // Evaluates the calls made since the last batch, and returns whether there
+  // were any.
+  bool EvaluateNewCalls() {
+    if (new_calls_.empty()) {
+      return false;
+    }
+    GpuMemory<GpuMathCall> calls_device(new_calls_.size());
+    GpuMemory<float> results_device(new_calls_.size());
+    calls_device.MemcpyFrom(new_calls_.data());
+    constexpr uint32_t kThreads = 256;
+    EvaluateGpuMathCalls<<<(new_calls_.size() + kThreads - 1) / kThreads,
+                           kThreads>>>(calls_device.get(), results_device.get(),
+                                       new_calls_.size());
+    CHECK_CUDA(cudaGetLastError());
+    const std::vector<float> results = results_device.Copy();
+    for (size_t i = 0; i < new_calls_.size(); ++i) {
+      const GpuMathCall &call = new_calls_[i];
+      results_[static_cast<size_t>(call.function)][Key(call.a, call.b)] =
+          results[i];
+    }
+    new_calls_.clear();
+    return true;
+  }
+
+  // By function, then by Key() of the arguments.
+  std::array<std::unordered_map<uint64_t, float>, 2> results_;
+  std::vector<GpuMathCall> new_calls_;
+};
+
+// Weighted moments of some points in half pixels: W sums their weights, Mx
+// their weights times x, Mxy their weights times x y, and so on, and N counts
+// them.  The GPU keeps Mx, My, and W in 32 bits, so if they overflow there,
+// they differ from these.
+struct ReferenceMoments {
+  int64_t Mx = 0;
+  int64_t My = 0;
+  int64_t Mxx = 0;
+  int64_t Myy = 0;
+  int64_t Mxy = 0;
+  int64_t W = 0;
+  int64_t N = 0;
+
+  ReferenceMoments operator+(const ReferenceMoments &other) const {
+    return ReferenceMoments{
+        .Mx = Mx + other.Mx,
+        .My = My + other.My,
+        .Mxx = Mxx + other.Mxx,
+        .Myy = Myy + other.Myy,
+        .Mxy = Mxy + other.Mxy,
+        .W = W + other.W,
+        .N = N + other.N,
+    };
+  }
+  ReferenceMoments operator-(const ReferenceMoments &other) const {
+    return ReferenceMoments{
+        .Mx = Mx - other.Mx,
+        .My = My - other.My,
+        .Mxx = Mxx - other.Mxx,
+        .Myy = Myy - other.Myy,
+        .Mxy = Mxy - other.Mxy,
+        .W = W - other.W,
+        .N = N - other.N,
+    };
+  }
+  bool operator==(const ReferenceMoments &) const = default;
+};
+
+std::ostream &operator<<(std::ostream &os, const ReferenceMoments &moments) {
+  return os << "{Mx:" << moments.Mx << ", My:" << moments.My
+            << ", Mxx:" << moments.Mxx << ", Myy:" << moments.Myy
+            << ", Mxy:" << moments.Mxy << ", W:" << moments.W
+            << ", N:" << moments.N << "}";
+}
+
+// Returns a blob's sorted points' line fit points, the prefix sums of their
+// moments, added up as aprilrobotics' compute_lfps() does.  Each point's weight
+// comes from the decimated image's gradient at it.
+std::vector<ReferenceMoments> ReferenceLineFitPoints(
+    std::span<const IndexPoint> points, const cv::Mat &decimated,
+    GpuMath &math) {
+  std::vector<ReferenceMoments> result;
+  result.reserve(points.size());
+  ReferenceMoments sum;
+  for (const IndexPoint point : points) {
+    // Adjusted for the pixel center bias.
+    const int64_t x = point.x() + 1;
+    const int64_t y = point.y() + 1;
+    const int ix = x / 2;
+    const int iy = y / 2;
+    int64_t W = 1;
+    if (ix > 0 && ix + 1 < decimated.cols && iy > 0 &&
+        iy + 1 < decimated.rows) {
+      const int grad_x =
+          decimated.at<uint8_t>(iy, ix + 1) - decimated.at<uint8_t>(iy, ix - 1);
+      const int grad_y =
+          decimated.at<uint8_t>(iy + 1, ix) - decimated.at<uint8_t>(iy - 1, ix);
+      W = static_cast<int32_t>(math.Hypotf(grad_x, grad_y) + 1);
+    }
+    sum = sum + ReferenceMoments{
+                    .Mx = W * x,
+                    .My = W * y,
+                    .Mxx = W * x * x,
+                    .Myy = W * y * y,
+                    .Mxy = W * x * y,
+                    .W = W,
+                    .N = 1,
+                };
+    result.push_back(sum);
+  }
+  return result;
+}
+
+// Returns the moments of a blob's points i0 to i1 from its line fit points,
+// wrapping around the end of the blob when i0 > i1, as aprilrobotics'
+// fit_line() does.
+ReferenceMoments RangeMoments(std::span<const ReferenceMoments> line_fit_points,
+                              uint32_t i0, uint32_t i1) {
+  const ReferenceMoments before =
+      i0 > 0 ? line_fit_points[i0 - 1] : ReferenceMoments{};
+  if (i0 < i1) {
+    return line_fit_points[i1] - before;
+  }
+  return line_fit_points.back() - before + line_fit_points[i1];
+}
+
+// A line fit to some moments, in the floats the GPU computes it in.
+struct ReferenceLine {
+  // The sum and the mean of the squared errors.
+  float err;
+  float mse;
+  // The line's unit normal, if asked for.
+  float normal[2];
+};
+
+// Returns FitLine()'s fit of a line to moments, whose error is also
+// FitLineError()'s.
+ReferenceLine ReferenceFitLine(const ReferenceMoments &moments,
+                               bool with_normal, GpuMath &math) {
+  const int64_t Cxx = moments.Mxx * moments.W - moments.Mx * moments.Mx;
+  const int64_t Cxy = moments.Mxy * moments.W - moments.Mx * moments.My;
+  const int64_t Cyy = moments.Myy * moments.W - moments.My * moments.My;
+  const float hypot =
+      math.Hypotf(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
+  // 8 W^2 is an exact double, so this rounds it once, as the GPU's integer
+  // 8 W^2 must.
+  const float eig_small = (static_cast<float>(Cxx + Cyy) - hypot) /
+                          static_cast<float>(moments.W * moments.W * 8.0);
+  ReferenceLine line{
+      .err = moments.N * eig_small, .mse = eig_small, .normal = {0, 0}};
+  if (with_normal) {
+    // The longer of two candidate normals.  The GPU contracts each sum of
+    // squares into an fma.
+    const float nx1 = static_cast<float>(Cxx - Cyy) - hypot;
+    const float ny1 = static_cast<float>(2 * Cxy);
+    const float nx2 = static_cast<float>(2 * Cxy);
+    const float ny2 = static_cast<float>(Cyy - Cxx) - hypot;
+    const bool first =
+        std::fma(nx1, nx1, ny1 * ny1) > std::fma(ny2, ny2, nx2 * nx2);
+    const float nx = first ? nx1 : nx2;
+    const float ny = first ? ny1 : ny2;
+    const float length = math.Hypotf(nx, ny);
+    line.normal[0] = nx / length;
+    line.normal[1] = ny / length;
+  }
+  return line;
+}
+
+// A blob's line fit errors, and their filtered errors.
+struct ReferenceErrors {
+  std::vector<double> errs;
+  std::vector<double> filtered_errs;
+};
+
+// Returns FitBlobQuad()'s errors for a blob's line fit points.
+ReferenceErrors ReferenceBlobErrors(
+    std::span<const ReferenceMoments> line_fit_points, GpuMath &math) {
+  const uint32_t count = line_fit_points.size();
+  const uint32_t ksz = std::min<uint32_t>(20, count / 12);
+  ReferenceErrors result;
+  for (uint32_t i = 0; i < count; ++i) {
+    // Fits the points within ksz of point i, wrapping around the blob.
+    result.errs.push_back(
+        ReferenceFitLine(
+            RangeMoments(line_fit_points, (i + count - ksz) % count,
+                         (i + ksz) % count),
+            /*with_normal=*/false, math)
+            .err);
+  }
+  constexpr size_t kFilterSize = FilterCoefficients().size();
+  for (uint32_t i = 0; i < count; ++i) {
+    // The GPU contracts each step into an fma.
+    double filtered_error = 0;
+    for (size_t j = 0; j < kFilterSize; ++j) {
+      filtered_error =
+          std::fma(result.errs[(i + j + count - kFilterSize / 2) % count],
+                   FilterCoefficients()[j], filtered_error);
+    }
+    result.filtered_errs.push_back(filtered_error);
+  }
+  return result;
+}
+
+// Returns whether point i of a blob is a peak of its filtered errors.
+bool IsPeak(std::span<const double> filtered_errs, size_t i) {
+  const size_t count = filtered_errs.size();
+  return filtered_errs[i] > filtered_errs[(i + count - 1) % count] &&
+         filtered_errs[i] > filtered_errs[(i + 1) % count];
+}
+
+// Returns the point indices of the corners of the quad the GPU fits to a blob,
+// or nullopt if it fits none.  As in aprilrobotics' fit_quad(), every
+// combination of 4 of the best peaks is tried in order, and the first with the
+// smallest error wins.  The best peaks are the first max_nmaxima in a stable
+// sort by float -filtered error, which QuadFitTail()'s ranking must match.
+std::optional<std::array<uint32_t, 4>> ReferenceQuadIndices(
+    std::span<const ReferenceMoments> line_fit_points,
+    std::span<const double> filtered_errs,
+    const apriltag_quad_thresh_params &qtp, GpuMath &math) {
+  const uint32_t count = line_fit_points.size();
+  std::vector<std::pair<float, uint32_t>> peaks;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (IsPeak(filtered_errs, i)) {
+      peaks.emplace_back(static_cast<float>(-filtered_errs[i]), i);
+    }
+  }
+  if (peaks.size() < 4) {
+    return std::nullopt;
+  }
+  std::stable_sort(
+      peaks.begin(), peaks.end(),
+      [](const auto &a, const auto &b) { return a.first < b.first; });
+  std::vector<uint32_t> maxima;
+  for (size_t i = 0; i < std::min<size_t>(peaks.size(), qtp.max_nmaxima); ++i) {
+    maxima.push_back(peaks[i].second);
+  }
+  std::sort(maxima.begin(), maxima.end());
+
+  const auto fit = [&](uint32_t i0, uint32_t i1, bool with_normal) {
+    return ReferenceFitLine(RangeMoments(line_fit_points, i0, i1), with_normal,
+                            math);
+  };
+  const int nmaxima = maxima.size();
+  double best_error = std::numeric_limits<double>::infinity();
+  std::optional<std::array<uint32_t, 4>> best;
+  for (int m0 = 0; m0 < nmaxima - 3; ++m0) {
+    const uint32_t i0 = maxima[m0];
+    for (int m1 = m0 + 1; m1 < nmaxima - 2; ++m1) {
+      const uint32_t i1 = maxima[m1];
+      const ReferenceLine line01 = fit(i0, i1, /*with_normal=*/true);
+      if (line01.mse > qtp.max_line_fit_mse) {
+        continue;
+      }
+      for (int m2 = m1 + 1; m2 < nmaxima - 1; ++m2) {
+        const uint32_t i2 = maxima[m2];
+        const ReferenceLine line12 = fit(i1, i2, /*with_normal=*/true);
+        if (line12.mse > qtp.max_line_fit_mse) {
+          continue;
+        }
+        const double dot =
+            static_cast<double>(line01.normal[0]) * line12.normal[0] +
+            static_cast<double>(line01.normal[1]) * line12.normal[1];
+        if (std::abs(dot) > qtp.cos_critical_rad) {
+          continue;
+        }
+        for (int m3 = m2 + 1; m3 < nmaxima; ++m3) {
+          const uint32_t i3 = maxima[m3];
+          const ReferenceLine line23 = fit(i2, i3, /*with_normal=*/false);
+          if (line23.mse > qtp.max_line_fit_mse) {
+            continue;
+          }
+          const ReferenceLine line30 = fit(i3, i0, /*with_normal=*/false);
+          if (line30.mse > qtp.max_line_fit_mse) {
+            continue;
+          }
+          const double error = static_cast<double>(line01.err) + line12.err +
+                               line23.err + line30.err;
+          if (error < best_error) {
+            best_error = error;
+            best = {i0, i1, i2, i3};
+          }
+        }
+      }
+    }
+  }
+  // The GPU's own test of the whole quad, with its float product.
+  if (!best.has_value() ||
+      !(best_error < qtp.max_line_fit_mse * static_cast<float>(count))) {
+    return std::nullopt;
+  }
+  return best;
+}
+
+// How many of a frame's sorted points share an angle with the point before
+// them.
+struct AngleTies {
+  // In blobs the rank sort orders, and in the bigger ones FixAngleTies()
+  // orders.
+  size_t rank_sorted = 0;
+  size_t radix_sorted = 0;
+  // Of those in the bigger blobs, how many start a warp's or a chunk's share
+  // of FixAngleTies()' points.
+  size_t warp_starts = 0;
+  size_t chunk_starts = 0;
+};
+
 class CudaAprilTagDetector {
  public:
   CudaAprilTagDetector(
@@ -388,6 +757,7 @@ class CudaAprilTagDetector {
     num_quads_ = gpu_detector_.NumQuads();
 
     fit_quads_ = gpu_detector_.FitQuads();
+    fit_quads_cuda_ = gpu_detector_.CopyFitQuads();
 
     ABSL_LOG(INFO) << "num_compressed_union_marker_pair "
                    << sorted_union_marker_pair_.size();
@@ -1063,7 +1433,8 @@ class CudaAprilTagDetector {
     }
   }
 
-  // Tests that the extents and dot products match the cuda versions.
+  // Tests that the extents and dot products match the cuda versions.  Returns
+  // the number of selected blobs, and their points, without angles.
   std::pair<size_t, std::vector<IndexPoint>> CheckCudaExtents(
       const std::vector<std::vector<QuadBoundaryPoint>> &cuda_grouped_points,
       const std::vector<MinMaxExtents> &extents_cuda) const {
@@ -1147,15 +1518,7 @@ class CudaAprilTagDetector {
             !(!normal_border_ && !quad_reversed_border)) {
           ++selected_quads;
           for (size_t j = 0; j < points.size(); ++j) {
-            IndexPoint pt(i, points[j].point_bits());
-            float theta =
-                (atan2f(pt.y() - extents.cy(), pt.x() - extents.cx()) +
-                 numbers::pi) *
-                8e6;
-            long long int theta_int = llrintf(theta);
-
-            pt.set_theta(theta_int);
-            selected_blobs.emplace_back(pt);
+            selected_blobs.emplace_back(i, points[j].point_bits());
           }
         }
 
@@ -1178,6 +1541,242 @@ class CudaAprilTagDetector {
       ABSL_CHECK_EQ(selected_blobs[i].blob_index(),
                     selected_blobs_cuda[i].blob_index());
     }
+  }
+
+  // Checks each per-blob step from ScatterSelectedPoints to the quad fits
+  // exactly against host references.  CheckSortedFilteredCudaPoints(),
+  // CheckErrors(), and CheckQuads() compare with aprilrobotics, which computes
+  // in double and orders points with the same angle differently, so they let
+  // small differences through, and with them a wrong but repeatable result.
+  // selected_blobs holds the selected blobs' points, without angles.  Returns
+  // the ties in angle the frame had for the sorts to order.
+  AngleTies CheckQuadFitsExactly(std::vector<IndexPoint> selected_blobs) const {
+    GpuMath math;
+
+    // ScatterSelectedPoints gives each blob its points, with the angles
+    // AddTheta() gives them, in no particular order.  Keys sort by blob first.
+    selected_blobs = math.Run([&]() {
+      std::vector<IndexPoint> result = selected_blobs;
+      for (IndexPoint &point : result) {
+        const MinMaxExtents &extents = extents_cuda_[point.blob_index()];
+        const float theta =
+            (math.Atan2f(point.y() - extents.cy(), point.x() - extents.cx()) +
+             numbers::pi) *
+            8e6;
+        point.set_theta(std::max<long long int>(0, llrintf(theta)));
+      }
+      return result;
+    });
+    const auto by_key = [](IndexPoint a, IndexPoint b) {
+      return a.key < b.key;
+    };
+    std::sort(selected_blobs.begin(), selected_blobs.end(), by_key);
+    std::vector<IndexPoint> scattered = selected_blobs_cuda_;
+    std::sort(scattered.begin(), scattered.end(), by_key);
+    ABSL_CHECK_EQ(scattered.size(), selected_blobs.size());
+    for (size_t i = 0; i < scattered.size(); ++i) {
+      ABSL_CHECK_EQ(scattered[i].key, selected_blobs[i].key)
+          << ": selected point " << i << " by key is " << scattered[i]
+          << ", expected " << selected_blobs[i];
+    }
+
+    // The quad fits sort each blob's points by angle, and points with the
+    // same angle by AngleTieKey(): by dxy, then base_y, then base_x.
+    std::vector<IndexPoint> sorted = selected_blobs_cuda_;
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [](IndexPoint a, IndexPoint b) {
+                       return std::make_tuple(a.blob_index(), a.theta(),
+                                              a.dxy(), a.base_y(), a.base_x()) <
+                              std::make_tuple(b.blob_index(), b.theta(),
+                                              b.dxy(), b.base_y(), b.base_x());
+                     });
+    ABSL_CHECK_EQ(sorted_selected_blobs_cuda_.size(), sorted.size());
+    for (size_t i = 0; i < sorted.size(); ++i) {
+      ABSL_CHECK_EQ(sorted_selected_blobs_cuda_[i].key, sorted[i].key)
+          << ": sorted point " << i << " is " << sorted_selected_blobs_cuda_[i]
+          << ", expected " << sorted[i];
+    }
+
+    // The rest goes blob by blob, from each one's sorted points.
+    struct Blob {
+      uint32_t index;
+      size_t offset;
+      std::span<const IndexPoint> points;
+    };
+    std::vector<Blob> blobs;
+    AngleTies ties;
+    for (size_t start = 0; start < sorted.size();) {
+      size_t end = start + 1;
+      while (end < sorted.size() &&
+             sorted[end].blob_index() == sorted[start].blob_index()) {
+        ++end;
+      }
+      // The quad fits rank sort blobs of up to 256 points.  FixAngleTies()
+      // takes the rest a block of 256 threads at a time, or of 512 for those
+      // of over 2048 points.
+      const size_t count = end - start;
+      const size_t chunk = count > 2048 ? 512 : 256;
+      for (size_t i = 1; i < count; ++i) {
+        if (sorted[start + i].theta() != sorted[start + i - 1].theta()) {
+          continue;
+        }
+        if (count <= 256) {
+          ++ties.rank_sorted;
+          continue;
+        }
+        ++ties.radix_sorted;
+        ties.warp_starts += i % 32 == 0;
+        ties.chunk_starts += i % chunk == 0;
+      }
+      blobs.push_back(Blob{
+          .index = sorted[start].blob_index(),
+          .offset = start,
+          .points =
+              std::span<const IndexPoint>(sorted).subspan(start, end - start),
+      });
+      start = end;
+    }
+
+    const std::vector<std::vector<ReferenceMoments>> line_fit_points =
+        math.Run([&]() {
+          std::vector<std::vector<ReferenceMoments>> result;
+          for (const Blob &blob : blobs) {
+            result.push_back(
+                ReferenceLineFitPoints(blob.points, decimated_cuda_, math));
+          }
+          return result;
+        });
+    for (size_t b = 0; b < blobs.size(); ++b) {
+      for (size_t i = 0; i < blobs[b].points.size(); ++i) {
+        const LineFitPoint &point = line_fit_points_cuda_[blobs[b].offset + i];
+        const ReferenceMoments actual{
+            .Mx = point.Mx,
+            .My = point.My,
+            .Mxx = point.Mxx,
+            .Myy = point.Myy,
+            .Mxy = point.Mxy,
+            .W = point.W,
+            .N = static_cast<int64_t>(i + 1),
+        };
+        ABSL_CHECK(actual == line_fit_points[b][i] &&
+                   point.blob_index == blobs[b].index)
+            << ": line fit point " << i << " of blob " << blobs[b].index
+            << " is " << actual << " of blob " << point.blob_index
+            << ", expected " << line_fit_points[b][i];
+      }
+    }
+
+    const std::vector<ReferenceErrors> errors = math.Run([&]() {
+      std::vector<ReferenceErrors> result;
+      for (const std::vector<ReferenceMoments> &points : line_fit_points) {
+        result.push_back(ReferenceBlobErrors(points, math));
+      }
+      return result;
+    });
+    for (size_t b = 0; b < blobs.size(); ++b) {
+      const ReferenceErrors &expected = errors[b];
+      // Every error goes first, since each filtered error reads the errors on
+      // both sides of it.
+      for (size_t i = 0; i < blobs[b].points.size(); ++i) {
+        const size_t position = blobs[b].offset + i;
+        ABSL_CHECK_EQ(std::bit_cast<uint64_t>(errors_device_[position]),
+                      std::bit_cast<uint64_t>(expected.errs[i]))
+            << std::setprecision(17) << ": error " << i << " of blob "
+            << blobs[b].index << " is " << errors_device_[position]
+            << ", expected " << expected.errs[i];
+      }
+      for (size_t i = 0; i < blobs[b].points.size(); ++i) {
+        const size_t position = blobs[b].offset + i;
+        ABSL_CHECK_EQ(
+            std::bit_cast<uint64_t>(filtered_errors_device_[position]),
+            std::bit_cast<uint64_t>(expected.filtered_errs[i]))
+            << std::setprecision(17) << ": filtered error " << i << " of blob "
+            << blobs[b].index << " is " << filtered_errors_device_[position]
+            << ", expected " << expected.filtered_errs[i];
+        const Peak &peak = peaks_device_[position];
+        const float peak_error = static_cast<float>(-expected.filtered_errs[i]);
+        const uint16_t peak_blob_index = IsPeak(expected.filtered_errs, i)
+                                             ? blobs[b].index
+                                             : Peak::kNoPeak();
+        ABSL_CHECK(std::bit_cast<uint32_t>(peak.error) ==
+                       std::bit_cast<uint32_t>(peak_error) &&
+                   peak.filtered_point_index == position &&
+                   peak.blob_index == peak_blob_index)
+            << std::setprecision(9) << ": peak " << i << " of blob "
+            << blobs[b].index << " is {" << peak.error << ", "
+            << peak.filtered_point_index << ", " << peak.blob_index
+            << "}, expected {" << peak_error << ", " << position << ", "
+            << peak_blob_index << "}";
+      }
+    }
+
+    const std::vector<std::optional<std::array<uint32_t, 4>>> quads =
+        math.Run([&]() {
+          std::vector<std::optional<std::array<uint32_t, 4>>> result;
+          for (size_t b = 0; b < blobs.size(); ++b) {
+            result.push_back(ReferenceQuadIndices(line_fit_points[b],
+                                                  errors[b].filtered_errs,
+                                                  tag_detector_->qtp, math));
+          }
+          return result;
+        });
+    // fit_quads_cuda_ has the valid quads, in blob order.
+    size_t num_quads = 0;
+    for (size_t b = 0; b < blobs.size(); ++b) {
+      const bool has_quad =
+          num_quads < fit_quads_cuda_.size() &&
+          fit_quads_cuda_[num_quads].blob_index == blobs[b].index;
+      ABSL_CHECK_EQ(has_quad, quads[b].has_value())
+          << ": for the quad of blob " << blobs[b].index;
+      if (!has_quad) {
+        continue;
+      }
+      const FitQuad &quad = fit_quads_cuda_[num_quads++];
+      const std::array<uint32_t, 4> &indices = *quads[b];
+      ABSL_CHECK(std::equal(indices.begin(), indices.end(), quad.indices))
+          << ": the quad of blob " << blobs[b].index << " has corners "
+          << absl::StrJoin(quad.indices, ", ") << ", expected "
+          << absl::StrJoin(indices, ", ");
+      for (int c = 0; c < 4; ++c) {
+        const LineFitMoments &moments = quad.moments[c];
+        const ReferenceMoments actual{
+            .Mx = moments.Mx,
+            .My = moments.My,
+            .Mxx = moments.Mxx,
+            .Myy = moments.Myy,
+            .Mxy = moments.Mxy,
+            .W = moments.W,
+            .N = moments.N,
+        };
+        const ReferenceMoments expected =
+            RangeMoments(line_fit_points[b], indices[c], indices[(c + 1) % 4]);
+        ABSL_CHECK(actual == expected)
+            << ": side " << c << " of the quad of blob " << blobs[b].index
+            << " is " << actual << ", expected " << expected;
+      }
+    }
+    ABSL_CHECK_EQ(num_quads, fit_quads_cuda_.size())
+        << ": quads for blobs with no points";
+    ABSL_LOG(INFO) << "Checked " << sorted.size() << " points in "
+                   << blobs.size() << " blobs and " << num_quads
+                   << " quads exactly.  Points sharing an angle with the one "
+                      "before: "
+                   << ties.rank_sorted << " rank sorted, " << ties.radix_sorted
+                   << " radix sorted, of which " << ties.warp_starts
+                   << " start a warp's points and " << ties.chunk_starts
+                   << " a chunk's.";
+    return ties;
+  }
+
+  // CheckQuadFitsExactly() on its own, for images too unlike a real frame to
+  // compare with aprilrobotics.
+  AngleTies CheckQuadFitsExactly() const {
+    const std::vector<IndexPoint> selected_blobs =
+        CheckCudaExtents(CudaGroupedPoints(sorted_union_marker_pair_),
+                         extents_cuda_)
+            .second;
+    CheckFilteredCudaPoints(selected_blobs, selected_blobs_cuda_);
+    return CheckQuadFitsExactly(selected_blobs);
   }
 
   // Tests that the cuda sorted point list matches C++.
@@ -2008,6 +2607,9 @@ class CudaAprilTagDetector {
     // And that the filtered list is reasonable.
     CheckFilteredCudaPoints(selected_blobs, selected_blobs_cuda_);
 
+    // And that everything from there to the quad fits is exact.
+    CheckQuadFitsExactly(selected_blobs);
+
     // And that they sorted right too.
     CheckSortedFilteredCudaPoints(slope_sorted_expected_grouped_points,
                                   selected_quads, selected_blobs,
@@ -2264,6 +2866,7 @@ class CudaAprilTagDetector {
   int num_compressed_union_marker_pair_ = 0;
   int num_quads_ = 0;
   std::vector<QuadCorners> fit_quads_;
+  std::vector<FitQuad> fit_quads_cuda_;
 
   GpuDetector gpu_detector_;
 
@@ -3394,6 +3997,49 @@ TEST(LargeImageTest, Detect1920x1200) {
 
   apriltag_detector_destroy(tag_detector);
   tag16h5_destroy(tag_family);
+}
+
+// Tests the quad fits exactly on points with the same angle, which real frames
+// have few of, and fewer where FixAngleTies() hands one warp's or chunk's
+// points to the next.  Each black bar has a white slot cut into it from its
+// left end, and the slot's top edge is the middle row of the bar's outline.
+// Far from the bar's center, the points along that edge are so nearly in line
+// with it that they share angles in runs, which mix diagonal and straight
+// neighbours out of the order the GPU finds them in.  The bars' widths put
+// their runs at various positions in their sorted points.
+TEST(AngleTieTest, MatchesReference) {
+  constexpr int kWidth = 1600;
+  constexpr int kHeight = 1304;
+  cv::Mat image(kHeight, kWidth, CV_8UC2, cv::Scalar(255, 128));
+  // Sets the luma of decimated pixels [x0, x1) x [y0, y1).
+  const auto fill = [&image](int x0, int x1, int y0, int y1, uint8_t luma) {
+    for (int y = 2 * y0; y < 2 * y1; ++y) {
+      for (int x = 2 * x0; x < 2 * x1; ++x) {
+        image.at<cv::Vec2b>(y, x)[0] = luma;
+      }
+    }
+  };
+  constexpr int kBarHeight = 30;
+  constexpr int kBars = 13;
+  for (int bar = 0; bar < kBars; ++bar) {
+    const int width = 260 + 36 * bar;
+    constexpr int x0 = 50;
+    const int y0 = 6 + 50 * bar;
+    fill(x0, x0 + width, y0, y0 + kBarHeight, 0);
+    fill(x0, x0 + width / 2 - 50, y0 + kBarHeight / 2, y0 + kBarHeight / 2 + 2,
+         255);
+  }
+
+  CudaAprilTagDetector cuda_detector(kWidth, kHeight);
+  for (const bool stage_timing : {false, true}) {
+    SCOPED_TRACE(stage_timing ? "stage timing" : "graph");
+    cuda_detector.set_stage_timing(stage_timing);
+    cuda_detector.DetectGPU(image);
+    const AngleTies ties = cuda_detector.CheckQuadFitsExactly();
+    EXPECT_GT(ties.radix_sorted, 0u);
+    EXPECT_GT(ties.warp_starts, 0u);
+    EXPECT_GT(ties.chunk_starts, 0u);
+  }
 }
 
 // The labels LabelImage gives a thresholded image, and the size at each label.
