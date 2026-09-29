@@ -35,7 +35,7 @@ ABSL_FLAG(bool, display_undistorted, false,
 namespace frc::vision {
 namespace {
 
-void Main() {
+int Main() {
   aos::FlatbufferDetachedBuffer<aos::Configuration> config =
       aos::configuration::ReadConfig(absl::GetFlag(FLAGS_config));
 
@@ -72,7 +72,7 @@ void Main() {
     event_loop.Run();
   }
 
-  calibrator.MaybeCalibrate();
+  return calibrator.MaybeCalibrate().ok() ? 0 : 1;
 }
 
 }  // namespace
@@ -80,5 +80,5 @@ void Main() {
 
 int main(int argc, char **argv) {
   aos::InitGoogle(&argc, &argv);
-  frc::vision::Main();
+  return frc::vision::Main();
 }

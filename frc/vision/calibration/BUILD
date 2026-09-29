@@ -62,6 +62,7 @@ cc_library(
     ],
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
+        ":calibration_validator",
         "//aos/events:event_loop",
         "//frc/control_loops/drivetrain:improved_down_estimator",
         "//frc/vision:vision_fbs",
@@ -73,6 +74,8 @@ cc_library(
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/log:die_if_null",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@eigen",
     ],
@@ -134,6 +137,7 @@ cc_test(
     ],
     data = [
         ":intrinsics_test_config",
+        "//frc/vision:calibration_files",
         "//frc/vision/test_calib_files",
         "@intrinsic_calibration_test_images",
     ],
@@ -142,14 +146,18 @@ cc_test(
         ":intrinsics_calibration",
         ":intrinsics_calibration_lib",
         "//aos:init",
+        "//aos:json_to_flatbuffer",
         "//aos/events:shm_event_loop",
         "//aos/events:simulated_event_loop",
         "//aos/testing:googletest",
         "//aos/testing:path",
         "//aos/testing:random_seed",
+        "//aos/testing:tmpdir",
         "//aos/util:math",
+        "//frc/vision:calibration_fbs",
         "//third_party:opencv",
         "@bazel_tools//tools/cpp/runfiles",
+        "@com_google_absl//absl/status",
     ],
 )
 
