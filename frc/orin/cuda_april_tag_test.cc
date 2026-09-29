@@ -2436,18 +2436,22 @@ TEST_F(AprilDetectionTest, KeepIntermediatesSameQuads) {
       const std::vector<FitQuad> fit_quads = gpu_detector.CopyFitQuads();
       if (!expected.has_value()) {
         expected = fit_quads;
-        // Blobs of up to 256 points stay in shared memory, those of up to
-        // 2048 don't, and bigger ones get a kernel of their own.
-        size_t shared = 0, global = 0, big = 0;
+        // Tiny blobs get a kernel of their own, small ones another, which
+        // keeps the smallest of them in shared memory, and bigger ones a third.
+        size_t tiny = 0, shared = 0, global = 0, big = 0;
         for (const auto &extents : gpu_detector.CopySelectedExtents()) {
           const uint32_t count = extents.value.count;
-          shared += count > 0 && count <= 256;
-          global += count > 256 && count <= 2048;
-          big += count > 2048;
+          tiny += count > 0 && count <= kMaxTinyBlobPoints;
+          shared += count > kMaxTinyBlobPoints && count <= kMaxSharedBlobPoints;
+          global +=
+              count > kMaxSharedBlobPoints && count <= kMaxSmallBlobPoints;
+          big += count > kMaxSmallBlobPoints;
         }
-        ABSL_LOG(INFO) << "Blobs in shared memory: " << shared
+        ABSL_LOG(INFO) << "Tiny blobs: " << tiny
+                       << ", in shared memory: " << shared
                        << ", global: " << global << ", big: " << big
                        << ", quads: " << fit_quads.size();
+        EXPECT_GT(tiny, 0u);
         EXPECT_GT(shared, 0u);
         EXPECT_GT(global, 0u);
         EXPECT_GT(big, 0u);

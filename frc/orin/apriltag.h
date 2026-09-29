@@ -326,9 +326,10 @@ class GpuDetector {
  private:
   // Enqueues everything from labeling the thresholded image to fitting quads
   // on stream_, recording the stage events if record_stages.  With
-  // fork_big_blobs, the big-blob quad fit runs on big_blob_stream_, parallel
-  // to the small-blob quad fits.
-  void EnqueueQuadFitting(bool record_stages, bool fork_big_blobs);
+  // fork_quad_fits, the big-blob quad fit runs on big_blob_stream_ and the
+  // tiny-blob quad fits on tiny_blob_stream_, parallel to the small-blob quad
+  // fits.
+  void EnqueueQuadFitting(bool record_stages, bool fork_quad_fits);
 
   void UpdateFitQuads();
 
@@ -396,6 +397,11 @@ class GpuDetector {
   CudaStream big_blob_stream_{big_blob_priority_};
   CudaEvent fork_big_blobs_{cudaEventDisableTiming};
   CudaEvent join_big_blobs_{cudaEventDisableTiming};
+  // The tiny-blob quad fits' branch of frame_graph_, at the default priority,
+  // and the events which fork it from stream_ and join it back.
+  CudaStream tiny_blob_stream_{0};
+  CudaEvent fork_tiny_blobs_{cudaEventDisableTiming};
+  CudaEvent join_tiny_blobs_{cudaEventDisableTiming};
 
   // Events between the steps.  Detect() always records the events it waits
   // on, start_ for GPU time or stage timing, and the rest only for stage
@@ -414,6 +420,8 @@ class GpuDetector {
   CudaEvent after_rank_pairs_;
   CudaEvent after_pair_extents_;
   CudaEvent after_scatter_;
+  CudaEvent after_blob_work_list_;
+  CudaEvent after_tiny_blob_quads_;
   CudaEvent after_small_blob_quads_;
   CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
@@ -437,7 +445,7 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 14> stages_{{
+  const std::array<Stage, 16> stages_{{
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
       {"Memcpy Gray", &after_threshold_, &after_memcpy_gray_},
@@ -451,7 +459,9 @@ class GpuDetector {
       {"Rank pairs", &after_bin_pairs_, &after_rank_pairs_},
       {"Pair extents", &after_rank_pairs_, &after_pair_extents_},
       {"Scatter selected", &after_pair_extents_, &after_scatter_},
-      {"Small blob quads", &after_scatter_, &after_small_blob_quads_},
+      {"Blob work list", &after_scatter_, &after_blob_work_list_},
+      {"Tiny blob quads", &after_blob_work_list_, &after_tiny_blob_quads_},
+      {"Small blob quads", &after_tiny_blob_quads_, &after_small_blob_quads_},
       {"Big blob quads", &after_small_blob_quads_, &after_quad_fit_},
   }};
 
@@ -475,11 +485,12 @@ class GpuDetector {
   // stream_ is idle: the NEON threshold at the start of Detect() and the
   // Copy*To methods after it returns.  Every kernel that touches them runs on
   // stream_, or in frame_graph_, which launches there.  That includes the
-  // big-blob quad fit on frame_graph_'s big_blob_stream_ branch, which reads
-  // the decimated image.  CUDA leaves reads from a stream the memory isn't
-  // attached to undefined on a GPU without concurrent managed access, like
-  // the Orin's, but a microtest there found a graph branch reading memory
-  // attached to the launch stream always saw the CPU's latest writes.
+  // big- and tiny-blob quad fits on frame_graph_'s big_blob_stream_ and
+  // tiny_blob_stream_ branches, which read the decimated image.  CUDA leaves
+  // reads from a stream the memory isn't attached to undefined on a GPU without
+  // concurrent managed access, like the Orin's, but a microtest there found a
+  // graph branch reading memory attached to the launch stream always saw the
+  // CPU's latest writes.
   std::optional<GpuMemory<uint8_t>> decimated_image_gpu_;
   std::optional<GpuMemory<uint8_t>> thresholded_image_gpu_;
   std::optional<UnifiedMemory<uint8_t>> decimated_image_unified_;

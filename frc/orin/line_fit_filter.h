@@ -131,8 +131,10 @@ struct FitQuad {
 // The selected blobs with points, split by which kernel fits their quads, each
 // list in blob order.
 struct BlobWorkList {
+  uint32_t num_tiny_blobs;
   uint32_t num_small_blobs;
   uint32_t num_big_blobs;
+  uint16_t tiny_blobs[IndexPoint::kMaxBlobs];
   uint16_t small_blobs[IndexPoint::kMaxBlobs];
   uint16_t big_blobs[IndexPoint::kMaxBlobs];
 };
@@ -140,6 +142,20 @@ struct BlobWorkList {
 // The most points a blob can have, since FitBigBlobQuads() sorts each blob in
 // one block's shared memory.
 constexpr uint32_t kMaxBlobPoints = 6144;
+
+// One block fits each selected blob's quad.  Blobs with up to
+// kMaxTinyBlobPoints points get a FitTinyBlobQuads block each, those with up to
+// kMaxSmallBlobPoints a FitSmallBlobQuads block each, and the few bigger ones
+// share the FitBigBlobQuads blocks.  Most blobs are tiny, and a block with a
+// thread for each of their points leaves room for twice as many blocks as a
+// small blob's.
+constexpr uint32_t kMaxTinyBlobPoints = 128;
+constexpr uint32_t kMaxSmallBlobPoints = 2048;
+// FitSmallBlobQuads keeps the sorted points, line fit points, and errors of
+// blobs with up to this many points in shared memory from the sort to the quad
+// fit, and bigger ones use BlobQuadFitArgs' buffers.  4 blocks still fit in an
+// Orin SM's shared memory, and bigger limits measured no faster.
+constexpr uint32_t kMaxSharedBlobPoints = 256;
 
 // What the blob quad fits read, and where they write.
 struct BlobQuadFitArgs {
@@ -179,16 +195,17 @@ struct BlobQuadFitArgs {
 };
 
 // Lists the selected blobs with points in work_list, and marks every other
-// blob's quad fit invalid.  FitSmallBlobQuads() and FitBigBlobQuads() read the
-// list, so this goes first.
+// blob's quad fit invalid.  The quad fits read the list, so this goes first.
 void ListBlobs(const BlobQuadFitArgs &args, CudaStream *stream);
 
 // Fits a quad to each blob on the work list, the way aprilrobotics' fit_quad
 // does: sorts its points by angle around it, fits a line around each point,
 // filters the fits' errors, and fits the quad from the best nmaxima peaks of
-// the filtered errors.  FitSmallBlobQuads() covers the small blobs, with a
-// block for each, and FitBigBlobQuads() the few big ones.  The two write
-// different blobs, so they can run in parallel.
+// the filtered errors.  FitTinyBlobQuads() covers the tiny blobs and
+// FitSmallBlobQuads() the small ones, with a block for each, and
+// FitBigBlobQuads() the few big ones.  The three write different blobs, so they
+// can run in parallel.
+void FitTinyBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream);
 void FitSmallBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream);
 void FitBigBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream);
 

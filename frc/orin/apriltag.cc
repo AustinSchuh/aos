@@ -182,7 +182,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
                 thresholded_image_device_,
                 tag_detector_->qtp.min_white_black_diff, &stream_);
           }
-          EnqueueQuadFitting(/*record_stages=*/false, /*fork_big_blobs=*/true);
+          EnqueueQuadFitting(/*record_stages=*/false, /*fork_quad_fits=*/true);
         },
         /*use_node_priority=*/true);
     // The big-blob quad fit's overlap with the small-blob quad fits rests on
@@ -859,7 +859,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   if (use_graph) {
     frame_graph_->Launch(&stream_);
   } else {
-    EnqueueQuadFitting(stage_timing_, /*fork_big_blobs=*/false);
+    EnqueueQuadFitting(stage_timing_, /*fork_quad_fits=*/false);
   }
   // The host reads the quads where the quad fits write them, so this is
   // Detect()'s only wait on the GPU.
@@ -938,7 +938,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   }
 }
 
-void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
+void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_quad_fits) {
   // Records event on stream if timing every stage.
   auto record_stage = [record_stages](CudaEvent &event, CudaStream *stream) {
     if (record_stages) {
@@ -1054,7 +1054,8 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
   };
   ListBlobs(blob_quad_fit_args, &stream_);
   MaybeCheckAndSynchronize("ListBlobs");
-  if (fork_big_blobs) {
+  record_stage(after_blob_work_list_, &stream_);
+  if (fork_quad_fits) {
     // Each big-blob block needs a whole SM's registers, so after the
     // small-blob quad fits, the few of them would leave most SMs idle.  On a
     // branch of its own, the big-blob quad fit overlaps the small-blob ones
@@ -1065,10 +1066,21 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
     fork_big_blobs_.Record(&stream_);
     big_blob_stream_.Wait(&fork_big_blobs_);
     FitBigBlobQuads(blob_quad_fit_args, &big_blob_stream_);
+    // The tiny-blob quad fits get a branch too, at the default priority, so
+    // neither they nor the small-blob ones wait for the other kernel's last
+    // wave to drain.  They write disjoint blobs as well.
+    fork_tiny_blobs_.Record(&stream_);
+    tiny_blob_stream_.Wait(&fork_tiny_blobs_);
+    FitTinyBlobQuads(blob_quad_fit_args, &tiny_blob_stream_);
     FitSmallBlobQuads(blob_quad_fit_args, &stream_);
+    join_tiny_blobs_.Record(&tiny_blob_stream_);
+    stream_.Wait(&join_tiny_blobs_);
     join_big_blobs_.Record(&big_blob_stream_);
     stream_.Wait(&join_big_blobs_);
   } else {
+    FitTinyBlobQuads(blob_quad_fit_args, &stream_);
+    MaybeCheckAndSynchronize("FitTinyBlobQuads");
+    record_stage(after_tiny_blob_quads_, &stream_);
     FitSmallBlobQuads(blob_quad_fit_args, &stream_);
     MaybeCheckAndSynchronize("FitSmallBlobQuads");
     record_stage(after_small_blob_quads_, &stream_);

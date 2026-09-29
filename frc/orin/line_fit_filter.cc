@@ -120,13 +120,10 @@ struct SumLineFitPoints {
   }
 };
 
-// One block fits each selected blob's quad.  Blobs with up to
-// kMaxSmallBlobPoints points get a FitSmallBlobQuads block each, and the few
-// bigger ones share the FitBigBlobQuads blocks.
-constexpr uint32_t kMaxSmallBlobPoints = 2048;
 // Blobs with up to this many points are sorted by ranking every point against
 // the others, which takes fewer steps than a radix sort's passes.
 constexpr uint32_t kMaxRankSortPoints = 256;
+constexpr int kTinyBlobThreads = kMaxTinyBlobPoints;
 constexpr int kSmallBlobThreads = 256;
 constexpr int kBigBlobThreads = 512;
 constexpr int kBigBlobPointsPerThread = 12;
@@ -137,7 +134,7 @@ constexpr int kWorkListThreads = 1024;
 constexpr int kThetaBits = 28;
 
 static_assert(IndexPoint::kMaxBlobs % kWorkListThreads == 0);
-// BuildBlobWorkList counts both kinds of blob in one 32 bit sum.
+// BuildBlobWorkList counts the three kinds of blob in 16 bit fields of one sum.
 static_assert(IndexPoint::kMaxBlobs < (1 << 16));
 
 // Lists the selected blobs with points, split by size, in blob order, and
@@ -145,13 +142,15 @@ static_assert(IndexPoint::kMaxBlobs < (1 << 16));
 __global__ void __launch_bounds__(kWorkListThreads)
     BuildBlobWorkList(BlobQuadFitArgs args) {
   constexpr int kBlobsPerThread = IndexPoint::kMaxBlobs / kWorkListThreads;
-  typedef cub::BlockScan<uint32_t, kWorkListThreads> BlockScan;
+  typedef cub::BlockScan<uint64_t, kWorkListThreads> BlockScan;
   __shared__ typename BlockScan::TempStorage scan_storage;
 
-  // Small blobs count in the low 16 bits, and big ones in the high 16.
-  constexpr uint32_t kSmallBlob = 1;
-  constexpr uint32_t kBigBlob = 1 << 16;
-  uint32_t kind[kBlobsPerThread];
+  // Tiny blobs count in bits 0-15, small ones in bits 16-31, and big ones in
+  // bits 32-47.
+  constexpr uint64_t kTinyBlob = 1;
+  constexpr uint64_t kSmallBlob = uint64_t{1} << 16;
+  constexpr uint64_t kBigBlob = uint64_t{1} << 32;
+  uint64_t kind[kBlobsPerThread];
 #pragma unroll
   for (int i = 0; i < kBlobsPerThread; ++i) {
     const uint32_t blob = threadIdx.x * kBlobsPerThread + i;
@@ -160,27 +159,32 @@ __global__ void __launch_bounds__(kWorkListThreads)
       kind[i] = 0;
       // No quad fit block sees it.
       args.fit_quad_valid[blob] = false;
+    } else if (count <= kMaxTinyBlobPoints) {
+      kind[i] = kTinyBlob;
     } else if (count <= kMaxSmallBlobPoints) {
       kind[i] = kSmallBlob;
     } else {
       kind[i] = kBigBlob;
     }
   }
-  uint32_t position[kBlobsPerThread];
-  uint32_t total;
+  uint64_t position[kBlobsPerThread];
+  uint64_t total;
   BlockScan(scan_storage).ExclusiveSum(kind, position, total);
 #pragma unroll
   for (int i = 0; i < kBlobsPerThread; ++i) {
     const uint16_t blob = threadIdx.x * kBlobsPerThread + i;
-    if (kind[i] == kSmallBlob) {
-      args.work_list->small_blobs[position[i] & 0xffff] = blob;
+    if (kind[i] == kTinyBlob) {
+      args.work_list->tiny_blobs[position[i] & 0xffff] = blob;
+    } else if (kind[i] == kSmallBlob) {
+      args.work_list->small_blobs[(position[i] >> 16) & 0xffff] = blob;
     } else if (kind[i] == kBigBlob) {
-      args.work_list->big_blobs[position[i] >> 16] = blob;
+      args.work_list->big_blobs[(position[i] >> 32) & 0xffff] = blob;
     }
   }
   if (threadIdx.x == 0) {
-    args.work_list->num_small_blobs = total & 0xffff;
-    args.work_list->num_big_blobs = total >> 16;
+    args.work_list->num_tiny_blobs = total & 0xffff;
+    args.work_list->num_small_blobs = (total >> 16) & 0xffff;
+    args.work_list->num_big_blobs = (total >> 32) & 0xffff;
   }
 }
 
@@ -412,6 +416,17 @@ __device__ __forceinline__ void RadixSortAndScanBlob(
                                            sorted_points, line_fit_points);
 }
 
+// Shared memory for RankSortAndScanBlob.
+template <int kThreads>
+struct RankSortStorage {
+  union {
+    uint64_t rank_keys[kThreads];
+    typename LineFitPointScan<kThreads>::TempStorage scan;
+  } temp;
+  // The ranked points' keys, in sorted order.
+  uint64_t ranked_points[kThreads];
+};
+
 struct SmallBlobStorage {
   union {
     typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 2,
@@ -420,21 +435,20 @@ struct SmallBlobStorage {
                                  uint32_t>::TempStorage radix_sort4;
     typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 8,
                                  uint32_t>::TempStorage radix_sort8;
-    uint64_t rank_keys[kMaxRankSortPoints];
     typename LineFitPointScan<kSmallBlobThreads>::TempStorage scan;
+    RankSortStorage<kSmallBlobThreads> rank_sort;
   } temp;
-  // The ranked points' keys, in sorted order.
-  uint64_t ranked_points[kMaxRankSortPoints];
 };
 
 // Sorts a blob's points by angle by ranking each against the others, then
 // writes them and their line fit points.  Points with the same angle rank by
-// AngleTieKey().
+// AngleTieKey().  The blob has at most kThreads points.
+template <int kThreads>
 __device__ __forceinline__ void RankSortAndScanBlob(
-    SmallBlobStorage &storage, uint32_t blob_index, const IndexPoint *points,
-    uint32_t count, const TransformLineFitPoint &transform,
-    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
-  static_assert(kSmallBlobThreads == kMaxRankSortPoints);
+    RankSortStorage<kThreads> &storage, uint32_t blob_index,
+    const IndexPoint *points, uint32_t count,
+    const TransformLineFitPoint &transform, IndexPoint *sorted_points,
+    LineFitPoint *line_fit_points) {
   const bool has_point = threadIdx.x < count;
   // Every key is unique, so the ranks are too.
   uint64_t key = 0;
@@ -461,9 +475,9 @@ __device__ __forceinline__ void RankSortAndScanBlob(
   if (has_point) {
     sorted_point.key = storage.ranked_points[threadIdx.x];
   }
-  WriteSortedChunk<kSmallBlobThreads>(storage.temp.scan, prefix, sorted_point,
-                                      threadIdx.x, count, transform,
-                                      sorted_points, line_fit_points);
+  WriteSortedChunk<kThreads>(storage.temp.scan, prefix, sorted_point,
+                             threadIdx.x, count, transform, sorted_points,
+                             line_fit_points);
 }
 
 union BigBlobStorage {
@@ -1088,12 +1102,6 @@ __device__ __forceinline__ void FitBlobQuad(
                         args.fit_quad_valid);
 }
 
-// Blobs with up to this many points keep their sorted points, line fit
-// points, and errors in shared memory from the sort to the quad fit, and
-// bigger ones use args' buffers.  4 blocks still fit in an Orin SM's shared
-// memory, and bigger limits measured no faster.
-constexpr uint32_t kMaxSharedBlobPoints = 256;
-
 struct SmallBlobQuadStorage {
   union {
     SmallBlobStorage sort;
@@ -1128,8 +1136,11 @@ __global__ void __launch_bounds__(kSmallBlobThreads, 4)
   LineFitPoint *line_fit_points =
       in_shared ? storage.line_fit_points : args.line_fit_points + offset;
   if (count <= kMaxRankSortPoints) {
-    RankSortAndScanBlob(storage.temp.sort, blob_index, points, count, transform,
-                        sorted_points, line_fit_points);
+    // Each thread ranks one point.
+    static_assert(kSmallBlobThreads == kMaxRankSortPoints);
+    RankSortAndScanBlob<kSmallBlobThreads>(storage.temp.sort.temp.rank_sort,
+                                           blob_index, points, count, transform,
+                                           sorted_points, line_fit_points);
   } else if (count <= 2 * kSmallBlobThreads) {
     RadixSortAndScanBlob<kSmallBlobThreads, 2, true>(
         storage.temp.sort.temp.radix_sort2, storage.temp.sort.temp.scan,
@@ -1161,6 +1172,50 @@ __global__ void __launch_bounds__(kSmallBlobThreads, 4)
       storage.temp.peak_keys, std::size(storage.temp.peak_keys));
 }
 
+struct TinyBlobQuadStorage {
+  union {
+    RankSortStorage<kTinyBlobThreads> sort;
+    // Two neighboring points are never both peaks.
+    uint64_t peak_keys[kMaxTinyBlobPoints / 2 + 1];
+  } temp;
+  cub::Uninitialized<IndexPoint[kMaxTinyBlobPoints]> sorted_points;
+  LineFitPoint line_fit_points[kMaxTinyBlobPoints];
+  double errs[kMaxTinyBlobPoints];
+  double filtered_errs[kMaxTinyBlobPoints];
+  FitBlobQuadStorage<kTinyBlobThreads> fit;
+};
+
+// Fits the quad of each tiny blob in the work list, one blob per block, with a
+// thread for each point.  Everything but the outputs stays in shared memory.
+__global__ void __launch_bounds__(kTinyBlobThreads, 8)
+    FitTinyBlobQuadsKernel(BlobQuadFitArgs args,
+                           TransformLineFitPoint transform) {
+  __shared__ TinyBlobQuadStorage storage;
+  if (blockIdx.x >= args.work_list->num_tiny_blobs) {
+    return;
+  }
+  const uint32_t blob_index = args.work_list->tiny_blobs[blockIdx.x];
+  const MinMaxExtents extents = args.selected_extents[blob_index].value;
+  const uint32_t count = extents.count;
+  const uint32_t offset = extents.starting_offset;
+  IndexPoint *sorted_points = storage.sorted_points.Alias();
+  RankSortAndScanBlob<kTinyBlobThreads>(
+      storage.temp.sort, blob_index, args.selected_blobs + offset, count,
+      transform, sorted_points, storage.line_fit_points);
+  // WriteSortedChunk ends with a barrier, so every sorted point and line fit
+  // point is written.
+  if (args.keep_intermediates) {
+    for (uint32_t i = threadIdx.x; i < count; i += kTinyBlobThreads) {
+      args.sorted_points[offset + i] = sorted_points[i];
+      args.line_fit_points[offset + i] = storage.line_fit_points[i];
+    }
+  }
+  FitBlobQuad<kTinyBlobThreads>(storage.fit, args, blob_index, count, offset,
+                                storage.line_fit_points, storage.errs,
+                                storage.filtered_errs, storage.temp.peak_keys,
+                                std::size(storage.temp.peak_keys));
+}
+
 struct BigBlobQuadStorage {
   union {
     BigBlobStorage sort;
@@ -1170,10 +1225,12 @@ struct BigBlobQuadStorage {
   FitBlobQuadStorage<kBigBlobThreads> fit;
 };
 // Kernels get at most 48 KiB of static shared memory.
+static_assert(sizeof(TinyBlobQuadStorage) <= 48 * 1024);
 static_assert(sizeof(SmallBlobQuadStorage) <= 48 * 1024);
 static_assert(sizeof(BigBlobQuadStorage) <= 48 * 1024);
 // An Orin SM has 164 KiB of shared memory, and each block also takes 1 KiB for
 // the system.
+static_assert(8 * (sizeof(TinyBlobQuadStorage) + 1024) <= 164 * 1024);
 static_assert(4 * (sizeof(SmallBlobQuadStorage) + 1024) <= 164 * 1024);
 
 // Fits the quad of each big blob in the work list, looping over the blobs.
@@ -1208,6 +1265,16 @@ __global__ void __launch_bounds__(kBigBlobThreads)
 
 void ListBlobs(const BlobQuadFitArgs &args, CudaStream *stream) {
   BuildBlobWorkList<<<1, kWorkListThreads, 0, stream->get()>>>(args);
+}
+
+void FitTinyBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream) {
+  ABSL_CHECK_EQ(args.nmaxima, kNMaxima)
+      << ": Kernel is compiled and optimized for a fixed nmaxima, please "
+         "recompile if you want to change it.";
+  FitTinyBlobQuadsKernel<<<IndexPoint::kMaxBlobs, kTinyBlobThreads, 0,
+                           stream->get()>>>(
+      args, TransformLineFitPoint(args.decimated_image, args.decimated_width,
+                                  args.decimated_height));
 }
 
 void FitSmallBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream) {
