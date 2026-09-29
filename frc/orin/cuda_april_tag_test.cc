@@ -1314,7 +1314,8 @@ class CudaAprilTagDetector {
       size_t found_blobs = 0;
       ABSL_CHECK_EQ(selected_extents_cuda[i].value.starting_offset,
                     sorted_point_index);
-      while (sorted_selected_blobs_cuda[sorted_point_index].blob_index() == i) {
+      while (sorted_point_index < sorted_selected_blobs_cuda.size() &&
+             sorted_selected_blobs_cuda[sorted_point_index].blob_index() == i) {
         ++found_blobs;
         ++sorted_point_index;
       }
