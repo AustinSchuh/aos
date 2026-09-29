@@ -145,6 +145,27 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "decode_pool",
+    srcs = ["decode_pool.cc"],
+    hdrs = ["decode_pool.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/log:absl_check",
+    ],
+)
+
+cc_test(
+    name = "decode_pool_test",
+    srcs = ["decode_pool_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":decode_pool",
+        "//aos/testing:googletest",
+    ],
+)
+
 cuda_library(
     name = "apriltag",
     srcs = [
@@ -171,6 +192,7 @@ cuda_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cuda",
+        ":decode_pool",
         ":threshold",
         "//aos/time",
         "//frc/vision:calibration_fbs",

@@ -95,7 +95,8 @@ ABSL_FLAG(uint32_t, min_white_black_diff, 20,
           "Matches --min_white_black_diff on the robot.");
 ABSL_FLAG(uint32_t, min_cluster_pixels, 25,
           "Matches --min_cluster_pixels on the robot.");
-ABSL_FLAG(int32_t, nthreads, 6, "Decode threads per detector.");
+ABSL_FLAG(int32_t, nthreads, 6,
+          "Decode threads per detector, counting the one which runs it.");
 ABSL_FLAG(bool, stage_timing, false,
           "Report the time each GPU stage takes.  The stages then run one "
           "after another on one stream instead of as the frame's CUDA graph, "
@@ -537,7 +538,6 @@ DetectorResults RunDetector(
   apriltag_detector_t *tag_detector = apriltag_detector_create();
   apriltag_detector_add_family_bits(tag_detector, tag_family, 1);
   tag_detector->nthreads = absl::GetFlag(FLAGS_nthreads);
-  tag_detector->wp = workerpool_create(tag_detector->nthreads);
   tag_detector->qtp.min_white_black_diff =
       absl::GetFlag(FLAGS_min_white_black_diff);
   tag_detector->qtp.min_cluster_pixels =
@@ -664,7 +664,9 @@ DetectorResults RunDetector(
           zarray_get(detections, j, &det);
           formatted.push_back(FormatDetection(det));
         }
-        // Decode threads finish in any order, so sort for a stable result.
+        // Detections() comes out in a fixed order, but the --compare_to
+        // baselines come from the original detector, whose decode threads
+        // finished in any order, so the detections are compared sorted.
         std::sort(formatted.begin(), formatted.end());
         results.detections[frame.name] = std::move(formatted);
       }

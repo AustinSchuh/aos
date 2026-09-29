@@ -41,6 +41,9 @@ ABSL_FLAG(uint32_t, min_white_black_diff, 5,
           "edge.");
 ABSL_FLAG(uint32_t, min_cluster_pixels, 25,
           "Minimum number of pixels in a cluster.");
+ABSL_FLAG(int32_t, decode_threads, 6,
+          "Threads which decode tags, counting the one which runs the "
+          "detector.");
 
 // Set max age on image for processing at 20 ms.  For 60Hz, we should be
 // processing at least every 16.7ms
@@ -110,8 +113,7 @@ apriltag_detector_t *ApriltagDetector::MakeTagDetector(
 
   apriltag_detector_add_family_bits(tag_detector, tag_family, 1);
 
-  tag_detector->nthreads = 6;
-  tag_detector->wp = workerpool_create(tag_detector->nthreads);
+  tag_detector->nthreads = absl::GetFlag(FLAGS_decode_threads);
   tag_detector->qtp.min_white_black_diff =
       absl::GetFlag(FLAGS_min_white_black_diff);
   tag_detector->qtp.min_cluster_pixels =

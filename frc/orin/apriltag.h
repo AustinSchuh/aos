@@ -12,6 +12,7 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "frc/orin/cuda.h"
+#include "frc/orin/decode_pool.h"
 #include "frc/orin/gpu_image.h"
 #include "frc/orin/line_fit_filter.h"
 #include "frc/orin/points.h"
@@ -147,6 +148,8 @@ class GpuDetector {
 
   const std::vector<QuadCorners> &FitQuads() const;
 
+  // The last Detect()'s detections, sorted by id, and by quad within an id, so
+  // the same image always gives the same order.
   const zarray_t *Detections() const { return detections_; }
 
   // Records a CUDA event between every GPU stage of Detect() so StageTimesMs()
@@ -309,7 +312,9 @@ class GpuDetector {
 
   void DecodeTags();
 
-  static void QuadDecodeTask(void *_u);
+  // Refines and decodes quad_corners_host_[quad_index] from image, adding what
+  // it decodes to detections.
+  void DecodeQuad(size_t quad_index, image_u8_t *image, zarray_t *detections);
 
   // Creates a GPU image wrapped around the provided memory.
   template <typename T>
@@ -536,6 +541,14 @@ class GpuDetector {
   zarray_t *poly1_;
 
   zarray_t *detections_ = nullptr;
+
+  // Decodes the quads on the thread calling Detect() and its helpers.
+  DecodePool decode_pool_;
+  // Where each decode thread's quad_decode_index() adds detections.
+  std::vector<zarray_t *> decode_thread_detections_;
+  // What each quad decoded to, one slot per tag family, in quad order.  Slots
+  // which decoded nothing are nullptr.
+  std::vector<apriltag_detection_t *> quad_detections_;
 
   const vision::ImageFormat image_format_;
 };

@@ -59,6 +59,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       distortion_coefficients_(distortion_coefficients),
       threshold_(use_neon_ ? MakeNeonThreshold(image_format, width, height)
                            : MakeThreshold(image_format, width, height)),
+      decode_pool_(tag_detector->nthreads),
       image_format_(image_format) {
   quad_corners_host_.reserve(kMaxBlobs);
 
@@ -119,6 +120,13 @@ GpuDetector::GpuDetector(size_t width, size_t height,
 
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
   zarray_ensure_capacity(detections_, kMaxBlobs);
+  const int num_families = zarray_size(tag_detector_->tag_families);
+  for (int i = 0; i < decode_pool_.threads(); ++i) {
+    zarray_t *detections = zarray_create(sizeof(apriltag_detection_t *));
+    zarray_ensure_capacity(detections, num_families);
+    decode_thread_detections_.push_back(detections);
+  }
+  quad_detections_.reserve(kMaxBlobs * num_families);
 
   // Everything from labeling to the quad fit has the same shape every frame,
   // so capture it once, along with the GPU MONO8 threshold, which reads the
@@ -148,6 +156,9 @@ GpuDetector::~GpuDetector() {
   }
 
   zarray_destroy(detections_);
+  for (zarray_t *detections : decode_thread_detections_) {
+    zarray_destroy(detections);
+  }
   zarray_destroy(poly1_);
   zarray_destroy(poly0_);
 }

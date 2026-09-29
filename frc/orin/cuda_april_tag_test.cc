@@ -1816,7 +1816,9 @@ class CudaAprilTagDetector {
   // Checks that the GPU's sorted points, line fit points, and detections match
   // those of the last call with the same image, and saves them for the next.
   // The GPU finds points in a different order each time, and that must not
-  // reach anything past the sort by angle.
+  // reach anything past the sort by angle.  The decode threads finish quads in
+  // a different order each time too, and that must not reach the order of
+  // Detections().
   void CheckSameAsLastDetect(size_t image_index = 0) {
     std::vector<DetectionValues> detections;
     const zarray_t *gpu_detections = gpu_detector_.Detections();
@@ -1831,8 +1833,10 @@ class CudaAprilTagDetector {
       std::copy_n(det->c, 2, values.c);
       std::copy_n(&det->p[0][0], 8, &values.p[0][0]);
     }
-    // The decode threads finish in any order.
-    std::sort(detections.begin(), detections.end());
+    // Detections() is sorted by id.
+    for (size_t i = 1; i < detections.size(); ++i) {
+      ABSL_CHECK_LE(detections[i - 1].id, detections[i].id) << ": at " << i;
+    }
 
     LastDetect &last = last_detects_[image_index];
     if (!last.sorted_selected_blobs.empty()) {
@@ -3081,6 +3085,53 @@ TEST_F(SyntheticImageTest, TooManyBlobs) {
             GpuDetector::kMaxBlobs);
   EXPECT_FALSE(gpu_detector_.last_frame_overflowed());
   EXPECT_GT(gpu_detector_.NumFitQuads(), 0);
+}
+
+// Tests that Detections() comes out in the same order every time, including
+// among tags with the same id, although the decode threads finish the quads in
+// a different order each time.
+TEST_F(SyntheticImageTest, DetectionOrderRepeats) {
+  constexpr size_t kScale = 12;
+  constexpr size_t kPitch = 160;
+  constexpr int kIds[] = {0, 1, 0, 2};
+  std::vector<uint8_t> image = UniformImage(255);
+  size_t num_tags = 0;
+  for (size_t y0 = kPitch / 4; y0 + kPitch <= kHeight; y0 += kPitch) {
+    for (size_t x0 = kPitch / 4; x0 + kPitch <= kWidth; x0 += kPitch) {
+      image_u8_t *tag =
+          apriltag_to_image(tag_family_, kIds[num_tags % std::size(kIds)]);
+      for (size_t y = 0; y < tag->height * kScale; ++y) {
+        for (size_t x = 0; x < tag->width * kScale; ++x) {
+          image[2 * ((y0 + y) * kWidth + x0 + x)] =
+              tag->buf[y / kScale * tag->stride + x / kScale];
+        }
+      }
+      image_u8_destroy(tag);
+      ++num_tags;
+    }
+  }
+
+  std::vector<std::tuple<int, double, double>> first;
+  for (int i = 0; i < 5; ++i) {
+    Detect(image);
+    const zarray_t *detections = gpu_detector_.Detections();
+    std::vector<std::tuple<int, double, double>> order;
+    for (int j = 0; j < zarray_size(detections); ++j) {
+      apriltag_detection_t *det;
+      zarray_get(const_cast<zarray_t *>(detections), j, &det);
+      order.emplace_back(det->id, det->c[0], det->c[1]);
+    }
+    ASSERT_EQ(order.size(), num_tags);
+    EXPECT_TRUE(std::is_sorted(order.begin(), order.end(),
+                               [](const auto &a, const auto &b) {
+                                 return std::get<0>(a) < std::get<0>(b);
+                               }));
+    if (i == 0) {
+      first = std::move(order);
+    } else {
+      EXPECT_EQ(order, first) << ": detect " << i;
+    }
+  }
 }
 
 // The labels LabelImage gives a thresholded image, and the size at each label.
