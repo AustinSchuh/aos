@@ -1,11 +1,18 @@
+#include <algorithm>
+#include <chrono>
 #include <string>
+#include <string_view>
 
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
+#include "absl/status/status.h"
 
 #include "aos/events/shm_event_loop.h"
 #include "aos/init.h"
+#include "aos/time/time.h"
 #include "frc/orin/gpu_apriltag.h"
+#include "frc/vision/calibration/calibration_validator.h"
 #include "frc/vision/camera_constants_generated.h"
 
 ABSL_FLAG(std::string, channel, "/camera", "Channel name");
@@ -37,6 +44,59 @@ const calibration::CameraCalibration *FindCameraCalibration(
                   << " and camera number " << camera_number;
 }
 
+// Dies unless the detector can undistort every point of a width x height
+// image with calibration, or constants waives the calibration.  The build
+// validates calibrations at default_camera_stream_settings' size, but --width
+// and --height can change it, and the deployed constants can differ.
+void CheckCalibration(const CameraConstants &constants,
+                      const calibration::CameraCalibration &calibration,
+                      int width, int height) {
+  const aos::monotonic_clock::time_point start = aos::monotonic_clock::now();
+  CalibrationReport report;
+  const absl::Status status =
+      ValidateCalibration(calibration, width, height, &report);
+  const std::string_view camera_id =
+      calibration.has_camera_id() ? calibration.camera_id()->string_view()
+                                  : std::string_view();
+  ABSL_LOG(INFO) << "Validated camera_id \"" << camera_id
+                 << "\" calibration_timestamp "
+                 << calibration.calibration_timestamp() << " in "
+                 << std::chrono::duration<double, std::milli>(
+                        aos::monotonic_clock::now() - start)
+                        .count()
+                 << " ms: " << report;
+  if (status.ok()) {
+    return;
+  }
+  const bool waived =
+      constants.has_waived_calibrations() &&
+      std::any_of(constants.waived_calibrations()->begin(),
+                  constants.waived_calibrations()->end(),
+                  [&](const CalibrationId *waiver) {
+                    return (waiver->has_camera_id()
+                                ? waiver->camera_id()->string_view()
+                                : std::string_view()) == camera_id &&
+                           waiver->calibration_timestamp() ==
+                               calibration.calibration_timestamp();
+                  });
+  ABSL_CHECK(waived) << ": The calibration of camera_id \"" << camera_id
+                     << "\" (calibration_timestamp "
+                     << calibration.calibration_timestamp()
+                     << ") fails validation at " << width << "x" << height
+                     << ", so the detector can't reliably undistort all of "
+                        "the image:\n"
+                     << status.message() << "\nRecalibrate the camera at "
+                     << width << "x" << height
+                     << ", run it at the size it was calibrated at, or add "
+                        "its camera_id and calibration_timestamp to the "
+                        "robot's waived_calibrations to run it anyway.";
+  ABSL_LOG(WARNING) << "The calibration of camera_id \"" << camera_id
+                    << "\" fails validation at " << width << "x" << height
+                    << ", and runs anyway because it is in "
+                       "waived_calibrations:\n"
+                    << status.message();
+}
+
 void GpuApriltagDetector() {
   aos::FlatbufferDetachedBuffer<aos::Configuration> config =
       aos::configuration::ReadConfig(absl::GetFlag(FLAGS_config));
@@ -62,12 +122,16 @@ void GpuApriltagDetector() {
   const CameraStreamSettings *const stream_settings =
       calibration_data.constants().default_camera_stream_settings();
 
+  const uint32_t width = absl::GetFlag(FLAGS_width) > 0
+                             ? absl::GetFlag(FLAGS_width)
+                             : stream_settings->image_width();
+  const uint32_t height = absl::GetFlag(FLAGS_height) > 0
+                              ? absl::GetFlag(FLAGS_height)
+                              : stream_settings->image_height();
+  CheckCalibration(calibration_data.constants(), *calibration, width, height);
+
   frc::apriltag::ApriltagDetector detector(
-      &event_loop, absl::GetFlag(FLAGS_channel), calibration,
-      absl::GetFlag(FLAGS_width) > 0 ? absl::GetFlag(FLAGS_width)
-                                     : stream_settings->image_width(),
-      absl::GetFlag(FLAGS_height) > 0 ? absl::GetFlag(FLAGS_height)
-                                      : stream_settings->image_height());
+      &event_loop, absl::GetFlag(FLAGS_channel), calibration, width, height);
 
   detector.PinMemory(&event_loop);
 
