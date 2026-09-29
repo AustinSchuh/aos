@@ -28,15 +28,6 @@ struct QuadCorners {
   uint32_t blob_index;
 };
 
-// The selected blobs with points, split by which kernel sorts them, each list
-// in blob order.
-struct BlobWorkList {
-  uint32_t num_small_blobs;
-  uint32_t num_big_blobs;
-  uint16_t small_blobs[IndexPoint::kMaxBlobs];
-  uint16_t big_blobs[IndexPoint::kMaxBlobs];
-};
-
 // The pairs of blobs with points between them, in an open addressing hash
 // table keyed by rep01(), and the order the kernels after BinBlobPairs put
 // them in.  Between frames, every slot is empty and every count is zero.
@@ -139,9 +130,18 @@ class GpuDetector {
   // Constructs a detector, reserving space for detecting tags of the provided
   // with and height, using the provided detector options.
   //
+  // The image must fit the detector's fixed-width fields: width and height are
+  // multiples of 8 and at most 2048, and width * height is under 2^22.
+  // --use_neon also needs a MONO8 image with a width that is a multiple of 16.
+  // Blobs with more than kMaxBlobPoints boundary points are rejected as too
+  // big, so tags whose outline is longer than about 6144 pixels go undetected,
+  // which only matters when width + height is over 3072.
+  //
   // With keep_intermediates, Detect() also writes the intermediate results
   // which only the debug methods read and which it otherwise skips: the label
-  // image CopyUnionMarkersTo() copies.
+  // image CopyUnionMarkersTo() copies, and the sorted points, line fit points,
+  // errors, filtered errors, and peaks the methods from
+  // CopySortedSelectedBlobs() to CopyPeaks() copy.
   GpuDetector(size_t width, size_t height, apriltag_detector_t *tag_detector,
               CameraMatrix camera_matrix, DistCoeffs distortion_coefficients,
               vision::ImageFormat image_format,
@@ -263,22 +263,28 @@ class GpuDetector {
     return selected_blobs_device_.Copy(NumSelectedPairs());
   }
 
+  // From here to CopyPeaks(), only with keep_intermediates.
   std::vector<IndexPoint> CopySortedSelectedBlobs() const {
+    ABSL_CHECK(keep_intermediates_);
     return sorted_selected_blobs_device_.Copy(NumSelectedPairs());
   }
 
   std::vector<LineFitPoint> CopyLineFitPoints() const {
+    ABSL_CHECK(keep_intermediates_);
     return line_fit_points_device_.Copy(NumSelectedPairs());
   }
 
   std::vector<double> CopyErrors() const {
+    ABSL_CHECK(keep_intermediates_);
     return errs_device_.Copy(NumSelectedPairs());
   }
 
   std::vector<double> CopyFilteredErrors() const {
+    ABSL_CHECK(keep_intermediates_);
     return filtered_errs_device_.Copy(NumSelectedPairs());
   }
   std::vector<Peak> CopyPeaks() const {
+    ABSL_CHECK(keep_intermediates_);
     return filtered_is_local_peak_device_.Copy(NumSelectedPairs());
   }
 
@@ -320,8 +326,8 @@ class GpuDetector {
  private:
   // Enqueues everything from labeling the thresholded image to fitting quads
   // on stream_, recording the stage events if record_stages.  With
-  // fork_big_blobs, the big-blob sort runs on big_blob_stream_, parallel to
-  // the small-blob sort.
+  // fork_big_blobs, the big-blob quad fit runs on big_blob_stream_, parallel
+  // to the small-blob quad fits.
   void EnqueueQuadFitting(bool record_stages, bool fork_big_blobs);
 
   void UpdateFitQuads();
@@ -384,8 +390,8 @@ class GpuDetector {
 
   // Stream to operate on.
   CudaStream stream_;
-  // The big-blob sort's branch of frame_graph_, at the greatest priority, and
-  // the events which fork it from stream_ and join it back.
+  // The big-blob quad fit's branch of frame_graph_, at the greatest priority,
+  // and the events which fork it from stream_ and join it back.
   const int big_blob_priority_ = GreatestStreamPriority();
   CudaStream big_blob_stream_{big_blob_priority_};
   CudaEvent fork_big_blobs_{cudaEventDisableTiming};
@@ -408,9 +414,7 @@ class GpuDetector {
   CudaEvent after_rank_pairs_;
   CudaEvent after_pair_extents_;
   CudaEvent after_scatter_;
-  CudaEvent after_small_blob_sort_;
-  CudaEvent after_big_blob_sort_;
-  CudaEvent after_line_filter_;
+  CudaEvent after_small_blob_quads_;
   CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
   // EnqueueQuadFitting(false, true), captured, unless --sync is set.
@@ -433,7 +437,7 @@ class GpuDetector {
     CudaEvent *end;
   };
   // The stages StageTimesMs() reports, in order.
-  const std::array<Stage, 16> stages_{{
+  const std::array<Stage, 14> stages_{{
       {"Memcpy", &start_, &after_image_memcpy_to_device_},
       {"Threshold", &after_image_memcpy_to_device_, &after_threshold_},
       {"Memcpy Gray", &after_threshold_, &after_memcpy_gray_},
@@ -447,10 +451,8 @@ class GpuDetector {
       {"Rank pairs", &after_bin_pairs_, &after_rank_pairs_},
       {"Pair extents", &after_rank_pairs_, &after_pair_extents_},
       {"Scatter selected", &after_pair_extents_, &after_scatter_},
-      {"Small blob sort", &after_scatter_, &after_small_blob_sort_},
-      {"Big blob sort", &after_small_blob_sort_, &after_big_blob_sort_},
-      {"Error Filter", &after_big_blob_sort_, &after_line_filter_},
-      {"FitQuads", &after_line_filter_, &after_quad_fit_},
+      {"Small blob quads", &after_scatter_, &after_small_blob_quads_},
+      {"Big blob quads", &after_small_blob_quads_, &after_quad_fit_},
   }};
 
   // TODO(austin): Remove this...
@@ -473,8 +475,8 @@ class GpuDetector {
   // stream_ is idle: the NEON threshold at the start of Detect() and the
   // Copy*To methods after it returns.  Every kernel that touches them runs on
   // stream_, or in frame_graph_, which launches there.  That includes the
-  // big-blob sort on frame_graph_'s big_blob_stream_ branch, which reads the
-  // decimated image.  CUDA leaves reads from a stream the memory isn't
+  // big-blob quad fit on frame_graph_'s big_blob_stream_ branch, which reads
+  // the decimated image.  CUDA leaves reads from a stream the memory isn't
   // attached to undefined on a GPU without concurrent managed access, like
   // the Orin's, but a microtest there found a graph branch reading memory
   // attached to the launch stream always saw the CPU's latest writes.
@@ -516,14 +518,15 @@ class GpuDetector {
 
   // Compacted blobs which pass our threshold.
   GpuMemory<IndexPoint> selected_blobs_device_;
-  // Which selected blobs each sorting kernel handles.
+  // Which selected blobs each quad fit kernel handles.
   GpuMemory<BlobWorkList> blob_work_list_device_{1};
-  // Sorted list of those points.
+  // Each selected point's sorted point, line fit point, error, filtered
+  // error, and peak.  The quad fits only use the first four for blobs too big
+  // to keep in shared memory, and write all five for every blob with
+  // keep_intermediates.
   GpuMemory<IndexPoint> sorted_selected_blobs_device_;
-
   // TODO(austin): Can we bound this better?  This is a lot of memory.
   GpuMemory<LineFitPoint> line_fit_points_device_;
-
   GpuMemory<double> errs_device_;
   GpuMemory<double> filtered_errs_device_;
   GpuMemory<Peak> filtered_is_local_peak_device_;

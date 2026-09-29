@@ -1,6 +1,5 @@
 #include "frc/orin/apriltag.h"
 
-#include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cuda/atomic>
 #include <numbers>
@@ -24,10 +23,20 @@ ABSL_DECLARE_FLAG(bool, sync);
 namespace frc::apriltag {
 namespace {
 
-typedef std::chrono::duration<float, std::milli> float_milli;
+// Returns BytesPerPixel(image_format), after checking for the formats it traps
+// on, since a trap on the host doesn't say which format it was.
+apriltag_size_t HostBytesPerPixel(vision::ImageFormat image_format) {
+  ABSL_CHECK(image_format == vision::ImageFormat::MONO8 ||
+             image_format == vision::ImageFormat::MONO16 ||
+             image_format == vision::ImageFormat::YUYV422 ||
+             image_format == vision::ImageFormat::BGR8 ||
+             image_format == vision::ImageFormat::BGRA8)
+      << ": Unknown image format: " << vision::EnumNameImageFormat(image_format)
+      << " (" << static_cast<int>(image_format) << ")";
+  return BytesPerPixel(image_format);
+}
 
-// Returns the priority of each SortAndScanBigBlobs launch in graph.
-std::vector<int> BigBlobSortPriorities(const CudaGraph &graph);
+typedef std::chrono::duration<float, std::milli> float_milli;
 
 }  // namespace
 
@@ -43,7 +52,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       use_neon_(absl::GetFlag(FLAGS_use_neon)),
       keep_intermediates_(keep_intermediates),
       gray_image_host_(width * height),
-      color_image_device_(BytesPerPixel(image_format) * width * height),
+      color_image_device_(HostBytesPerPixel(image_format) * width * height),
       gray_image_device_(width * height),
       union_markers_device_(width / 2 * height / 2),
       union_markers_size_device_(width / 2 * height / 2),
@@ -68,6 +77,19 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       image_format_(image_format) {
   quad_corners_host_.reserve(kMaxBlobs);
 
+  // The image size limits in apriltag.h.
+  ABSL_CHECK(width % 8 == 0 && height % 8 == 0)
+      << ": " << width << "x" << height
+      << " image: width and height must be multiples of 8 for the threshold's "
+         "4x4 tiles of the decimated image";
+  ABSL_CHECK(width <= 2048 && height <= 2048)
+      << ": " << width << "x" << height
+      << " image: width and height must be at most 2048, since boundary points "
+         "hold decimated coordinates in 10 bits";
+  ABSL_CHECK_LT(width * height, size_t{1} << 22)
+      << ": " << width << "x" << height
+      << " image: width * height must be under 2^22, since boundary points "
+         "hold blob labels, which are decimated pixel indices, in 20 bits";
   ABSL_CHECK_EQ(tag_detector_->quad_decimate, 2);
   ABSL_CHECK(!tag_detector_->qtp.deglitch);
   // The NEON threshold reads one byte per pixel from the host image.
@@ -163,10 +185,10 @@ GpuDetector::GpuDetector(size_t width, size_t height,
           EnqueueQuadFitting(/*record_stages=*/false, /*fork_big_blobs=*/true);
         },
         /*use_node_priority=*/true);
-    // The big-blob sort's overlap with the small-blob sort rests on its
-    // priority, and nothing else would notice it going missing.
+    // The big-blob quad fit's overlap with the small-blob quad fits rests on
+    // its priority, and nothing else would notice it going missing.
     const std::vector<int> big_blob_priorities =
-        BigBlobSortPriorities(*frame_graph_);
+        BigBlobQuadFitPriorities(*frame_graph_);
     ABSL_CHECK_EQ(big_blob_priorities.size(), 1u);
     ABSL_CHECK_EQ(big_blob_priorities[0], big_blob_priority_);
   }
@@ -756,498 +778,6 @@ __global__ void __launch_bounds__(kScatterThreads) ScatterSelectedPoints(
   }
 }
 
-struct TransformLineFitPoint {
-  // Returns the weight of a point, from the image gradient at it.
-  __device__ __forceinline__ int32_t Weight(IndexPoint p) const {
-    // we now undo our fixed-point arithmetic.
-    // adjust for pixel center bias
-    constexpr int delta = 1;
-    int32_t ix2 = p.x() + delta;
-    int32_t iy2 = p.y() + delta;
-    int32_t ix = ix2 / 2;
-    int32_t iy = iy2 / 2;
-
-    int32_t W = 1;
-
-    if (ix > 0 && ix + 1 < decimated_width && iy > 0 &&
-        iy + 1 < decimated_height) {
-      int32_t grad_x = decimated_image_device_[iy * decimated_width + ix + 1] -
-                       decimated_image_device_[iy * decimated_width + ix - 1];
-
-      int32_t grad_y =
-          decimated_image_device_[(iy + 1) * decimated_width + ix] -
-          decimated_image_device_[(iy - 1) * decimated_width + ix];
-
-      // XXX Tunable. How to shape the gradient magnitude?
-      W = hypotf(grad_x, grad_y) + 1;
-    }
-    return W;
-  }
-
-  // Returns the line fit moments of a point with weight W.
-  __device__ __forceinline__ static LineFitPoint Moments(IndexPoint p,
-                                                         int32_t W) {
-    LineFitPoint result;
-
-    constexpr int delta = 1;
-    int32_t ix2 = p.x() + delta;
-    int32_t iy2 = p.y() + delta;
-
-    result.Mx = W * ix2;
-    result.My = W * iy2;
-    result.Mxx = W * ix2 * ix2;
-    result.Mxy = W * ix2 * iy2;
-    result.Myy = W * iy2 * iy2;
-    result.W = W;
-    result.blob_index = p.blob_index();
-    return result;
-  }
-
-  __device__ __forceinline__ LineFitPoint operator()(IndexPoint p) const {
-    return Moments(p, Weight(p));
-  }
-
-  TransformLineFitPoint(const uint8_t *decimated_image_device,
-                        int decimated_width_param, int decimated_height_param)
-      : decimated_image_device_(decimated_image_device),
-        decimated_width(decimated_width_param),
-        decimated_height(decimated_height_param) {}
-  const uint8_t *decimated_image_device_;
-  int decimated_width;
-  int decimated_height;
-};
-
-struct SumLineFitPoints {
-  __host__ __device__ __forceinline__ LineFitPoint
-  operator()(const LineFitPoint &a, const LineFitPoint &b) const {
-    LineFitPoint result;
-    result.Mx = a.Mx + b.Mx;
-    result.My = a.My + b.My;
-    result.Mxx = a.Mxx + b.Mxx;
-    result.Mxy = a.Mxy + b.Mxy;
-    result.Myy = a.Myy + b.Myy;
-    result.W = a.W + b.W;
-    result.blob_index = a.blob_index;
-    return result;
-  }
-};
-
-// One block sorts each selected blob's points by angle and prefix sums their
-// line fit points.  Blobs with up to kMaxSmallBlobPoints points get a
-// SortAndScanSmallBlobs block each, and the few bigger ones share the
-// SortAndScanBigBlobs blocks.
-constexpr uint32_t kMaxSmallBlobPoints = 2048;
-// Blobs with up to this many points are sorted by ranking every point against
-// the others, which takes fewer steps than a radix sort's passes.
-constexpr uint32_t kMaxRankSortPoints = 256;
-constexpr int kSmallBlobThreads = 256;
-constexpr int kBigBlobThreads = 512;
-constexpr int kBigBlobPointsPerThread = 12;
-// A frame has about 1.5 big blobs.
-constexpr int kBigBlobBlocks = 8;
-constexpr int kWorkListThreads = 1024;
-// The width of IndexPoint::theta().
-constexpr int kThetaBits = 28;
-
-static_assert(GpuDetector::kMaxBlobs % kWorkListThreads == 0);
-// BuildBlobWorkList counts both kinds of blob in one 32 bit sum.
-static_assert(GpuDetector::kMaxBlobs < (1 << 16));
-
-// Lists the selected blobs with points, split by size, in blob order.
-__global__ void __launch_bounds__(kWorkListThreads) BuildBlobWorkList(
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    BlobWorkList *work_list) {
-  constexpr int kBlobsPerThread = GpuDetector::kMaxBlobs / kWorkListThreads;
-  typedef cub::BlockScan<uint32_t, kWorkListThreads> BlockScan;
-  __shared__ typename BlockScan::TempStorage scan_storage;
-
-  // Small blobs count in the low 16 bits, and big ones in the high 16.
-  constexpr uint32_t kSmallBlob = 1;
-  constexpr uint32_t kBigBlob = 1 << 16;
-  uint32_t kind[kBlobsPerThread];
-#pragma unroll
-  for (int i = 0; i < kBlobsPerThread; ++i) {
-    const uint32_t count =
-        selected_extents_device[threadIdx.x * kBlobsPerThread + i].value.count;
-    if (count == 0) {
-      kind[i] = 0;
-    } else if (count <= kMaxSmallBlobPoints) {
-      kind[i] = kSmallBlob;
-    } else {
-      kind[i] = kBigBlob;
-    }
-  }
-  uint32_t position[kBlobsPerThread];
-  uint32_t total;
-  BlockScan(scan_storage).ExclusiveSum(kind, position, total);
-#pragma unroll
-  for (int i = 0; i < kBlobsPerThread; ++i) {
-    const uint16_t blob = threadIdx.x * kBlobsPerThread + i;
-    if (kind[i] == kSmallBlob) {
-      work_list->small_blobs[position[i] & 0xffff] = blob;
-    } else if (kind[i] == kBigBlob) {
-      work_list->big_blobs[position[i] >> 16] = blob;
-    }
-  }
-  if (threadIdx.x == 0) {
-    work_list->num_small_blobs = total & 0xffff;
-    work_list->num_big_blobs = total >> 16;
-  }
-}
-
-template <int kThreads>
-using LineFitPointScan =
-    cub::BlockScan<LineFitPoint, kThreads, cub::BLOCK_SCAN_WARP_SCANS>;
-
-__device__ __forceinline__ LineFitPoint ZeroLineFitPoint(uint32_t blob_index) {
-  LineFitPoint result;
-  result.Mxx = 0;
-  result.Myy = 0;
-  result.Mxy = 0;
-  result.Mx = 0;
-  result.My = 0;
-  result.W = 0;
-  result.blob_index = blob_index;
-  return result;
-}
-
-// Carries the sum of a blob's line fit points from one chunk of them to the
-// next.
-struct LineFitPointPrefix {
-  __device__ __forceinline__ LineFitPoint
-  operator()(const LineFitPoint &chunk_sum) {
-    const LineFitPoint prefix = sum;
-    sum = SumLineFitPoints()(sum, chunk_sum);
-    return prefix;
-  }
-
-  LineFitPoint sum;
-};
-
-// Writes the next kThreads of a blob's sorted points, where this thread's
-// point goes at position, and the prefix sums of their line fit points.  Every
-// thread in the block calls this for each chunk.
-template <int kThreads>
-__device__ __forceinline__ void WriteSortedChunk(
-    typename LineFitPointScan<kThreads>::TempStorage &scan_storage,
-    LineFitPointPrefix &prefix, IndexPoint point, uint32_t position,
-    uint32_t count, const TransformLineFitPoint &transform,
-    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
-  LineFitPoint line_fit_point = ZeroLineFitPoint(prefix.sum.blob_index);
-  if (position < count) {
-    sorted_points[position] = point;
-    line_fit_point = transform(point);
-  }
-  LineFitPointScan<kThreads>(scan_storage)
-      .InclusiveScan(line_fit_point, line_fit_point, SumLineFitPoints(),
-                     prefix);
-  if (position < count) {
-    line_fit_points[position] = line_fit_point;
-  }
-  // The next chunk reuses scan_storage.
-  __syncthreads();
-}
-
-// Returns the key that orders a blob's points with the same angle: dxy, then
-// base_y, then base_x.  No two points share it, so sorting by angle and then
-// this does not depend on the order the blob has its points in.
-__device__ __forceinline__ uint32_t AngleTieKey(IndexPoint point) {
-  return (point.dxy() << 20) | (point.base_y() << 10) | point.base_x();
-}
-
-// Puts each run of a blob's sorted points with the same angle in AngleTieKey()
-// order, and redoes the line fit prefix sums inside the run.  Every thread in
-// the block calls this after writing the blob's points and passing a barrier.
-template <int kThreads, int kPointsPerThread>
-__device__ __forceinline__ void FixAngleTies(
-    uint32_t blob_index, uint32_t count, const TransformLineFitPoint &transform,
-    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
-  // Reading the angles back keeps the sort's registers free for the scans.
-  // Each lane reads one, and gets the next from the next lane.
-  const uint32_t lane = threadIdx.x % 32;
-  bool has_tie = false;
-#pragma unroll
-  for (int i = 0; i < kPointsPerThread; ++i) {
-    const uint32_t position = i * kThreads + threadIdx.x;
-    const uint32_t theta =
-        position < count ? sorted_points[position].theta() : 0;
-    uint32_t next_theta = __shfl_down_sync(0xffffffffu, theta, 1);
-    if (lane == 31 && position + 1 < count) {
-      next_theta = sorted_points[position + 1].theta();
-    }
-    has_tie |= position + 1 < count && next_theta == theta;
-  }
-  // Ties are rare, and most blobs have none.
-  if (!__syncthreads_or(has_tie)) {
-    return;
-  }
-
-  // Every run is found before any moves, since finding one reads the points
-  // on both sides of it.  run_end is 0 where no run starts.
-  uint32_t run_end[kPointsPerThread];
-#pragma unroll
-  for (int i = 0; i < kPointsPerThread; ++i) {
-    const uint32_t start = i * kThreads + threadIdx.x;
-    run_end[i] = 0;
-    if (start + 1 < count) {
-      const uint32_t theta = sorted_points[start].theta();
-      if (sorted_points[start + 1].theta() == theta &&
-          (start == 0 || sorted_points[start - 1].theta() != theta)) {
-        uint32_t end = start + 2;
-        while (end < count && sorted_points[end].theta() == theta) {
-          ++end;
-        }
-        run_end[i] = end;
-      }
-    }
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int i = 0; i < kPointsPerThread; ++i) {
-    const uint32_t start = i * kThreads + threadIdx.x;
-    const uint32_t end = run_end[i];
-    if (end == 0) {
-      continue;
-    }
-    for (uint32_t j = start + 1; j < end; ++j) {
-      const IndexPoint point = sorted_points[j];
-      const uint32_t key = AngleTieKey(point);
-      uint32_t k = j;
-      for (; k > start && AngleTieKey(sorted_points[k - 1]) > key; --k) {
-        sorted_points[k] = sorted_points[k - 1];
-      }
-      sorted_points[k] = point;
-    }
-    // The run's last prefix sum covers all of it in any order, so it stays,
-    // and the run after this one may read it.
-    LineFitPoint sum =
-        start == 0 ? ZeroLineFitPoint(blob_index) : line_fit_points[start - 1];
-    for (uint32_t j = start; j + 1 < end; ++j) {
-      sum = SumLineFitPoints()(sum, transform(sorted_points[j]));
-      line_fit_points[j] = sum;
-    }
-  }
-}
-
-// Sorts a blob's points by angle with a radix sort, then writes them and their
-// line fit points.  Points with the same angle end up in AngleTieKey() order.
-//
-// With kScanInChunks, the block scans kThreads sorted points at a time, which
-// keeps the writes coalesced.  Otherwise each thread sums its own
-// kPointsPerThread consecutive points and the block scans once, which is
-// faster for many points per thread.
-template <int kThreads, int kPointsPerThread, bool kScanInChunks>
-__device__ __forceinline__ void RadixSortAndScanBlob(
-    typename cub::BlockRadixSort<uint32_t, kThreads, kPointsPerThread,
-                                 uint32_t>::TempStorage &sort_storage,
-    typename LineFitPointScan<kThreads>::TempStorage &scan_storage,
-    uint32_t blob_index, const IndexPoint *points, uint32_t count,
-    const TransformLineFitPoint &transform, IndexPoint *sorted_points,
-    LineFitPoint *line_fit_points) {
-  typedef cub::BlockRadixSort<uint32_t, kThreads, kPointsPerThread, uint32_t>
-      BlockRadixSort;
-  uint32_t theta[kPointsPerThread];
-  uint32_t point_bits[kPointsPerThread];
-#pragma unroll
-  for (int i = 0; i < kPointsPerThread; ++i) {
-    const uint32_t index = threadIdx.x * kPointsPerThread + i;
-    if (index < count) {
-      const IndexPoint point = points[index];
-      theta[i] = point.theta();
-      point_bits[i] = point.point_bits();
-    } else {
-      // Sorts after every point, since no angle is bigger and the padding
-      // comes last.
-      theta[i] = 0xffffffffu;
-      point_bits[i] = 0;
-    }
-  }
-  if constexpr (kScanInChunks) {
-    BlockRadixSort(sort_storage)
-        .SortBlockedToStriped(theta, point_bits, 0, kThetaBits);
-  } else {
-    BlockRadixSort(sort_storage).Sort(theta, point_bits, 0, kThetaBits);
-  }
-  // scan_storage may alias sort_storage.
-  __syncthreads();
-
-  if constexpr (kScanInChunks) {
-    LineFitPointPrefix prefix{ZeroLineFitPoint(blob_index)};
-#pragma unroll
-    for (int i = 0; i < kPointsPerThread; ++i) {
-      if (i * kThreads >= count) {
-        break;
-      }
-      IndexPoint point(blob_index, point_bits[i]);
-      point.set_theta(theta[i]);
-      WriteSortedChunk<kThreads>(scan_storage, prefix, point,
-                                 i * kThreads + threadIdx.x, count, transform,
-                                 sorted_points, line_fit_points);
-    }
-  } else {
-    // Only the weights are kept between the two passes over the points, since
-    // the moments take too many registers.
-    int32_t weight[kPointsPerThread];
-    LineFitPoint sum = ZeroLineFitPoint(blob_index);
-#pragma unroll
-    for (int i = 0; i < kPointsPerThread; ++i) {
-      if (threadIdx.x * kPointsPerThread + i < count) {
-        IndexPoint point(blob_index, point_bits[i]);
-        weight[i] = transform.Weight(point);
-        sum = SumLineFitPoints()(
-            sum, TransformLineFitPoint::Moments(point, weight[i]));
-      }
-    }
-    LineFitPointScan<kThreads>(scan_storage)
-        .ExclusiveScan(sum, sum, ZeroLineFitPoint(blob_index),
-                       SumLineFitPoints());
-#pragma unroll
-    for (int i = 0; i < kPointsPerThread; ++i) {
-      const uint32_t position = threadIdx.x * kPointsPerThread + i;
-      if (position < count) {
-        IndexPoint point(blob_index, point_bits[i]);
-        point.set_theta(theta[i]);
-        sum = SumLineFitPoints()(
-            sum, TransformLineFitPoint::Moments(point, weight[i]));
-        sorted_points[position] = point;
-        line_fit_points[position] = sum;
-      }
-    }
-    // The next blob reuses scan_storage.
-    __syncthreads();
-  }
-  // The sort is stable, so it left points with the same angle in the blob's
-  // order.
-  FixAngleTies<kThreads, kPointsPerThread>(blob_index, count, transform,
-                                           sorted_points, line_fit_points);
-}
-
-struct SmallBlobStorage {
-  union {
-    typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 2,
-                                 uint32_t>::TempStorage radix_sort2;
-    typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 4,
-                                 uint32_t>::TempStorage radix_sort4;
-    typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 8,
-                                 uint32_t>::TempStorage radix_sort8;
-    uint64_t rank_keys[kMaxRankSortPoints];
-    typename LineFitPointScan<kSmallBlobThreads>::TempStorage scan;
-  } temp;
-  // The ranked points' keys, in sorted order.
-  uint64_t ranked_points[kMaxRankSortPoints];
-};
-
-// Sorts a blob's points by angle by ranking each against the others, then
-// writes them and their line fit points.  Points with the same angle rank by
-// AngleTieKey().
-__device__ __forceinline__ void RankSortAndScanBlob(
-    SmallBlobStorage &storage, uint32_t blob_index, const IndexPoint *points,
-    uint32_t count, const TransformLineFitPoint &transform,
-    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
-  static_assert(kSmallBlobThreads == kMaxRankSortPoints);
-  const bool has_point = threadIdx.x < count;
-  // Every key is unique, so the ranks are too.
-  uint64_t key = 0;
-  IndexPoint point;
-  if (has_point) {
-    point = points[threadIdx.x];
-    key = (static_cast<uint64_t>(point.theta()) << 32) | AngleTieKey(point);
-    storage.temp.rank_keys[threadIdx.x] = key;
-  }
-  __syncthreads();
-
-  if (has_point) {
-    uint32_t rank = 0;
-    for (uint32_t j = 0; j < count; ++j) {
-      rank += storage.temp.rank_keys[j] < key;
-    }
-    storage.ranked_points[rank] = point.key;
-  }
-  // The scan reuses rank_keys' storage.
-  __syncthreads();
-
-  LineFitPointPrefix prefix{ZeroLineFitPoint(blob_index)};
-  IndexPoint sorted_point;
-  if (has_point) {
-    sorted_point.key = storage.ranked_points[threadIdx.x];
-  }
-  WriteSortedChunk<kSmallBlobThreads>(storage.temp.scan, prefix, sorted_point,
-                                      threadIdx.x, count, transform,
-                                      sorted_points, line_fit_points);
-}
-
-// Sorts the points of each small blob in the work list by angle, and prefix
-// sums their line fit points, one blob per block.
-__global__ void __launch_bounds__(kSmallBlobThreads, 4) SortAndScanSmallBlobs(
-    const BlobWorkList *work_list, const IndexPoint *selected_blobs,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    TransformLineFitPoint transform, IndexPoint *sorted_selected_blobs,
-    LineFitPoint *line_fit_points) {
-  __shared__ SmallBlobStorage storage;
-  if (blockIdx.x >= work_list->num_small_blobs) {
-    return;
-  }
-  const uint32_t blob_index = work_list->small_blobs[blockIdx.x];
-  const MinMaxExtents extents = selected_extents_device[blob_index].value;
-  const uint32_t count = extents.count;
-  const IndexPoint *points = selected_blobs + extents.starting_offset;
-  IndexPoint *sorted_points = sorted_selected_blobs + extents.starting_offset;
-  LineFitPoint *blob_line_fit_points =
-      line_fit_points + extents.starting_offset;
-  if (count <= kMaxRankSortPoints) {
-    RankSortAndScanBlob(storage, blob_index, points, count, transform,
-                        sorted_points, blob_line_fit_points);
-  } else if (count <= 2 * kSmallBlobThreads) {
-    RadixSortAndScanBlob<kSmallBlobThreads, 2, true>(
-        storage.temp.radix_sort2, storage.temp.scan, blob_index, points, count,
-        transform, sorted_points, blob_line_fit_points);
-  } else if (count <= 4 * kSmallBlobThreads) {
-    RadixSortAndScanBlob<kSmallBlobThreads, 4, true>(
-        storage.temp.radix_sort4, storage.temp.scan, blob_index, points, count,
-        transform, sorted_points, blob_line_fit_points);
-  } else {
-    static_assert(8 * kSmallBlobThreads == kMaxSmallBlobPoints);
-    RadixSortAndScanBlob<kSmallBlobThreads, 8, true>(
-        storage.temp.radix_sort8, storage.temp.scan, blob_index, points, count,
-        transform, sorted_points, blob_line_fit_points);
-  }
-}
-
-union BigBlobStorage {
-  typename cub::BlockRadixSort<uint32_t, kBigBlobThreads,
-                               kBigBlobPointsPerThread, uint32_t>::TempStorage
-      radix_sort;
-  typename LineFitPointScan<kBigBlobThreads>::TempStorage scan;
-};
-// Kernels get at most 48 KiB of static shared memory.
-static_assert(sizeof(BigBlobStorage) <= 48 * 1024);
-static_assert(sizeof(SmallBlobStorage) <= 48 * 1024);
-
-// Sorts the points of each big blob in the work list by angle, and prefix sums
-// their line fit points, looping over the blobs.
-__global__ void __launch_bounds__(kBigBlobThreads) SortAndScanBigBlobs(
-    const BlobWorkList *work_list, const IndexPoint *selected_blobs,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    TransformLineFitPoint transform, IndexPoint *sorted_selected_blobs,
-    LineFitPoint *line_fit_points) {
-  __shared__ BigBlobStorage storage;
-  const uint32_t num_big_blobs = work_list->num_big_blobs;
-  for (uint32_t i = blockIdx.x; i < num_big_blobs; i += gridDim.x) {
-    const uint32_t blob_index = work_list->big_blobs[i];
-    const MinMaxExtents extents = selected_extents_device[blob_index].value;
-    RadixSortAndScanBlob<kBigBlobThreads, kBigBlobPointsPerThread, false>(
-        storage.radix_sort, storage.scan, blob_index,
-        selected_blobs + extents.starting_offset, extents.count, transform,
-        sorted_selected_blobs + extents.starting_offset,
-        line_fit_points + extents.starting_offset);
-  }
-}
-
-std::vector<int> BigBlobSortPriorities(const CudaGraph &graph) {
-  return graph.KernelPriorities(SortAndScanBigBlobs);
-}
-
 }  // namespace
 
 void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
@@ -1331,8 +861,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   } else {
     EnqueueQuadFitting(stage_timing_, /*fork_big_blobs=*/false);
   }
-  // The host reads the quads where FitQuads writes them, so this is Detect()'s
-  // only wait on the GPU.
+  // The host reads the quads where the quad fits write them, so this is
+  // Detect()'s only wait on the GPU.
   after_quad_fit_.Record(&stream_);
   after_quad_fit_.Synchronize(host_wait_spin_);
 
@@ -1416,9 +946,6 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
     }
   };
 
-  //  Make sure we fit in our mask.
-  ABSL_CHECK_LT(width_ * height_, static_cast<size_t>(1 << 22));
-
   // Unionfind the image, and find the points between blobs.
   LabelImage(ToDecimatedGpuImage(thresholded_image_device_),
              ToGpuImage(union_markers_size_device_),
@@ -1435,13 +962,6 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
                            : std::span<CudaEvent>());
   MaybeCheckAndSynchronize("LabelImage");
 
-  ABSL_CHECK((width_ % 8) == 0);
-  ABSL_CHECK((height_ % 8) == 0);
-
-  // TODO(austin): Tune for the global shutter camera.
-  // 1280 -> 2 * 128 * 5
-  // 720 -> 2 * 8 * 5 * 9
-
   // Longest april tag will be the full perimeter of the image.  Each point
   // results in 2 neighbor points, 1 straight, and one at 45 degrees.  But, we
   // are in decimated space here, and width_ and height_ are in full image
@@ -1449,11 +969,15 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
   //
   // Aprilrobotics has a *3 instead of a *2 here since they have duplicated
   // points in their list at this stage.
-  const apriltag_size_t max_april_tag_perimeter = 2 * (width_ + height_);
-  // SortAndScanBigBlobs holds a whole blob in one block.
-  ABSL_CHECK_LE(
-      max_april_tag_perimeter,
-      static_cast<apriltag_size_t>(kBigBlobThreads * kBigBlobPointsPerThread));
+  //
+  // FitBigBlobQuads() holds at most kMaxBlobPoints points, so bigger blobs are
+  // rejected as too big as well.  A point is about a pixel of the quad's
+  // perimeter, so that is a quad over 6144 pixels around, like a 1536 pixel
+  // square.  It changes nothing while width_ + height_ <= 3072, and past that
+  // it only drops quads spanning most of the frame: 98% of its perimeter at
+  // 1920x1200, and 75% at 2048x2040, the longest the constructor accepts.
+  const apriltag_size_t max_april_tag_perimeter =
+      std::min<apriltag_size_t>(2 * (width_ + height_), kMaxBlobPoints);
 
   // Sum them up by blob pair.
   {
@@ -1503,67 +1027,54 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
   }
   record_stage(after_scatter_, &stream_);
 
-  {
-    // Sort each selected blob's points by angle around the blob, and prefix
-    // sum their line fit points, in a block per blob.  Blobs are contiguous
-    // and in blob order in selected_blobs_device_, so this matches a global
-    // sort by (blob, angle, AngleTieKey()), and the host never needs the
-    // number of selected points.
-    BuildBlobWorkList<<<1, kWorkListThreads, 0, stream_.get()>>>(
-        selected_extents_device_.get(), blob_work_list_device_.get());
-    MaybeCheckAndSynchronize("BuildBlobWorkList");
-    TransformLineFitPoint transform(decimated_image_device_, width_ / 2,
-                                    height_ / 2);
-    auto sort_small_blobs = [&]() {
-      SortAndScanSmallBlobs<<<kMaxBlobs, kSmallBlobThreads, 0, stream_.get()>>>(
-          blob_work_list_device_.get(), selected_blobs_device_.get(),
-          selected_extents_device_.get(), transform,
-          sorted_selected_blobs_device_.get(), line_fit_points_device_.get());
-      MaybeCheckAndSynchronize("SortAndScanSmallBlobs");
-    };
-    auto sort_big_blobs = [&](CudaStream *stream) {
-      SortAndScanBigBlobs<<<kBigBlobBlocks, kBigBlobThreads, 0,
-                            stream->get()>>>(
-          blob_work_list_device_.get(), selected_blobs_device_.get(),
-          selected_extents_device_.get(), transform,
-          sorted_selected_blobs_device_.get(), line_fit_points_device_.get());
-      MaybeCheckAndSynchronize("SortAndScanBigBlobs");
-    };
-    if (fork_big_blobs) {
-      // Each big-blob block needs a whole SM's registers, so after the
-      // small-blob sort, the few of them would leave most SMs idle.  On a
-      // branch of its own, the big-blob sort overlaps the small-blob sort
-      // instead, as long as its blocks are dispatched before the small-blob
-      // blocks fill the SMs.  Its stream's priority sees to that, whatever
-      // order the graph's ready kernels would otherwise go in.  The two sorts
-      // write disjoint blobs, and FitLines, after the join, reads them first.
-      fork_big_blobs_.Record(&stream_);
-      big_blob_stream_.Wait(&fork_big_blobs_);
-      sort_big_blobs(&big_blob_stream_);
-      sort_small_blobs();
-      join_big_blobs_.Record(&big_blob_stream_);
-      stream_.Wait(&join_big_blobs_);
-    } else {
-      sort_small_blobs();
-      record_stage(after_small_blob_sort_, &stream_);
-      sort_big_blobs(&stream_);
-    }
+  // Fit each selected blob's quad, from sorting its points by angle around it
+  // on, in a block per blob.  Blobs are contiguous and in blob order in
+  // selected_blobs_device_, so sorting each blob's points matches a global
+  // sort by (blob, angle, AngleTieKey()), and the host never needs the number
+  // of selected points.
+  const BlobQuadFitArgs blob_quad_fit_args{
+      .work_list = blob_work_list_device_.get(),
+      .selected_blobs = selected_blobs_device_.get(),
+      .selected_extents = selected_extents_device_.get(),
+      .decimated_image = decimated_image_device_,
+      .decimated_width = static_cast<int>(width_ / 2),
+      .decimated_height = static_cast<int>(height_ / 2),
+      .sorted_points = sorted_selected_blobs_device_.get(),
+      .line_fit_points = line_fit_points_device_.get(),
+      .errs = errs_device_.get(),
+      .filtered_errs = filtered_errs_device_.get(),
+      .peaks = filtered_is_local_peak_device_.get(),
+      .keep_intermediates = keep_intermediates_,
+      .max_blob_points = max_april_tag_perimeter,
+      .nmaxima = tag_detector_->qtp.max_nmaxima,
+      .max_line_fit_mse = tag_detector_->qtp.max_line_fit_mse,
+      .cos_critical_rad = tag_detector_->qtp.cos_critical_rad,
+      .fit_quads = fit_quads_host_.device_ptr(),
+      .fit_quad_valid = fit_quad_valid_host_.device_ptr(),
+  };
+  ListBlobs(blob_quad_fit_args, &stream_);
+  MaybeCheckAndSynchronize("ListBlobs");
+  if (fork_big_blobs) {
+    // Each big-blob block needs a whole SM's registers, so after the
+    // small-blob quad fits, the few of them would leave most SMs idle.  On a
+    // branch of its own, the big-blob quad fit overlaps the small-blob ones
+    // instead, as long as its blocks are dispatched before the small-blob
+    // blocks fill the SMs.  Its stream's priority sees to that, whatever order
+    // the graph's ready kernels would otherwise go in.  The two write disjoint
+    // blobs, and the host reads the quads after the join.
+    fork_big_blobs_.Record(&stream_);
+    big_blob_stream_.Wait(&fork_big_blobs_);
+    FitBigBlobQuads(blob_quad_fit_args, &big_blob_stream_);
+    FitSmallBlobQuads(blob_quad_fit_args, &stream_);
+    join_big_blobs_.Record(&big_blob_stream_);
+    stream_.Wait(&join_big_blobs_);
+  } else {
+    FitSmallBlobQuads(blob_quad_fit_args, &stream_);
+    MaybeCheckAndSynchronize("FitSmallBlobQuads");
+    record_stage(after_small_blob_quads_, &stream_);
+    FitBigBlobQuads(blob_quad_fit_args, &stream_);
+    MaybeCheckAndSynchronize("FitBigBlobQuads");
   }
-  record_stage(after_big_blob_sort_, &stream_);
-
-  FitLines(line_fit_points_device_.get(), num_selected_blobs_device_.get(),
-           selected_extents_device_.get(), errs_device_.get(),
-           filtered_errs_device_.get(), filtered_is_local_peak_device_.get(),
-           &stream_);
-  record_stage(after_line_filter_, &stream_);
-
-  apriltag::FitQuads(
-      filtered_is_local_peak_device_.get(), line_fit_points_device_.get(),
-      selected_extents_device_.get(), kMaxBlobs, max_april_tag_perimeter,
-      tag_detector_->qtp.max_nmaxima, tag_detector_->qtp.max_line_fit_mse,
-      tag_detector_->qtp.cos_critical_rad, fit_quads_host_.device_ptr(),
-      fit_quad_valid_host_.device_ptr(), &stream_);
-  MaybeCheckAndSynchronize("FitQuads");
 }
 
 }  // namespace frc::apriltag

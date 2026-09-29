@@ -9,6 +9,7 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "frc/orin/cuda.h"
+#include "frc/orin/points.h"
 
 namespace frc::apriltag {
 
@@ -84,9 +85,8 @@ struct LineFitPoint {
   uint32_t blob_index;
 };
 
-// DoFitLines copies LineFitPoints into shared memory with 16 byte loads, and
-// its offsets rely on this layout.  Aligning the struct to 16 bytes would pad
-// it to 48 bytes and add 20% to every buffer and read.
+// Aligning the struct to 16 bytes would pad it to 48 bytes and add 20% to
+// every buffer and read.
 static_assert(sizeof(LineFitPoint) == 40);
 static_assert(alignof(LineFitPoint) == 8);
 
@@ -128,28 +128,72 @@ struct FitQuad {
   LineFitMoments moments[4];
 };
 
-__host__ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
-                                 double *lineparam23, double *err, double *mse);
+// The selected blobs with points, split by which kernel fits their quads, each
+// list in blob order.
+struct BlobWorkList {
+  uint32_t num_small_blobs;
+  uint32_t num_big_blobs;
+  uint16_t small_blobs[IndexPoint::kMaxBlobs];
+  uint16_t big_blobs[IndexPoint::kMaxBlobs];
+};
 
-// Computes the line fit error, filtered error, and peak at every point.  The
-// GPU reads the number of points from num_points_device, so it only has to be
-// written by the time the kernel runs.
-void FitLines(
-    const LineFitPoint *line_fit_points_device, const int *num_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    double *errs_device, double *filtered_errs_device, Peak *peaks_device,
-    CudaStream *stream);
+// The most points a blob can have, since FitBigBlobQuads() sorts each blob in
+// one block's shared memory.
+constexpr uint32_t kMaxBlobPoints = 6144;
 
-// Fits a quad to each of the first num_blobs blobs in selected_extents_device
-// from its best nmaxima peaks, the way aprilrobotics' fit_quad does.  A blob's
-// quad goes in its own slot of fit_quads_device, and fit_quad_valid_device says
-// which slots hold a valid quad.  No blob has more than max_blob_points points.
-void FitQuads(
-    const Peak *peaks_device, const LineFitPoint *line_fit_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    size_t num_blobs, size_t max_blob_points, int nmaxima,
-    float max_line_fit_mse, double cos_critical_rad, FitQuad *fit_quads_device,
-    bool *fit_quad_valid_device, CudaStream *stream);
+// What the blob quad fits read, and where they write.
+struct BlobQuadFitArgs {
+  // ListBlobs() writes it, and the quad fits read it.
+  BlobWorkList *work_list;
+  // The selected blobs' points, each blob's in the range its entry of
+  // selected_extents gives, and the extents, one per blob.
+  const IndexPoint *selected_blobs;
+  const cub::KeyValuePair<long, MinMaxExtents> *selected_extents;
+  // The decimated image, for each point's weight.
+  const uint8_t *decimated_image;
+  int decimated_width;
+  int decimated_height;
+
+  // Each point's sorted point, line fit point, error, filtered error, and
+  // peak, in selected_blobs' order.  Blobs with too many points to keep in
+  // shared memory use the first four as scratch.  With keep_intermediates,
+  // every blob writes all five, for the debug methods.
+  IndexPoint *sorted_points;
+  LineFitPoint *line_fit_points;
+  double *errs;
+  double *filtered_errs;
+  Peak *peaks;
+  bool keep_intermediates;
+
+  // No blob has more points than this, which is at most kMaxBlobPoints.
+  uint32_t max_blob_points;
+  // The quad fit's parameters, as in apriltag_quad_thresh.  nmaxima must be
+  // 10, which the kernels are compiled for.
+  int nmaxima;
+  float max_line_fit_mse;
+  double cos_critical_rad;
+
+  // Each blob's quad fit, in its own slot, and whether it is valid.
+  FitQuad *fit_quads;
+  bool *fit_quad_valid;
+};
+
+// Lists the selected blobs with points in work_list, and marks every other
+// blob's quad fit invalid.  FitSmallBlobQuads() and FitBigBlobQuads() read the
+// list, so this goes first.
+void ListBlobs(const BlobQuadFitArgs &args, CudaStream *stream);
+
+// Fits a quad to each blob on the work list, the way aprilrobotics' fit_quad
+// does: sorts its points by angle around it, fits a line around each point,
+// filters the fits' errors, and fits the quad from the best nmaxima peaks of
+// the filtered errors.  FitSmallBlobQuads() covers the small blobs, with a
+// block for each, and FitBigBlobQuads() the few big ones.  The two write
+// different blobs, so they can run in parallel.
+void FitSmallBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream);
+void FitBigBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream);
+
+// Returns the priority of each FitBigBlobQuads() launch in graph.
+std::vector<int> BigBlobQuadFitPriorities(const CudaGraph &graph);
 
 // Returns a key which orders peaks the way a stable cub radix sort by error
 // does: by error, then by index.  cub compares floats by their bits, with -0.0

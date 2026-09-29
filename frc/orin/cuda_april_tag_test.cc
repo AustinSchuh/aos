@@ -7,6 +7,7 @@
 #include <map>
 #include <numbers>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string>
 #include <tuple>
@@ -713,7 +714,8 @@ class CudaAprilTagDetector {
   std::vector<std::vector<QuadBoundaryPoint>> FilterBlobs(
       std::vector<std::vector<QuadBoundaryPoint>> blobs) const {
     std::vector<std::vector<QuadBoundaryPoint>> result;
-    const size_t max_april_tag_perimeter = 2 * (width_ + height_);
+    const size_t max_april_tag_perimeter =
+        std::min<size_t>(2 * (width_ + height_), kMaxBlobPoints);
     ABSL_LOG(ERROR) << "Max permiter test " << max_april_tag_perimeter;
 
     for (std::vector<QuadBoundaryPoint> &blob : blobs) {
@@ -1066,7 +1068,8 @@ class CudaAprilTagDetector {
       const std::vector<std::vector<QuadBoundaryPoint>> &cuda_grouped_points,
       const std::vector<MinMaxExtents> &extents_cuda) const {
     std::vector<IndexPoint> selected_blobs;
-    const size_t max_april_tag_perimeter = 2 * (width_ + height_);
+    const size_t max_april_tag_perimeter =
+        std::min<size_t>(2 * (width_ + height_), kMaxBlobPoints);
     size_t selected_quads = 0;
     {
       size_t i = 0;
@@ -2387,6 +2390,80 @@ TEST_F(AprilDetectionTest, ImageRepeat) {
   if (absl::GetFlag(FLAGS_debug)) {
     cuda_detector.WriteDebug(color_image);
   }
+}
+
+// Returns whether two quad fits are the same.
+bool SameFitQuad(const FitQuad &a, const FitQuad &b) {
+  if (a.blob_index != b.blob_index || a.valid != b.valid ||
+      !std::equal(std::begin(a.indices), std::end(a.indices),
+                  std::begin(b.indices))) {
+    return false;
+  }
+  for (int i = 0; i < 4; ++i) {
+    const LineFitMoments &x = a.moments[i];
+    const LineFitMoments &y = b.moments[i];
+    if (x.Mx != y.Mx || x.My != y.My || x.W != y.W || x.Mxx != y.Mxx ||
+        x.Myy != y.Myy || x.Mxy != y.Mxy || x.N != y.N) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Tests that writing the intermediates changes none of the quads, through the
+// CUDA graph or launching each stage.  Without them, the quad fits keep small
+// blobs' points in shared memory and write nothing else, so the frame needs
+// blobs of each size the quad fits handle differently.
+TEST_F(AprilDetectionTest, KeepIntermediatesSameQuads) {
+  auto image =
+      ReadImage("orin_large_image_apriltag/file/orin_large_gs_apriltag.bfbs");
+  const cv::Mat color_image = ToMat(&image.message());
+  apriltag_family_t *tag_family = tag16h5_create();
+  apriltag_detector_t *tag_detector = MakeTagDetector(tag_family);
+
+  std::optional<std::vector<FitQuad>> expected;
+  for (const bool keep_intermediates : {true, false}) {
+    GpuDetector gpu_detector(color_image.cols, color_image.rows, tag_detector,
+                             create_camera_matrix(),
+                             create_distortion_coefficients_five(),
+                             vision::ImageFormat::YUYV422, keep_intermediates);
+    for (const bool stage_timing : {false, true}) {
+      SCOPED_TRACE(std::string(keep_intermediates ? "with" : "without") +
+                   " intermediates, " +
+                   (stage_timing ? "stage timing" : "graph"));
+      gpu_detector.set_stage_timing(stage_timing);
+      gpu_detector.Detect(color_image.data, nullptr);
+      const std::vector<FitQuad> fit_quads = gpu_detector.CopyFitQuads();
+      if (!expected.has_value()) {
+        expected = fit_quads;
+        // Blobs of up to 256 points stay in shared memory, those of up to
+        // 2048 don't, and bigger ones get a kernel of their own.
+        size_t shared = 0, global = 0, big = 0;
+        for (const auto &extents : gpu_detector.CopySelectedExtents()) {
+          const uint32_t count = extents.value.count;
+          shared += count > 0 && count <= 256;
+          global += count > 256 && count <= 2048;
+          big += count > 2048;
+        }
+        ABSL_LOG(INFO) << "Blobs in shared memory: " << shared
+                       << ", global: " << global << ", big: " << big
+                       << ", quads: " << fit_quads.size();
+        EXPECT_GT(shared, 0u);
+        EXPECT_GT(global, 0u);
+        EXPECT_GT(big, 0u);
+        EXPECT_FALSE(fit_quads.empty());
+        continue;
+      }
+      ASSERT_EQ(fit_quads.size(), expected->size());
+      for (size_t i = 0; i < fit_quads.size(); ++i) {
+        EXPECT_TRUE(SameFitQuad(fit_quads[i], (*expected)[i]))
+            << ": quad " << i << " of blob " << (*expected)[i].blob_index;
+      }
+    }
+  }
+
+  apriltag_detector_destroy(tag_detector);
+  tag16h5_destroy(tag_family);
 }
 
 // Parameterized on the image, and on whether stage timing is on, which runs

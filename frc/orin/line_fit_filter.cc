@@ -1,24 +1,15 @@
 #include "frc/orin/line_fit_filter.h"
 
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <iomanip>
+#include <iterator>
 
 #include "absl/log/absl_check.h"
 
 #include "frc/orin/cuda.h"
 
-// #define DEBUG_BLOB_NUMBER 401
-
 namespace frc::apriltag {
-
-static_assert(sizeof(int4) == 16, "Size of int4 changed");
-
-constexpr size_t kPointsPerBlock = 256;
-// Number of errors to calculate before and after for the err filter and peak
-// finder.
-constexpr size_t kBeforeBuffer = 4;
-constexpr size_t kAfterBuffer = 4;
-constexpr size_t kErrorsBuffer = kBeforeBuffer + kAfterBuffer;
 
 // Half width of the window FitLineError fits a line to around each point.
 constexpr uint32_t kMaxKsz = 20;
@@ -51,625 +42,436 @@ __device__ double FitLineError(size_t N, int64_t Mx, int64_t My, int64_t Mxx,
   return N * eig_small;
 }
 
-struct TempStorage {
-  // Block of points that we pre-load.  ErrorCalculator::Load() fills it with
-  // int4 stores, and LineFitPoint is only 8 byte aligned.
-  alignas(16) LineFitPoint tmp_storage[kPointsPerBlock];
+namespace {
 
-  // The errors loaded.  The first kAfterBuffer errors are the indices (could be
-  // duplicated) immediately before the first blob.  The last kAfterBuffer
-  // errors are the indices immediately following the last blob.
-  double tmp_errs[kPointsPerBlock - 2 * kAfterBuffer];
+struct TransformLineFitPoint {
+  // Returns the weight of a point, from the image gradient at it.
+  __device__ __forceinline__ int32_t Weight(IndexPoint p) const {
+    // we now undo our fixed-point arithmetic.
+    // adjust for pixel center bias
+    constexpr int delta = 1;
+    int32_t ix2 = p.x() + delta;
+    int32_t iy2 = p.y() + delta;
+    int32_t ix = ix2 / 2;
+    int32_t iy = iy2 / 2;
 
-  // The errors which are from the start of the first blob before the beginning
-  // of the buffer.
-  double tmp_errs_before[kAfterBuffer];
-  // The errors which are from the end of the last blob after the end of the
-  // buffer.
-  double tmp_errs_after[kAfterBuffer];
+    int32_t W = 1;
 
-  // The filtered errors in the primary block.
-  double tmp_filtered_errs[kPointsPerBlock - 4 * kAfterBuffer + 2];
+    if (ix > 0 && ix + 1 < decimated_width && iy > 0 &&
+        iy + 1 < decimated_height) {
+      int32_t grad_x = decimated_image_device_[iy * decimated_width + ix + 1] -
+                       decimated_image_device_[iy * decimated_width + ix - 1];
 
-  // The filtered error corresponding to the first error in tmp_errs_before.
-  double tmp_filtered_err_before;
-  // The filtered error corresponding to the last error in tmp_errs_after.
-  double tmp_filtered_err_after;
+      int32_t grad_y =
+          decimated_image_device_[(iy + 1) * decimated_width + ix] -
+          decimated_image_device_[(iy - 1) * decimated_width + ix];
 
-  static_assert(sizeof(tmp_storage) == sizeof(LineFitPoint) * kPointsPerBlock,
-                "Storage changed size.");
-};
-static_assert(alignof(TempStorage) >= sizeof(int4));
-
-template <size_t kThreads>
-class ErrorCalculator {
- public:
-  // Calculates the errors of chunk, the chunk'th run of
-  // kPointsPerBlock - 2 * kErrorsBuffer points.
-  __host__ __device__ ErrorCalculator(
-      const LineFitPoint *line_fit_points_device, size_t points,
-      const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-      uint32_t chunk, TempStorage *storage)
-      : line_fit_points_device_(line_fit_points_device),
-        points_(points),
-        selected_extents_device_(selected_extents_device),
-        storage_(storage),
-        chunk_(chunk) {}
-
-  __host__ __device__ void Load() {
-    constexpr size_t kLoadSize = sizeof(int4);
-    static_assert(kLoadSize == 16, "kload");
-    // The cache starts at a multiple of kPointsPerBlock - 2 * kErrorsBuffer
-    // points, minus kErrorsBuffer, so it always starts on a 16 byte boundary
-    // and the division below is exact.
-    static_assert((kPointsPerBlock - 2 * kErrorsBuffer) * sizeof(LineFitPoint) %
-                      kLoadSize ==
-                  0);
-    static_assert(kErrorsBuffer * sizeof(LineFitPoint) % kLoadSize == 0);
-
-    // Global index in 128 bit loads.
-    const uint32_t global_index =
-        global_block_index_cache_start_ * sizeof(LineFitPoint) / kLoadSize +
-        threadIdx.x;
-
-    for (uint32_t i = 0; i < kPointsPerBlock * sizeof(LineFitPoint) / kLoadSize;
-         i += kThreads) {
-      // Load things in 128 bit increments strided across our threads in such a
-      // way our loads will coalesce nicely.
-      //
-      // Maybe overload a little bit past the end, but we over-allocate
-      // things on the host too.  Otherwise the end of the message can be
-      // corrupted.  For arrays which are multiples of kPointsPerBlock long,
-      // this will have no issues.  LineFitPoint is 40 bytes, not a multiple of
-      // the load size, so round up to load the last point's tail but nothing
-      // entirely past it.
-      if (i + global_index <
-          (points_ * sizeof(LineFitPoint) + kLoadSize - 1) / kLoadSize) {
-        *(reinterpret_cast<int4 *>(storage_->tmp_storage) + i + threadIdx.x) =
-            *(reinterpret_cast<const int4 *>(line_fit_points_device_) +
-              global_index + i);
-      }
+      // XXX Tunable. How to shape the gradient magnitude?
+      W = hypotf(grad_x, grad_y) + 1;
     }
+    return W;
   }
 
-  // Loads the blob extents for the provided buffer index. This index is from
-  // the front of the range we are responsible for computing.
-  __host__ __device__ void LoadExtents(size_t index) {
-    const size_t current_blob_index =
-        storage_->tmp_storage[index + (chunk_ == 0 ? 0 : kErrorsBuffer)]
-            .blob_index;
-    if (current_blob_index != blob_index_) {
-      starting_offset_ =
-          selected_extents_device_[current_blob_index].value.starting_offset;
-      count_ = selected_extents_device_[current_blob_index].value.count;
-      blob_index_ = current_blob_index;
-      ksz_ = std::min<uint32_t>(kMaxKsz, count_ / 12);
-    }
+  // Returns the line fit moments of a point with weight W.
+  __device__ __forceinline__ static LineFitPoint Moments(IndexPoint p,
+                                                         int32_t W) {
+    LineFitPoint result;
+
+    constexpr int delta = 1;
+    int32_t ix2 = p.x() + delta;
+    int32_t iy2 = p.y() + delta;
+
+    result.Mx = W * ix2;
+    result.My = W * iy2;
+    result.Mxx = W * ix2 * ix2;
+    result.Mxy = W * ix2 * iy2;
+    result.Myy = W * iy2 * iy2;
+    result.W = W;
+    result.blob_index = p.blob_index();
+    return result;
   }
 
-  // Loads the error from our shared memory.  This follows the same model as
-  // BlobIndex and CalculateError below.  Call LoadExtents first to get the
-  // right index, and proceed from there.
-  __host__ __device__ double LoadError(ssize_t index) const {
-    // Index into the current blob.  Should be between 0 and count_.
-    // Blobs have at most 2 * (width + height) points, so 32 bit division is
-    // exact here and below, and much cheaper than 64 bit division on the GPU.
-    const uint32_t positive_blob_index =
-        static_cast<uint32_t>(index + count_) % static_cast<uint32_t>(count_);
-
-    // This one is a normal one, it's global index is inside our range or
-    // contiguously just before our range.  Just do it.
-    //
-    // (note: kBeforeBuffer should be - on the right side of the >=, but due to
-    // unsigned arithmatic, it needs to be on the left.)
-    if (positive_blob_index + starting_offset_ + kBeforeBuffer >=
-        global_block_index_start()) {
-      // It is either inside our block, or just after our block.  That is all
-      // contiguous in memory and easy to calculate, so just return it.
-      if (positive_blob_index + starting_offset_ <
-          global_block_index_end() + kAfterBuffer) {
-        return storage_->tmp_errs[positive_blob_index + starting_offset_ +
-                                  kBeforeBuffer - global_block_index_start()];
-      }
-
-      // OK, this is past the back, but at the back end of the blob at the back
-      // end. These bytes are packed onto the back 4 objects of the buffer.
-      const size_t buffer_end = starting_offset_ + count_;
-      const size_t distance_from_end =
-          buffer_end - (positive_blob_index + starting_offset_);
-      return storage_->tmp_errs_after[4 - distance_from_end];
-    } else {
-      // We must be inside the before bits.
-      return storage_->tmp_errs_before[positive_blob_index];
-    }
+  __device__ __forceinline__ LineFitPoint operator()(IndexPoint p) const {
+    return Moments(p, Weight(p));
   }
 
-  // Loads the filtered error from the shared memory.  This follows the same
-  // model as BlobIndex and CalculateError below.  Call LoadExtents first to get
-  // the right index, and proceed from there.
-  __host__ __device__ double LoadFilteredError(ssize_t index) const {
-    const uint32_t positive_blob_index =
-        static_cast<uint32_t>(index + global_block_index_start_ + count_ -
-                              starting_offset_) %
-        static_cast<uint32_t>(count_);
-    // This one is a normal one, it's global index is inside our range or
-    // contiguously just before our range.  Just do it.
-    if (positive_blob_index + starting_offset_ + 1 >=
-        global_block_index_start()) {
-      // It is either inside our block, or just after our block.  That is all
-      // contiguous in memory and easy to calculate, so just return it.
-      if (positive_blob_index + starting_offset_ <
-          global_block_index_end() + 1) {
-        return storage_
-            ->tmp_filtered_errs[positive_blob_index + starting_offset_ + 1 -
-                                global_block_index_start()];
-      }
-
-      // OK, this is past the back, but at the back end of the blob at the back
-      // end.  Return the on error we've got there.
-      return storage_->tmp_filtered_err_after;
-    } else {
-      // We must be inside the before bits.
-      return storage_->tmp_filtered_err_before;
-    }
-  }
-
-  // Gets the line fit point from either our local cache, or from main memory if
-  // it is too far away.
-  __host__ __device__ LineFitPoint GetPoint(size_t global_index,
-                                            bool print = false) const {
-    if (global_index >= global_block_index_cache_end_ ||
-        global_index < global_block_index_cache_start_) {
-      if (print) {
-#ifdef DEBUG_BLOB_NUMBER
-        printf(
-            "Block %d Thread %d   Loading global %d, relative %d from global\n",
-            blockIdx.x, threadIdx.x, (int)global_index,
-            (int)(global_index - starting_offset_));
-#endif
-      }
-      return line_fit_points_device_[global_index];
-    } else {
-      if (print) {
-#ifdef DEBUG_BLOB_NUMBER
-        printf(
-            "Block %d Thread %d   Loading global %d, relative %d from cache\n",
-            blockIdx.x, threadIdx.x, (int)global_index,
-            (int)(global_index - starting_offset_));
-#endif
-      }
-      return storage_
-          ->tmp_storage[global_index - global_block_index_cache_start_];
-    }
-  }
-
-  // Returns the blob index for the provided buffer index.  This is relative to
-  // the start of the range we are responsible for.
-  __forceinline__ __host__ __device__ size_t
-  BlobIndex(size_t buffer_index) const {
-    return global_block_index_start_ + buffer_index - starting_offset_;
-  }
-
-  // Calculates the line fit error centered on the provided blob index in the
-  // current extent.
-  __device__ double CalculateError(ssize_t blob_index,
-                                   bool print = false) const {
-    // Index into the blob list for the current key.
-    const size_t i0 = static_cast<uint32_t>(blob_index + 2 * count_ - ksz_) %
-                      static_cast<uint32_t>(count_);
-    const size_t i1 = static_cast<uint32_t>(blob_index + count_ + ksz_) %
-                      static_cast<uint32_t>(count_);
-
-    const size_t global_i0 = i0 + starting_offset_;
-    const size_t global_i1 = i1 + starting_offset_;
-
-    int32_t Mx, My, W;
-    int64_t Mxx, Myy, Mxy;
-    int N;  // how many points are included in the set?
-
-    if (i0 < i1) {
-      N = i1 - i0 + 1;
-
-      LineFitPoint lf1 = GetPoint(global_i1);
-
-      Mx = lf1.Mx;
-      My = lf1.My;
-      Mxx = lf1.Mxx;
-      Mxy = lf1.Mxy;
-      Myy = lf1.Myy;
-      W = lf1.W;
-
-      if (i0 > 0) {
-        LineFitPoint lf0 = GetPoint(global_i0 - 1);
-
-        Mx -= lf0.Mx;
-        My -= lf0.My;
-        Mxx -= lf0.Mxx;
-        Mxy -= lf0.Mxy;
-        Myy -= lf0.Myy;
-        W -= lf0.W;
-      }
-    } else {
-      // i0 > i1, e.g. [15, 2]. Wrap around.
-      LineFitPoint lf0 = GetPoint(global_i0 - 1, print);
-      LineFitPoint lfsz = GetPoint(starting_offset_ + count_ - 1, print);
-
-      Mx = lfsz.Mx - lf0.Mx;
-      My = lfsz.My - lf0.My;
-      Mxx = lfsz.Mxx - lf0.Mxx;
-      Mxy = lfsz.Mxy - lf0.Mxy;
-      Myy = lfsz.Myy - lf0.Myy;
-      W = lfsz.W - lf0.W;
-
-      LineFitPoint lf1 = GetPoint(global_i1, print);
-
-      Mx += lf1.Mx;
-      My += lf1.My;
-      Mxx += lf1.Mxx;
-      Mxy += lf1.Mxy;
-      Myy += lf1.Myy;
-      W += lf1.W;
-
-      N = count_ - i0 + i1 + 1;
-    }
-
-    // And now fit it.
-    return FitLineError(N, Mx, My, Mxx, Myy, Mxy, W);
-  }
-
-  // Returns the starting global index of the region we are responsible for
-  // computing.
-  __host__ __device__ __forceinline__ uint32_t
-  global_block_index_start() const {
-    return global_block_index_start_;
-  }
-  // Returns the ending global index of the region we are responsible for
-  // computing.
-  __host__ __device__ __forceinline__ uint32_t global_block_index_end() const {
-    return global_block_index_end_;
-  }
-  // Returns the size of the region we are responsible for computing.
-  __host__ __device__ __forceinline__ uint32_t global_block_index_size() const {
-    return global_block_index_end_ - global_block_index_start_;
-  }
-
-  // Returns the starting index in global indices of the current blob ID.
-  __host__ __device__ __forceinline__ uint32_t
-  global_current_blob_starting_index() const {
-    return starting_offset_;
-  }
-
-  // Returns the number of points in the current blob ID.
-  __host__ __device__ __forceinline__ uint32_t
-  global_current_blob_count() const {
-    return count_;
-  }
-
-  // Returns the current blob ID.
-  __host__ __device__ __forceinline__ uint32_t blob_index() const {
-    return blob_index_;
-  }
-
- private:
-  const LineFitPoint *line_fit_points_device_;
-  size_t points_;
-  const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device_;
-
-  TempStorage *storage_;
-  const uint32_t chunk_;
-
-  // Start and end location of the LineFitPoint cache in tmp_storage_.
-  const uint32_t global_block_index_cache_start_ =
-      chunk_ == 0
-          ? 0
-          : chunk_ * (kPointsPerBlock - 2 * kErrorsBuffer) - kErrorsBuffer;
-  const uint32_t global_block_index_cache_end_ = std::min<uint32_t>(
-      global_block_index_cache_start_ + kPointsPerBlock, points_);
-
-  const uint32_t global_block_index_start_ =
-      chunk_ * (kPointsPerBlock - 2 * kErrorsBuffer);
-  const uint32_t global_block_index_end_ = std::min<uint32_t>(
-      global_block_index_start_ + kPointsPerBlock - 2 * kErrorsBuffer, points_);
-
-  size_t blob_index_ = 0xffffffff;
-  size_t starting_offset_ = 0;
-  size_t count_ = 0;
-  size_t ksz_ = 0;
+  TransformLineFitPoint(const uint8_t *decimated_image_device,
+                        int decimated_width_param, int decimated_height_param)
+      : decimated_image_device_(decimated_image_device),
+        decimated_width(decimated_width_param),
+        decimated_height(decimated_height_param) {}
+  const uint8_t *decimated_image_device_;
+  int decimated_width;
+  int decimated_height;
 };
 
-// Computes the errors, filtered errors, and peaks of one chunk of points.
-// Every thread in the block calls this, and storage is free again once it
-// returns.
-template <size_t kThreads>
-__device__ __forceinline__ void FitLinesChunk(
-    uint32_t chunk, size_t points, const LineFitPoint *line_fit_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    double *errs_device, double *filtered_errs_device, Peak *peaks_device,
-    TempStorage &storage) {
-  ErrorCalculator<kThreads> calculator(
-      line_fit_points_device, points, selected_extents_device, chunk, &storage);
+struct SumLineFitPoints {
+  __host__ __device__ __forceinline__ LineFitPoint
+  operator()(const LineFitPoint &a, const LineFitPoint &b) const {
+    LineFitPoint result;
+    result.Mx = a.Mx + b.Mx;
+    result.My = a.My + b.My;
+    result.Mxx = a.Mxx + b.Mxx;
+    result.Mxy = a.Mxy + b.Mxy;
+    result.Myy = a.Myy + b.Myy;
+    result.W = a.W + b.W;
+    result.blob_index = a.blob_index;
+    return result;
+  }
+};
 
-  calculator.Load();
+// One block fits each selected blob's quad.  Blobs with up to
+// kMaxSmallBlobPoints points get a FitSmallBlobQuads block each, and the few
+// bigger ones share the FitBigBlobQuads blocks.
+constexpr uint32_t kMaxSmallBlobPoints = 2048;
+// Blobs with up to this many points are sorted by ranking every point against
+// the others, which takes fewer steps than a radix sort's passes.
+constexpr uint32_t kMaxRankSortPoints = 256;
+constexpr int kSmallBlobThreads = 256;
+constexpr int kBigBlobThreads = 512;
+constexpr int kBigBlobPointsPerThread = 12;
+// A frame has about 1.5 big blobs.
+constexpr int kBigBlobBlocks = 8;
+constexpr int kWorkListThreads = 1024;
+// The width of IndexPoint::theta().
+constexpr int kThetaBits = 28;
 
-  // TODO(austin): Whichever warp loads the first ksz blobs should load the
-  // prior ksz blobs.  Figure out if things are too slow first.  __syncwarp()
-  // and make the first warp do it?
+static_assert(IndexPoint::kMaxBlobs % kWorkListThreads == 0);
+// BuildBlobWorkList counts both kinds of blob in one 32 bit sum.
+static_assert(IndexPoint::kMaxBlobs < (1 << 16));
 
-  __syncthreads();
+// Lists the selected blobs with points, split by size, in blob order, and
+// marks the rest invalid.
+__global__ void __launch_bounds__(kWorkListThreads)
+    BuildBlobWorkList(BlobQuadFitArgs args) {
+  constexpr int kBlobsPerThread = IndexPoint::kMaxBlobs / kWorkListThreads;
+  typedef cub::BlockScan<uint32_t, kWorkListThreads> BlockScan;
+  __shared__ typename BlockScan::TempStorage scan_storage;
 
-  // We need to compute a couple of errs_device past each end in shared memory.
-  // This needs to be (FilterCoefficients().size() - 1) + 2.  The first term is
-  // the number of extra errors we need for the filter.  The second is the extra
-  // number of errors needed to implement the peak finder (1 on each side).
-
-  // OK, the way this all works now, error calculation work [0, kErrorsBuffer)
-  // is done in the first kErrorsBuffer threads, and written to
-  // tmp_errs [0, kErrorsBuffer), even if this wraps back into the buffer.
-
-  // Now that everything is loaded, have each thread process its points by
-  // strides.
-
-  // TODO(austin): We need 4 reserved ranges.  Proposal is:
-  //   [0, kErrorsBuffer) -> beginning points of the extent of blob 0, ie
-  //     starting at starting_offset_ globally.
-  //
-  //   [kErrorsBuffer, 2 * kErrorsBuffer) -> 4 points immediately before the
-  //   starting point.
-  //
-  // And then symetrically off the back end too.  This will mean we process 16
-  // less points per thread.  Whatever.
-
-  for (size_t i = threadIdx.x; i < kPointsPerBlock; i += blockDim.x) {
-    // OK, now we need to do the actual line fit.
-    if (i < kErrorsBuffer) {
-      // Start by extending the errors before the blob in our buffer space.  All
-      // of this will be done in blob0's address space.
-      //
-      // In the first block, this will load the 8th element.  But, since blobs
-      // are 24 or longer, this will be the 0th blob.  For following blocks,
-      // this is actually the right index.
-      calculator.LoadExtents(0);
-
-      // First 4 threads do the first 4 elements in the first blob.
-      if (i < kBeforeBuffer) {
-        storage.tmp_errs_before[i] = calculator.CalculateError(i);
-      } else {
-        // Then, compute the 4 errors right before the buffer.
-        storage.tmp_errs[i - kBeforeBuffer] = calculator.CalculateError(
-            calculator.BlobIndex(i - kBeforeBuffer) - kBeforeBuffer);
-      }
-    } else if (i - kErrorsBuffer + calculator.global_block_index_start() <
-               calculator.global_block_index_end() + kBeforeBuffer) {
-      // Now we are solidly in the middle of the block.  Make sure anything
-      // computed after the end of the buffer uses the extents of the end.
-      calculator.LoadExtents(std::min<uint32_t>(
-          calculator.global_block_index_size() - 1, i - kErrorsBuffer));
-      size_t target_index = calculator.BlobIndex(i - kErrorsBuffer);
-
-#ifdef DEBUG_BLOB_NUMBER
-      const bool print =
-          (calculator.blob_index() == DEBUG_BLOB_NUMBER &&
-           ((484 - 4 <= target_index && target_index <= 484 + 4)));
-#endif
-
-      storage.tmp_errs[i - kBeforeBuffer] =
-          calculator.CalculateError(target_index);
-#ifdef DEBUG_BLOB_NUMBER
-      if (print) {
-        printf("Block %d Thread %d (idx %d)   Err: %f\n", blockIdx.x,
-               threadIdx.x, (int)target_index,
-               calculator.CalculateError(target_index, true));
-      }
-#endif
+  // Small blobs count in the low 16 bits, and big ones in the high 16.
+  constexpr uint32_t kSmallBlob = 1;
+  constexpr uint32_t kBigBlob = 1 << 16;
+  uint32_t kind[kBlobsPerThread];
+#pragma unroll
+  for (int i = 0; i < kBlobsPerThread; ++i) {
+    const uint32_t blob = threadIdx.x * kBlobsPerThread + i;
+    const uint32_t count = args.selected_extents[blob].value.count;
+    if (count == 0) {
+      kind[i] = 0;
+      // No quad fit block sees it.
+      args.fit_quad_valid[blob] = false;
+    } else if (count <= kMaxSmallBlobPoints) {
+      kind[i] = kSmallBlob;
     } else {
-      // Past the end of the normal calcs, do the end buffering.
-      if (i < kPointsPerBlock - kBeforeBuffer) {
-        continue;
-      }
-
-      // We are just supposed to continue with the extents of the last index
-      // and keep going.
-      calculator.LoadExtents(calculator.global_block_index_size() - 1);
-
-      // Wrap before the beginning now of the last blob.
-      storage.tmp_errs_after[i - (kPointsPerBlock - kBeforeBuffer)] =
-          calculator.CalculateError(calculator.global_current_blob_count() -
-                                    kBeforeBuffer +
-                                    (i - (kPointsPerBlock - kBeforeBuffer)));
+      kind[i] = kBigBlob;
     }
   }
-
-  __syncthreads();
-
-#ifdef DEBUG_BLOB_NUMBER
-  /*
+  uint32_t position[kBlobsPerThread];
+  uint32_t total;
+  BlockScan(scan_storage).ExclusiveSum(kind, position, total);
+#pragma unroll
+  for (int i = 0; i < kBlobsPerThread; ++i) {
+    const uint16_t blob = threadIdx.x * kBlobsPerThread + i;
+    if (kind[i] == kSmallBlob) {
+      args.work_list->small_blobs[position[i] & 0xffff] = blob;
+    } else if (kind[i] == kBigBlob) {
+      args.work_list->big_blobs[position[i] >> 16] = blob;
+    }
+  }
   if (threadIdx.x == 0) {
-    for (int i = (int)calculator.global_block_index_cache_start_;
-         i < (int)calculator.global_block_index_cache_end_; ++ i) {
-      auto x = calculator.GetPoint(i);
-      if (x.blob_index == DEBUG_BLOB_NUMBER) {
-        printf("Block %d Thread %d   Loading global %d, relative %d, Mx: %f\n",
-               blockIdx.x, threadIdx.x, i,
-               (int)(i - calculator.selected_extents_device_[x.blob_index]
-                             .value.starting_offset),
-               x.Mx / 2.0);
+    args.work_list->num_small_blobs = total & 0xffff;
+    args.work_list->num_big_blobs = total >> 16;
+  }
+}
+
+template <int kThreads>
+using LineFitPointScan =
+    cub::BlockScan<LineFitPoint, kThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+
+__device__ __forceinline__ LineFitPoint ZeroLineFitPoint(uint32_t blob_index) {
+  LineFitPoint result;
+  result.Mxx = 0;
+  result.Myy = 0;
+  result.Mxy = 0;
+  result.Mx = 0;
+  result.My = 0;
+  result.W = 0;
+  result.blob_index = blob_index;
+  return result;
+}
+
+// Carries the sum of a blob's line fit points from one chunk of them to the
+// next.
+struct LineFitPointPrefix {
+  __device__ __forceinline__ LineFitPoint
+  operator()(const LineFitPoint &chunk_sum) {
+    const LineFitPoint prefix = sum;
+    sum = SumLineFitPoints()(sum, chunk_sum);
+    return prefix;
+  }
+
+  LineFitPoint sum;
+};
+
+// Writes the next kThreads of a blob's sorted points, where this thread's
+// point goes at position, and the prefix sums of their line fit points.  Every
+// thread in the block calls this for each chunk.
+template <int kThreads>
+__device__ __forceinline__ void WriteSortedChunk(
+    typename LineFitPointScan<kThreads>::TempStorage &scan_storage,
+    LineFitPointPrefix &prefix, IndexPoint point, uint32_t position,
+    uint32_t count, const TransformLineFitPoint &transform,
+    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
+  LineFitPoint line_fit_point = ZeroLineFitPoint(prefix.sum.blob_index);
+  if (position < count) {
+    sorted_points[position] = point;
+    line_fit_point = transform(point);
+  }
+  LineFitPointScan<kThreads>(scan_storage)
+      .InclusiveScan(line_fit_point, line_fit_point, SumLineFitPoints(),
+                     prefix);
+  if (position < count) {
+    line_fit_points[position] = line_fit_point;
+  }
+  // The next chunk reuses scan_storage.
+  __syncthreads();
+}
+
+// Returns the key that orders a blob's points with the same angle: dxy, then
+// base_y, then base_x.  No two points share it, so sorting by angle and then
+// this does not depend on the order the blob has its points in.
+__device__ __forceinline__ uint32_t AngleTieKey(IndexPoint point) {
+  return (point.dxy() << 20) | (point.base_y() << 10) | point.base_x();
+}
+
+// Puts each run of a blob's sorted points with the same angle in AngleTieKey()
+// order, and redoes the line fit prefix sums inside the run.  Every thread in
+// the block calls this after writing the blob's points and passing a barrier.
+template <int kThreads, int kPointsPerThread>
+__device__ __forceinline__ void FixAngleTies(
+    uint32_t blob_index, uint32_t count, const TransformLineFitPoint &transform,
+    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
+  // Reading the angles back keeps the sort's registers free for the scans.
+  // Each lane reads one, and gets the next from the next lane.
+  const uint32_t lane = threadIdx.x % 32;
+  bool has_tie = false;
+#pragma unroll
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t position = i * kThreads + threadIdx.x;
+    const uint32_t theta =
+        position < count ? sorted_points[position].theta() : 0;
+    uint32_t next_theta = __shfl_down_sync(0xffffffffu, theta, 1);
+    if (lane == 31 && position + 1 < count) {
+      next_theta = sorted_points[position + 1].theta();
+    }
+    has_tie |= position + 1 < count && next_theta == theta;
+  }
+  // Ties are rare, and most blobs have none.
+  if (!__syncthreads_or(has_tie)) {
+    return;
+  }
+
+  // Every run is found before any moves, since finding one reads the points
+  // on both sides of it.  run_end is 0 where no run starts.
+  uint32_t run_end[kPointsPerThread];
+#pragma unroll
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t start = i * kThreads + threadIdx.x;
+    run_end[i] = 0;
+    if (start + 1 < count) {
+      const uint32_t theta = sorted_points[start].theta();
+      if (sorted_points[start + 1].theta() == theta &&
+          (start == 0 || sorted_points[start - 1].theta() != theta)) {
+        uint32_t end = start + 2;
+        while (end < count && sorted_points[end].theta() == theta) {
+          ++end;
+        }
+        run_end[i] = end;
       }
     }
   }
-
   __syncthreads();
-  */
-#endif
-
-  // We now have all the errors loaded! Box filter them.
-  for (size_t i = threadIdx.x; i < kPointsPerBlock; i += blockDim.x) {
-    // The peak finder needs 1 more filtered error in each direction.
-    ssize_t target_index;
-    double *destination;
-    if (i < kErrorsBuffer) {
-      if (i < kErrorsBuffer - 2) {
-        continue;
-      } else {
-        calculator.LoadExtents(0);
-        if (i < kErrorsBuffer - 1) {
-          // Target index is now 0.
-          target_index = 0;
-          destination = &storage.tmp_filtered_err_before;
-        } else {
-          target_index = calculator.BlobIndex(0) - 1;
-          destination = &storage.tmp_filtered_errs[i + 1 - kErrorsBuffer];
-        }
-      }
-    } else if (i - kErrorsBuffer + calculator.global_block_index_start() >=
-               calculator.global_block_index_end()) {
-      if (i - kErrorsBuffer + calculator.global_block_index_start() >=
-          calculator.global_block_index_end() + 2) {
-        // Past 1 past the end for the peak finder.
-        break;
-      }
-      calculator.LoadExtents(calculator.global_block_index_end() -
-                             calculator.global_block_index_start() - 1);
-
-      if (i - kErrorsBuffer + calculator.global_block_index_start() >=
-          calculator.global_block_index_end() + 1) {
-        destination = &storage.tmp_filtered_err_after;
-        target_index = calculator.global_current_blob_count() - 1;
-      } else {
-        destination = &storage.tmp_filtered_errs[i + 1 - kErrorsBuffer];
-        target_index = calculator.BlobIndex(i - kErrorsBuffer);
-      }
-    } else {
-      calculator.LoadExtents(i - kErrorsBuffer);
-      target_index = calculator.BlobIndex(i - kErrorsBuffer);
-      destination = &storage.tmp_filtered_errs[i + 1 - kErrorsBuffer];
-    }
-
-    double accumulated_error = 0.0;
-
-#ifdef DEBUG_BLOB_NUMBER
-    const bool print = (calculator.blob_index() == DEBUG_BLOB_NUMBER &&
-                        ((484 - 4 <= target_index && target_index <= 484 + 4)));
-#endif
 
 #pragma unroll
-    for (size_t j = 0; j < FilterCoefficients().size(); ++j) {
-      const double e = calculator.LoadError(target_index + j -
-                                            FilterCoefficients().size() / 2);
-      accumulated_error += e * FilterCoefficients()[j];
-#ifdef DEBUG_BLOB_NUMBER
-      if (print) {
-        printf("Block %d Thread %d (idx %d)    + %f * %f (%f) -> %f\n",
-               blockIdx.x, threadIdx.x, (int)target_index, e,
-               FilterCoefficients()[j], e * FilterCoefficients()[j],
-               accumulated_error);
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t start = i * kThreads + threadIdx.x;
+    const uint32_t end = run_end[i];
+    if (end == 0) {
+      continue;
+    }
+    for (uint32_t j = start + 1; j < end; ++j) {
+      const IndexPoint point = sorted_points[j];
+      const uint32_t key = AngleTieKey(point);
+      uint32_t k = j;
+      for (; k > start && AngleTieKey(sorted_points[k - 1]) > key; --k) {
+        sorted_points[k] = sorted_points[k - 1];
       }
-#endif
+      sorted_points[k] = point;
     }
-    *destination = accumulated_error;
-
-#ifdef DEBUG_BLOB_NUMBER
-    if (print) {
-      printf(
-          "Block %d Thread %d (idx %d)  Blob %d of size %d, index %d "
-          "filtered_error = "
-          "%f, error = %f\n",
-          blockIdx.x, threadIdx.x, (int)target_index,
-          (int)calculator.blob_index(),
-          (int)calculator.global_current_blob_count(), (int)target_index,
-          accumulated_error, calculator.LoadError(target_index));
+    // The run's last prefix sum covers all of it in any order, so it stays,
+    // and the run after this one may read it.
+    LineFitPoint sum =
+        start == 0 ? ZeroLineFitPoint(blob_index) : line_fit_points[start - 1];
+    for (uint32_t j = start; j + 1 < end; ++j) {
+      sum = SumLineFitPoints()(sum, transform(sorted_points[j]));
+      line_fit_points[j] = sum;
     }
-#endif
   }
+}
 
+// Sorts a blob's points by angle with a radix sort, then writes them and their
+// line fit points.  Points with the same angle end up in AngleTieKey() order.
+//
+// With kScanInChunks, the block scans kThreads sorted points at a time, which
+// keeps the writes coalesced.  Otherwise each thread sums its own
+// kPointsPerThread consecutive points and the block scans once, which is
+// faster for many points per thread.
+template <int kThreads, int kPointsPerThread, bool kScanInChunks>
+__device__ __forceinline__ void RadixSortAndScanBlob(
+    typename cub::BlockRadixSort<uint32_t, kThreads, kPointsPerThread,
+                                 uint32_t>::TempStorage &sort_storage,
+    typename LineFitPointScan<kThreads>::TempStorage &scan_storage,
+    uint32_t blob_index, const IndexPoint *points, uint32_t count,
+    const TransformLineFitPoint &transform, IndexPoint *sorted_points,
+    LineFitPoint *line_fit_points) {
+  typedef cub::BlockRadixSort<uint32_t, kThreads, kPointsPerThread, uint32_t>
+      BlockRadixSort;
+  uint32_t theta[kPointsPerThread];
+  uint32_t point_bits[kPointsPerThread];
+#pragma unroll
+  for (int i = 0; i < kPointsPerThread; ++i) {
+    const uint32_t index = threadIdx.x * kPointsPerThread + i;
+    if (index < count) {
+      const IndexPoint point = points[index];
+      theta[i] = point.theta();
+      point_bits[i] = point.point_bits();
+    } else {
+      // Sorts after every point, since no angle is bigger and the padding
+      // comes last.
+      theta[i] = 0xffffffffu;
+      point_bits[i] = 0;
+    }
+  }
+  if constexpr (kScanInChunks) {
+    BlockRadixSort(sort_storage)
+        .SortBlockedToStriped(theta, point_bits, 0, kThetaBits);
+  } else {
+    BlockRadixSort(sort_storage).Sort(theta, point_bits, 0, kThetaBits);
+  }
+  // scan_storage may alias sort_storage.
   __syncthreads();
-  // OK, errors are now saved to shared memory.  Compute peaks and push out to
-  // disk.
 
-  // TODO(austin): Don't save out the unfiltered errors if we aren't
-  // testing/debugging...
-  for (size_t i = threadIdx.x; i < kPointsPerBlock; i += blockDim.x) {
-    if (i < kErrorsBuffer) {
-      continue;
+  if constexpr (kScanInChunks) {
+    LineFitPointPrefix prefix{ZeroLineFitPoint(blob_index)};
+#pragma unroll
+    for (int i = 0; i < kPointsPerThread; ++i) {
+      if (i * kThreads >= count) {
+        break;
+      }
+      IndexPoint point(blob_index, point_bits[i]);
+      point.set_theta(theta[i]);
+      WriteSortedChunk<kThreads>(scan_storage, prefix, point,
+                                 i * kThreads + threadIdx.x, count, transform,
+                                 sorted_points, line_fit_points);
     }
-
-    if (i - kErrorsBuffer + calculator.global_block_index_start() >=
-        calculator.global_block_index_end()) {
-      break;
+  } else {
+    // Only the weights are kept between the two passes over the points, since
+    // the moments take too many registers.
+    int32_t weight[kPointsPerThread];
+    LineFitPoint sum = ZeroLineFitPoint(blob_index);
+#pragma unroll
+    for (int i = 0; i < kPointsPerThread; ++i) {
+      if (threadIdx.x * kPointsPerThread + i < count) {
+        IndexPoint point(blob_index, point_bits[i]);
+        weight[i] = transform.Weight(point);
+        sum = SumLineFitPoints()(
+            sum, TransformLineFitPoint::Moments(point, weight[i]));
+      }
     }
-
-    errs_device[i - kErrorsBuffer + calculator.global_block_index_start()] =
-        storage.tmp_errs[i - kBeforeBuffer];
+    LineFitPointScan<kThreads>(scan_storage)
+        .ExclusiveScan(sum, sum, ZeroLineFitPoint(blob_index),
+                       SumLineFitPoints());
+#pragma unroll
+    for (int i = 0; i < kPointsPerThread; ++i) {
+      const uint32_t position = threadIdx.x * kPointsPerThread + i;
+      if (position < count) {
+        IndexPoint point(blob_index, point_bits[i]);
+        point.set_theta(theta[i]);
+        sum = SumLineFitPoints()(
+            sum, TransformLineFitPoint::Moments(point, weight[i]));
+        sorted_points[position] = point;
+        line_fit_points[position] = sum;
+      }
+    }
+    // The next blob reuses scan_storage.
+    __syncthreads();
   }
+  // The sort is stable, so it left points with the same angle in the blob's
+  // order.
+  FixAngleTies<kThreads, kPointsPerThread>(blob_index, count, transform,
+                                           sorted_points, line_fit_points);
+}
 
-  for (size_t i = threadIdx.x; i < kPointsPerBlock; i += blockDim.x) {
-    if (i < kErrorsBuffer) {
-      continue;
-    }
+struct SmallBlobStorage {
+  union {
+    typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 2,
+                                 uint32_t>::TempStorage radix_sort2;
+    typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 4,
+                                 uint32_t>::TempStorage radix_sort4;
+    typename cub::BlockRadixSort<uint32_t, kSmallBlobThreads, 8,
+                                 uint32_t>::TempStorage radix_sort8;
+    uint64_t rank_keys[kMaxRankSortPoints];
+    typename LineFitPointScan<kSmallBlobThreads>::TempStorage scan;
+  } temp;
+  // The ranked points' keys, in sorted order.
+  uint64_t ranked_points[kMaxRankSortPoints];
+};
 
-    if (i - kErrorsBuffer + calculator.global_block_index_start() >=
-        calculator.global_block_index_end()) {
-      break;
-    }
-
-    calculator.LoadExtents(i - kErrorsBuffer);
-
-    const double before_error =
-        calculator.LoadFilteredError(i - kErrorsBuffer - 1);
-    const double my_error = calculator.LoadFilteredError(i - kErrorsBuffer);
-    const double after_error =
-        calculator.LoadFilteredError(i - kErrorsBuffer + 1);
-
-    // This gets us ready to sort.
-    filtered_errs_device[i - kErrorsBuffer +
-                         calculator.global_block_index_start()] = my_error;
-
-    const bool is_peak = my_error > before_error && my_error > after_error;
-
-    Peak peak;
-    peak.error = -my_error;
-    peak.blob_index = is_peak ? calculator.blob_index() : Peak::kNoPeak();
-    peak.filtered_point_index =
-        i - kErrorsBuffer + calculator.global_block_index_start();
-
-    peaks_device[peak.filtered_point_index] = peak;
+// Sorts a blob's points by angle by ranking each against the others, then
+// writes them and their line fit points.  Points with the same angle rank by
+// AngleTieKey().
+__device__ __forceinline__ void RankSortAndScanBlob(
+    SmallBlobStorage &storage, uint32_t blob_index, const IndexPoint *points,
+    uint32_t count, const TransformLineFitPoint &transform,
+    IndexPoint *sorted_points, LineFitPoint *line_fit_points) {
+  static_assert(kSmallBlobThreads == kMaxRankSortPoints);
+  const bool has_point = threadIdx.x < count;
+  // Every key is unique, so the ranks are too.
+  uint64_t key = 0;
+  IndexPoint point;
+  if (has_point) {
+    point = points[threadIdx.x];
+    key = (static_cast<uint64_t>(point.theta()) << 32) | AngleTieKey(point);
+    storage.temp.rank_keys[threadIdx.x] = key;
   }
-  // The next chunk reuses storage.
   __syncthreads();
-}
 
-// Fits lines to every chunk of the points, a block at a time.
-template <size_t kThreads>
-__global__ void DoFitLines(
-    const LineFitPoint *line_fit_points_device, const int *num_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    double *errs_device, double *filtered_errs_device, Peak *peaks_device) {
-  __shared__ TempStorage storage;
-
-  const size_t points = *num_points_device;
-  for (uint32_t chunk = blockIdx.x;
-       chunk * (kPointsPerBlock - 2 * kErrorsBuffer) < points;
-       chunk += gridDim.x) {
-    FitLinesChunk<kThreads>(chunk, points, line_fit_points_device,
-                            selected_extents_device, errs_device,
-                            filtered_errs_device, peaks_device, storage);
+  if (has_point) {
+    uint32_t rank = 0;
+    for (uint32_t j = 0; j < count; ++j) {
+      rank += storage.temp.rank_keys[j] < key;
+    }
+    storage.ranked_points[rank] = point.key;
   }
+  // The scan reuses rank_keys' storage.
+  __syncthreads();
+
+  LineFitPointPrefix prefix{ZeroLineFitPoint(blob_index)};
+  IndexPoint sorted_point;
+  if (has_point) {
+    sorted_point.key = storage.ranked_points[threadIdx.x];
+  }
+  WriteSortedChunk<kSmallBlobThreads>(storage.temp.scan, prefix, sorted_point,
+                                      threadIdx.x, count, transform,
+                                      sorted_points, line_fit_points);
 }
 
-void FitLines(
-    const LineFitPoint *line_fit_points_device, const int *num_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    double *errs_device, double *filtered_errs_device, Peak *peaks_device,
-    CudaStream *stream) {
-  constexpr size_t kThreads = 128;
-  // Only the GPU knows the number of points, so the grid fills the GPU once
-  // and loops over the chunks.
-  static const int kBlocks = ResidentBlocks(DoFitLines<kThreads>, kThreads);
-  DoFitLines<kThreads><<<kBlocks, kThreads, 0, stream->get()>>>(
-      line_fit_points_device, num_points_device, selected_extents_device,
-      errs_device, filtered_errs_device, peaks_device);
-}
-
-namespace {
+union BigBlobStorage {
+  typename cub::BlockRadixSort<uint32_t, kBigBlobThreads,
+                               kBigBlobPointsPerThread, uint32_t>::TempStorage
+      radix_sort;
+  typename LineFitPointScan<kBigBlobThreads>::TempStorage scan;
+};
 
 // Returns n choose k as a constexpr.
 constexpr uint Binomial(uint n, uint k) {
@@ -863,16 +665,7 @@ ReadMoments(const LineFitPoint *line_fit_points_device, size_t blob_point_count,
 }
 
 __device__ void FitLine(LineFitMoments moments, double *lineparam01,
-                        double *lineparam23, double *err, double *mse,
-                        bool print = false) {
-  if (print) {
-    printf(
-        "Block %d Thread %d   Mx: %.4f, My: %.4f, Mxx: %.4f, Mxy: %.4f, Myy: "
-        "%.4f, W: %d, N: %d\n",
-        blockIdx.x, threadIdx.x, moments.Mx / 2.0, moments.My / 2.0,
-        moments.Mxx / 4.0, moments.Mxy / 4.0, moments.Myy / 4.0, moments.W,
-        moments.N);
-  }
+                        double *lineparam23, double *err, double *mse) {
   int64_t Cxx = moments.Mxx * moments.W - static_cast<int64_t>(moments.Mx) *
                                               static_cast<int64_t>(moments.Mx);
   int64_t Cxy = moments.Mxy * moments.W - static_cast<int64_t>(moments.Mx) *
@@ -885,17 +678,13 @@ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
   // TODO(austin): Are floats good enough?  Hard to tell what the "right answer"
   // actually is...
   const float hypot_cached = std::hypotf((Cxx - Cyy), 2 * Cxy);
-  // A blob's W is at most 5808 * 361, so 8 W^2 is an integer below 2^53.
-  // Converting it straight to float rounds it once, exactly as converting it
-  // to double (exact) and then to float would, without the FP64 pipe.
+  // A blob's W is at most kMaxBlobPoints * 361, so 8 W^2 is an integer below
+  // 2^53.  Converting it straight to float rounds it once, exactly as
+  // converting it to double (exact) and then to float would, without the FP64
+  // pipe.
   const float eight_w_squared = static_cast<float>(
       static_cast<int64_t>(moments.W) * static_cast<int64_t>(moments.W) * 8);
   const float eig_small = (Cxx + Cyy - hypot_cached) / eight_w_squared;
-  if (print) {
-    printf("Block %d Thread %d   eig_small: (%ld + %ld - %f) / %f -> %f\n",
-           blockIdx.x, threadIdx.x, Cxx, Cyy, hypot_cached, eight_w_squared,
-           eig_small);
-  }
 
   if (lineparam01) {
     lineparam01[0] =
@@ -932,11 +721,6 @@ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
   // sum of squared errors
   *err = moments.N * eig_small;
 
-  if (print) {
-    printf("Block %d Thread %d   err: %f\n", blockIdx.x, threadIdx.x,
-           moments.N * eig_small);
-  }
-
   // mean squared error
   *mse = eig_small;
 }
@@ -944,16 +728,13 @@ __device__ void FitLine(LineFitMoments moments, double *lineparam01,
 __device__ __forceinline__ void FitLine(
     const LineFitPoint *line_fit_points_device, size_t blob_point_count,
     size_t index0, size_t index1, double *lineparam01, double *lineparam23,
-    double *err, double *mse, bool print = false) {
+    double *err, double *mse) {
   LineFitMoments moments =
       ReadMoments(line_fit_points_device, blob_point_count, index0, index1);
-  FitLine(moments, lineparam01, lineparam23, err, mse, print);
+  FitLine(moments, lineparam01, lineparam23, err, mse);
 }
 
 namespace {
-
-// Threads per DoFitQuads block.
-constexpr uint32_t kFitQuadsThreads = 256;
 
 // Unrank() for each combination of 4 peaks, so the quad fit's threads look
 // their combinations up instead of computing them.  Every thread reads a
@@ -1203,89 +984,256 @@ __device__ __forceinline__ void QuadFitTail(
   }
 }
 
-struct FitQuadsStorage {
-  typedef cub::BlockScan<int, kFitQuadsThreads> BlockScan;
+// Returns the error of the line fit to the points within ksz of point i of a
+// blob of count points, wrapping around the blob.  line_fit_points holds the
+// prefix sums of the blob's points' line fit points.
+__device__ __forceinline__ double PointError(
+    const LineFitPoint *line_fit_points, uint32_t count, uint32_t ksz,
+    uint32_t i) {
+  // Blobs have at most 2 * (width + height) points, so 32 bit division is
+  // exact, and much cheaper than 64 bit division on the GPU.
+  const uint32_t i0 = (i + 2 * count - ksz) % count;
+  const uint32_t i1 = (i + count + ksz) % count;
+  const LineFitMoments moments = ReadMoments(line_fit_points, count, i0, i1);
+  return FitLineError(moments.N, moments.Mx, moments.My, moments.Mxx,
+                      moments.Myy, moments.Mxy, moments.W);
+}
 
-  typename BlockScan::TempStorage scan;
-  QuadFitTailStorage<kFitQuadsThreads> tail;
+// Shared memory for FitBlobQuad.
+template <int kThreads>
+struct FitBlobQuadStorage {
+  typename cub::BlockScan<int, kThreads>::TempStorage scan;
+  QuadFitTailStorage<kThreads> tail;
 };
 
-// Fits a quad to blob blockIdx.x from its best kNMaxima peaks.  peak_keys has
-// room for max_peaks keys.
-__global__ void __launch_bounds__(kFitQuadsThreads) DoFitQuads(
-    const Peak *peaks_device, const LineFitPoint *line_fit_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    uint32_t max_peaks, float max_line_fit_mse, double max_dot,
-    FitQuad *fit_quads_device, bool *fit_quad_valid_device) {
-  extern __shared__ uint64_t peak_keys[];
-  __shared__ FitQuadsStorage storage;
-
-  const uint32_t blob_index = blockIdx.x;
-  const MinMaxExtents extents = selected_extents_device[blob_index].value;
-  const uint32_t count = extents.count;
-  // Filtered out blobs, and blobs past the end, have no points.
-  if (count == 0) {
-    if (threadIdx.x == 0) {
-      fit_quad_valid_device[blob_index] = false;
+// Fits blob blob_index's quad from its count sorted points' line fit points,
+// the way aprilrobotics' fit_quad does: fits a line around each point, filters
+// the fits' errors, and fits the quad from the best kNMaxima peaks of the
+// filtered errors.  errs and filtered_errs have room for count errors, and
+// peak_keys for max_peaks keys, which is more than the blob has peaks.  All of
+// them may be in shared or global memory.  The blob's points start at offset
+// in args' buffers.  Every thread of a kThreads thread block calls this.
+template <int kThreads>
+__device__ __forceinline__ void FitBlobQuad(
+    FitBlobQuadStorage<kThreads> &storage, const BlobQuadFitArgs &args,
+    uint32_t blob_index, uint32_t count, uint32_t offset,
+    const LineFitPoint *line_fit_points, double *errs, double *filtered_errs,
+    uint64_t *peak_keys, uint32_t max_peaks) {
+  const uint32_t ksz = min(kMaxKsz, count / 12);
+  for (uint32_t i = threadIdx.x; i < count; i += kThreads) {
+    const double error = PointError(line_fit_points, count, ksz, i);
+    errs[i] = error;
+    if (args.keep_intermediates) {
+      args.errs[offset + i] = error;
     }
-    return;
   }
-  const Peak *peaks = peaks_device + extents.starting_offset;
-  const LineFitPoint *line_fit_points =
-      line_fit_points_device + extents.starting_offset;
+  __syncthreads();
+
+  for (uint32_t i = threadIdx.x; i < count; i += kThreads) {
+    double filtered_error = 0.0;
+#pragma unroll
+    for (size_t j = 0; j < FilterCoefficients().size(); ++j) {
+      // Wraps around the blob, which has more points than the filter.
+      uint32_t k = i + j + count - FilterCoefficients().size() / 2;
+      k = k >= count ? k - count : k;
+      k = k >= count ? k - count : k;
+      filtered_error += errs[k] * FilterCoefficients()[j];
+    }
+    filtered_errs[i] = filtered_error;
+    if (args.keep_intermediates) {
+      args.filtered_errs[offset + i] = filtered_error;
+    }
+  }
+  __syncthreads();
 
   // Collect the peaks' keys, in point order.
   uint32_t num_peaks = 0;
-  for (uint32_t chunk = 0; chunk < count; chunk += kFitQuadsThreads) {
-    const uint32_t index = chunk + threadIdx.x;
+  for (uint32_t chunk = 0; chunk < count; chunk += kThreads) {
+    const uint32_t i = chunk + threadIdx.x;
     int is_peak = 0;
     float error = 0;
-    if (index < count) {
-      is_peak = peaks[index].blob_index != Peak::kNoPeak();
-      error = peaks[index].error;
+    if (i < count) {
+      // Every window has W >= 1, so the filtered errors are finite, and
+      // comparing their DoubleOrderKey()s decides the same as comparing them,
+      // without the FP64 pipe.
+      const double filtered_error = filtered_errs[i];
+      const uint64_t key = DoubleOrderKey(filtered_error);
+      is_peak =
+          key > DoubleOrderKey(filtered_errs[i == 0 ? count - 1 : i - 1]) &&
+          key > DoubleOrderKey(filtered_errs[i + 1 == count ? 0 : i + 1]);
+      error = -filtered_error;
+      if (args.keep_intermediates) {
+        Peak peak;
+        peak.error = error;
+        peak.filtered_point_index = offset + i;
+        peak.blob_index = is_peak ? blob_index : Peak::kNoPeak();
+        args.peaks[offset + i] = peak;
+      }
     }
-    int offset;
+    int position;
     int chunk_peaks;
-    FitQuadsStorage::BlockScan(storage.scan)
-        .ExclusiveSum(is_peak, offset, chunk_peaks);
-    // Two neighboring points can't both be peaks, so this always holds.
-    if (is_peak && num_peaks + offset < max_peaks) {
-      peak_keys[num_peaks + offset] = PeakSortKey(error, index);
+    cub::BlockScan<int, kThreads>(storage.scan)
+        .ExclusiveSum(is_peak, position, chunk_peaks);
+    if (is_peak && num_peaks + position < max_peaks) {
+      peak_keys[num_peaks + position] = PeakSortKey(error, i);
     }
     num_peaks += chunk_peaks;
+    // The next chunk reuses storage.scan, and QuadFitTail reads peak_keys.
     __syncthreads();
   }
 
-  QuadFitTail<kFitQuadsThreads>(storage.tail, blob_index, count,
-                                line_fit_points, peak_keys, num_peaks,
-                                max_peaks, max_line_fit_mse, max_dot,
-                                fit_quads_device, fit_quad_valid_device);
+  QuadFitTail<kThreads>(storage.tail, blob_index, count, line_fit_points,
+                        peak_keys, num_peaks, max_peaks, args.max_line_fit_mse,
+                        args.cos_critical_rad, args.fit_quads,
+                        args.fit_quad_valid);
+}
+
+// Blobs with up to this many points keep their sorted points, line fit
+// points, and errors in shared memory from the sort to the quad fit, and
+// bigger ones use args' buffers.  4 blocks still fit in an Orin SM's shared
+// memory, and bigger limits measured no faster.
+constexpr uint32_t kMaxSharedBlobPoints = 256;
+
+struct SmallBlobQuadStorage {
+  union {
+    SmallBlobStorage sort;
+    // Two neighboring points are never both peaks.
+    uint64_t peak_keys[kMaxSmallBlobPoints / 2 + 1];
+  } temp;
+  // IndexPoint's constructor keeps it out of a __shared__ variable, so this
+  // holds the points uninitialized.
+  cub::Uninitialized<IndexPoint[kMaxSharedBlobPoints]> sorted_points;
+  LineFitPoint line_fit_points[kMaxSharedBlobPoints];
+  double errs[kMaxSharedBlobPoints];
+  double filtered_errs[kMaxSharedBlobPoints];
+  FitBlobQuadStorage<kSmallBlobThreads> fit;
+};
+
+// Fits the quad of each small blob in the work list, one blob per block.
+__global__ void __launch_bounds__(kSmallBlobThreads, 4)
+    FitSmallBlobQuadsKernel(BlobQuadFitArgs args,
+                            TransformLineFitPoint transform) {
+  __shared__ SmallBlobQuadStorage storage;
+  if (blockIdx.x >= args.work_list->num_small_blobs) {
+    return;
+  }
+  const uint32_t blob_index = args.work_list->small_blobs[blockIdx.x];
+  const MinMaxExtents extents = args.selected_extents[blob_index].value;
+  const uint32_t count = extents.count;
+  const uint32_t offset = extents.starting_offset;
+  const IndexPoint *points = args.selected_blobs + offset;
+  const bool in_shared = count <= kMaxSharedBlobPoints;
+  IndexPoint *sorted_points =
+      in_shared ? storage.sorted_points.Alias() : args.sorted_points + offset;
+  LineFitPoint *line_fit_points =
+      in_shared ? storage.line_fit_points : args.line_fit_points + offset;
+  if (count <= kMaxRankSortPoints) {
+    RankSortAndScanBlob(storage.temp.sort, blob_index, points, count, transform,
+                        sorted_points, line_fit_points);
+  } else if (count <= 2 * kSmallBlobThreads) {
+    RadixSortAndScanBlob<kSmallBlobThreads, 2, true>(
+        storage.temp.sort.temp.radix_sort2, storage.temp.sort.temp.scan,
+        blob_index, points, count, transform, sorted_points, line_fit_points);
+  } else if (count <= 4 * kSmallBlobThreads) {
+    RadixSortAndScanBlob<kSmallBlobThreads, 4, true>(
+        storage.temp.sort.temp.radix_sort4, storage.temp.sort.temp.scan,
+        blob_index, points, count, transform, sorted_points, line_fit_points);
+  } else {
+    static_assert(8 * kSmallBlobThreads == kMaxSmallBlobPoints);
+    RadixSortAndScanBlob<kSmallBlobThreads, 8, true>(
+        storage.temp.sort.temp.radix_sort8, storage.temp.sort.temp.scan,
+        blob_index, points, count, transform, sorted_points, line_fit_points);
+  }
+  // FixAngleTies may still be writing the sorted points and line fit points
+  // the rest reads.
+  __syncthreads();
+
+  if (args.keep_intermediates && in_shared) {
+    for (uint32_t i = threadIdx.x; i < count; i += kSmallBlobThreads) {
+      args.sorted_points[offset + i] = sorted_points[i];
+      args.line_fit_points[offset + i] = line_fit_points[i];
+    }
+  }
+  FitBlobQuad<kSmallBlobThreads>(
+      storage.fit, args, blob_index, count, offset, line_fit_points,
+      in_shared ? storage.errs : args.errs + offset,
+      in_shared ? storage.filtered_errs : args.filtered_errs + offset,
+      storage.temp.peak_keys, std::size(storage.temp.peak_keys));
+}
+
+struct BigBlobQuadStorage {
+  union {
+    BigBlobStorage sort;
+    // Two neighboring points are never both peaks.
+    uint64_t peak_keys[kBigBlobThreads * kBigBlobPointsPerThread / 2 + 1];
+  } temp;
+  FitBlobQuadStorage<kBigBlobThreads> fit;
+};
+// Kernels get at most 48 KiB of static shared memory.
+static_assert(sizeof(SmallBlobQuadStorage) <= 48 * 1024);
+static_assert(sizeof(BigBlobQuadStorage) <= 48 * 1024);
+// An Orin SM has 164 KiB of shared memory, and each block also takes 1 KiB for
+// the system.
+static_assert(4 * (sizeof(SmallBlobQuadStorage) + 1024) <= 164 * 1024);
+
+// Fits the quad of each big blob in the work list, looping over the blobs.
+// They keep everything but their peaks in args' buffers.
+__global__ void __launch_bounds__(kBigBlobThreads)
+    FitBigBlobQuadsKernel(BlobQuadFitArgs args,
+                          TransformLineFitPoint transform) {
+  __shared__ BigBlobQuadStorage storage;
+  const uint32_t num_big_blobs = args.work_list->num_big_blobs;
+  for (uint32_t i = blockIdx.x; i < num_big_blobs; i += gridDim.x) {
+    const uint32_t blob_index = args.work_list->big_blobs[i];
+    const MinMaxExtents extents = args.selected_extents[blob_index].value;
+    const uint32_t offset = extents.starting_offset;
+    RadixSortAndScanBlob<kBigBlobThreads, kBigBlobPointsPerThread, false>(
+        storage.temp.sort.radix_sort, storage.temp.sort.scan, blob_index,
+        args.selected_blobs + offset, extents.count, transform,
+        args.sorted_points + offset, args.line_fit_points + offset);
+    // FixAngleTies may still be writing the line fit points FitBlobQuad
+    // reads.
+    __syncthreads();
+    FitBlobQuad<kBigBlobThreads>(
+        storage.fit, args, blob_index, extents.count, offset,
+        args.line_fit_points + offset, args.errs + offset,
+        args.filtered_errs + offset, storage.temp.peak_keys,
+        std::size(storage.temp.peak_keys));
+    // The next blob reuses storage.
+    __syncthreads();
+  }
 }
 
 }  // namespace
 
-void FitQuads(
-    const Peak *peaks_device, const LineFitPoint *line_fit_points_device,
-    const cub::KeyValuePair<long, MinMaxExtents> *selected_extents_device,
-    size_t num_blobs, size_t max_blob_points, int nmaxima,
-    float max_line_fit_mse, double cos_critical_rad, FitQuad *fit_quads_device,
-    bool *fit_quad_valid_device, CudaStream *stream) {
-  ABSL_CHECK_EQ(nmaxima, kNMaxima)
+void ListBlobs(const BlobQuadFitArgs &args, CudaStream *stream) {
+  BuildBlobWorkList<<<1, kWorkListThreads, 0, stream->get()>>>(args);
+}
+
+void FitSmallBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream) {
+  ABSL_CHECK_EQ(args.nmaxima, kNMaxima)
       << ": Kernel is compiled and optimized for a fixed nmaxima, please "
          "recompile if you want to change it.";
-  // No two neighboring points are both peaks.
-  const uint32_t max_peaks = max_blob_points / 2 + 1;
-  const size_t peak_keys_bytes = max_peaks * sizeof(uint64_t);
-  // Launches get 48 KiB of shared memory unless the kernel asks for more.
-  if (peak_keys_bytes + sizeof(FitQuadsStorage) > 48 * 1024) {
-    CHECK_CUDA(cudaFuncSetAttribute(DoFitQuads,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    peak_keys_bytes));
-  }
-  DoFitQuads<<<num_blobs, kFitQuadsThreads, peak_keys_bytes, stream->get()>>>(
-      peaks_device, line_fit_points_device, selected_extents_device, max_peaks,
-      max_line_fit_mse, cos_critical_rad, fit_quads_device,
-      fit_quad_valid_device);
+  FitSmallBlobQuadsKernel<<<IndexPoint::kMaxBlobs, kSmallBlobThreads, 0,
+                            stream->get()>>>(
+      args, TransformLineFitPoint(args.decimated_image, args.decimated_width,
+                                  args.decimated_height));
+}
+
+void FitBigBlobQuads(const BlobQuadFitArgs &args, CudaStream *stream) {
+  ABSL_CHECK_EQ(args.nmaxima, kNMaxima)
+      << ": Kernel is compiled and optimized for a fixed nmaxima, please "
+         "recompile if you want to change it.";
+  // Each block holds a whole blob.
+  static_assert(kBigBlobThreads * kBigBlobPointsPerThread == kMaxBlobPoints);
+  ABSL_CHECK_LE(args.max_blob_points, kMaxBlobPoints);
+  FitBigBlobQuadsKernel<<<kBigBlobBlocks, kBigBlobThreads, 0, stream->get()>>>(
+      args, TransformLineFitPoint(args.decimated_image, args.decimated_width,
+                                  args.decimated_height));
+}
+
+std::vector<int> BigBlobQuadFitPriorities(const CudaGraph &graph) {
+  return graph.KernelPriorities(FitBigBlobQuadsKernel);
 }
 
 std::ostream &operator<<(std::ostream &os,
