@@ -125,6 +125,26 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "mono8_threshold_test",
+    srcs = [
+        "mono8_threshold_test.cc",
+    ],
+    tags = [
+        # This needs a GPU, which means we need the GPU to be accessible inside
+        # the container.  Rather than solve that right now, just run it under
+        # linux-sandbox on the host which has a GPU already.
+        "no-remote-exec",
+    ],
+    target_compatible_with = ["//tools/platforms/gpu:nvidia"],
+    deps = [
+        ":threshold",
+        "//aos/testing:googletest",
+        "//aos/testing:random_seed",
+        "//third_party/apriltag",
+    ],
+)
+
 cuda_library(
     name = "apriltag",
     srcs = [

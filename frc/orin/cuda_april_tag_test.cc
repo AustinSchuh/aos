@@ -2244,6 +2244,46 @@ class AprilDetectionTest : public ::testing::Test {
     return color_image;
   }
 
+  // Detects tags in a MONO8 copy of orin_capture_24_04 and checks the GPU
+  // intermediates and detections against aprilrobotics.  The detector reads
+  // the image through the device alias of host memory registered with CUDA,
+  // as it reads a CameraImage, starting offset bytes past a page boundary.
+  void DetectRegisteredMono8(size_t offset) {
+    auto image = ReadImage("orin_capture_24_04/file/orin_capture_24_04.bfbs");
+    cv::Mat gray_image;
+    cv::cvtColor(ToMat(&image.message()), gray_image, cv::COLOR_YUV2GRAY_YUYV);
+
+    const size_t image_bytes = gray_image.total();
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    const size_t buffer_bytes =
+        (offset + image_bytes + page_size - 1) / page_size * page_size;
+    uint8_t *buffer =
+        static_cast<uint8_t *>(aligned_alloc(page_size, buffer_bytes));
+    ASSERT_NE(buffer, nullptr);
+    uint8_t *image_host = buffer + offset;
+    memcpy(image_host, gray_image.data, image_bytes);
+    CHECK_CUDA(cudaHostRegister(buffer, buffer_bytes, cudaHostRegisterDefault));
+    uint8_t *buffer_device = nullptr;
+    CHECK_CUDA(cudaHostGetDevicePointer(
+        reinterpret_cast<void **>(&buffer_device), buffer, 0));
+    const cv::Mat mono_image(gray_image.size(), CV_8UC1, image_host);
+
+    {
+      CudaAprilTagDetector cuda_detector(gray_image.cols, gray_image.rows,
+                                         tag36h11_create(),
+                                         vision::ImageFormat::MONO8);
+      cuda_detector.set_undistort(true);
+      cuda_detector.SetCameraFourConstants();
+
+      cuda_detector.DetectGPU(mono_image, buffer_device + offset);
+      cuda_detector.DetectCPU(mono_image.clone());
+      cuda_detector.Check(mono_image.clone());
+    }
+
+    CHECK_CUDA(cudaHostUnregister(buffer));
+    free(buffer);
+  }
+
  private:
   std::unique_ptr<bazel::tools::cpp::runfiles::Runfiles> runfiles_;
 };
@@ -3241,38 +3281,19 @@ TEST(LabelImageTest, MatchesReference) {
 TEST_F(AprilDetectionTest, NeonMono8) {
   absl::FlagSaver flag_saver;
   absl::SetFlag(&FLAGS_use_neon, true);
-
-  auto image = ReadImage("orin_capture_24_04/file/orin_capture_24_04.bfbs");
-  cv::Mat gray_image;
-  cv::cvtColor(ToMat(&image.message()), gray_image, cv::COLOR_YUV2GRAY_YUYV);
-
-  const size_t image_bytes = gray_image.total();
-  const size_t page_size = sysconf(_SC_PAGESIZE);
-  uint8_t *image_host = static_cast<uint8_t *>(aligned_alloc(
-      page_size, (image_bytes + page_size - 1) / page_size * page_size));
-  ASSERT_NE(image_host, nullptr);
-  memcpy(image_host, gray_image.data, image_bytes);
-  CHECK_CUDA(
-      cudaHostRegister(image_host, image_bytes, cudaHostRegisterDefault));
-  uint8_t *image_device = nullptr;
-  CHECK_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void **>(&image_device),
-                                      image_host, 0));
-  const cv::Mat mono_image(gray_image.size(), CV_8UC1, image_host);
-
-  {
-    CudaAprilTagDetector cuda_detector(gray_image.cols, gray_image.rows,
-                                       tag36h11_create(),
-                                       vision::ImageFormat::MONO8);
-    cuda_detector.set_undistort(true);
-    cuda_detector.SetCameraFourConstants();
-
-    cuda_detector.DetectGPU(mono_image, image_device);
-    cuda_detector.DetectCPU(mono_image.clone());
-    cuda_detector.Check(mono_image.clone());
-  }
-
-  CHECK_CUDA(cudaHostUnregister(image_host));
-  free(image_host);
+  DetectRegisteredMono8(0);
 }
 #endif
+
+// Tests a MONO8 image thresholded on the GPU, read from host memory registered
+// with CUDA.  A flatbuffer only aligns the image to 4 bytes, so the image also
+// starts 4 bytes past an 8 byte boundary.
+TEST_F(AprilDetectionTest, GpuMono8) {
+  absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_use_neon, false);
+  for (size_t offset : {0, 4}) {
+    SCOPED_TRACE("offset " + std::to_string(offset));
+    DetectRegisteredMono8(offset);
+  }
+}
 }  // namespace frc::apriltag::testing

@@ -201,14 +201,101 @@ __global__ void InternalThreshold(const uint8_t *decimated_image,
   }
 }
 
+// The thread block shape of InternalMono8DecimateThreshold, in 4x4 decimated
+// blocks.  The outer ring of blocks only feeds the 3x3 filter of the inner
+// ones, so taller blocks load fewer rows twice; on the Orin 16 rows beat 8 and
+// 32.
+constexpr int kFusedBlockCols = 32;
+constexpr int kFusedBlockRows = 16;
+
+// Decimates and thresholds a MONO8 image in one pass, exactly as
+// InternalCudaToGreyscaleAndDecimate, InternalBlockMinMax, InternalBlockFilter
+// and InternalThreshold do in four.  Each thread owns one 4x4 block of the
+// decimated image.  Thread blocks overlap by one 4x4 block on each side, so
+// the 3x3 min/max filter of the inner blocks only reads shared memory.
+__global__ void __launch_bounds__(kFusedBlockCols *kFusedBlockRows)
+    InternalMono8DecimateThreshold(const uint8_t *image,
+                                   const apriltag_size_t in_width,
+                                   uint8_t *decimated_image,
+                                   uint8_t *thresholded_image,
+                                   const apriltag_size_t block_cols,
+                                   const apriltag_size_t block_rows,
+                                   const apriltag_size_t min_white_black_diff) {
+  __shared__ uchar2 block_minmax[kFusedBlockRows][kFusedBlockCols];
+
+  const int block_x =
+      static_cast<int>(blockIdx.x * (kFusedBlockCols - 2) + threadIdx.x) - 1;
+  const int block_y =
+      static_cast<int>(blockIdx.y * (kFusedBlockRows - 2) + threadIdx.y) - 1;
+  const bool in_image = block_x >= 0 && block_y >= 0 &&
+                        block_x < static_cast<int>(block_cols) &&
+                        block_y < static_cast<int>(block_rows);
+
+  // Each word holds one row of the block's 4 decimated pixels.
+  uint32_t decimated[4];
+  // Blocks off the image don't change the filter, which skips them.
+  uchar2 minmax = make_uchar2(255, 0);
+  if (in_image) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      // The 8 raw pixels under a decimated row, loaded 4 bytes at a time
+      // because the image is only 4 byte aligned.
+      const uint32_t *raw = reinterpret_cast<const uint32_t *>(
+          image + (2 * (4 * block_y + i)) * in_width + 8 * block_x);
+      // Keep the even pixels: bytes 0 and 2 of each word.
+      decimated[i] = __byte_perm(raw[0], raw[1], 0x6420);
+    }
+    uint32_t min_word = __vminu4(__vminu4(decimated[0], decimated[1]),
+                                 __vminu4(decimated[2], decimated[3]));
+    min_word = __vminu4(min_word, min_word >> 16);
+    min_word = __vminu4(min_word, min_word >> 8);
+    uint32_t max_word = __vmaxu4(__vmaxu4(decimated[0], decimated[1]),
+                                 __vmaxu4(decimated[2], decimated[3]));
+    max_word = __vmaxu4(max_word, max_word >> 16);
+    max_word = __vmaxu4(max_word, max_word >> 8);
+    minmax = make_uchar2(min_word & 0xff, max_word & 0xff);
+  }
+  block_minmax[threadIdx.y][threadIdx.x] = minmax;
+  __syncthreads();
+
+  if (!in_image || threadIdx.x == 0 || threadIdx.x == kFusedBlockCols - 1 ||
+      threadIdx.y == 0 || threadIdx.y == kFusedBlockRows - 1) {
+    return;
+  }
+
+  uint32_t min_val = 255;
+  uint32_t max_val = 0;
+#pragma unroll
+  for (int dy = -1; dy <= 1; ++dy) {
+#pragma unroll
+    for (int dx = -1; dx <= 1; ++dx) {
+      const uchar2 neighbor = block_minmax[threadIdx.y + dy][threadIdx.x + dx];
+      min_val = min(min_val, static_cast<uint32_t>(neighbor.x));
+      max_val = max(max_val, static_cast<uint32_t>(neighbor.y));
+    }
+  }
+
+  const bool flat = max_val - min_val < min_white_black_diff;
+  const uint8_t thresh = min_val + (max_val - min_val) / 2;
+  const apriltag_size_t out_width = block_cols * 4;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const apriltag_size_t offset = (4 * block_y + i) * out_width + 4 * block_x;
+    *reinterpret_cast<uint32_t *>(decimated_image + offset) = decimated[i];
+    // __vcmpgtu4 sets each byte greater than thresh to 0xff and the rest to 0.
+    *reinterpret_cast<uint32_t *>(thresholded_image + offset) =
+        flat ? 0x7f7f7f7fu : __vcmpgtu4(decimated[i], thresh * 0x01010101u);
+  }
+}
+
 template <vision::ImageFormat IMAGE_FORMAT>
 class TypedThreshold : public Threshold {
  public:
   TypedThreshold(size_t width, size_t height)
       : width_(width),
         height_(height),
-        unfiltered_minmax_image_device_((width / 2 / 4 * height / 2 / 4) * 2),
-        minmax_image_device_((width / 2 / 4 * height / 2 / 4) * 2) {}
+        unfiltered_minmax_image_device_(MinMaxImageBytes(width, height)),
+        minmax_image_device_(MinMaxImageBytes(width, height)) {}
   // Create a full-size grayscale image from a color image on the provided
   // stream.
   void ToGreyscale(const uint8_t *color_image, uint8_t *gray_image,
@@ -225,6 +312,14 @@ class TypedThreshold : public Threshold {
   virtual ~TypedThreshold() = default;
 
  private:
+  static size_t MinMaxImageBytes(size_t width, size_t height) {
+    // MONO8 keeps the block min/max images in shared memory.
+    if constexpr (IMAGE_FORMAT == vision::ImageFormat::MONO8) {
+      return 0;
+    }
+    return (width / 2 / 4 * height / 2 / 4) * 2;
+  }
+
   size_t width_;
   size_t height_;
 
@@ -302,6 +397,32 @@ void TypedThreshold<IMAGE_FORMAT>::ThresholdAndDecimate(
         min_white_black_diff);
     MaybeCheckAndSynchronize();
   }
+}
+
+// A MONO8 image is already gray, so it decimates and thresholds in one kernel.
+template <>
+void TypedThreshold<vision::ImageFormat::MONO8>::ThresholdAndDecimate(
+    const uint8_t *color_image, uint8_t *decimated_image,
+    uint8_t *thresholded_image, apriltag_size_t min_white_black_diff,
+    CudaStream *stream) {
+  ABSL_CHECK((width_ % 8) == 0);
+  ABSL_CHECK((height_ % 8) == 0);
+  // CameraImage.data is a flatbuffer [ubyte] vector, which flatbuffers only
+  // aligns to 4 bytes.
+  ABSL_CHECK_EQ(reinterpret_cast<uintptr_t>(color_image) % 4, 0u)
+      << ": the MONO8 threshold loads the image 4 bytes at a time";
+
+  // The decimated image in 4x4 blocks.
+  const apriltag_size_t block_cols = width_ / 8;
+  const apriltag_size_t block_rows = height_ / 8;
+  const dim3 threads(kFusedBlockCols, kFusedBlockRows, 1);
+  const dim3 blocks((block_cols + kFusedBlockCols - 3) / (kFusedBlockCols - 2),
+                    (block_rows + kFusedBlockRows - 3) / (kFusedBlockRows - 2),
+                    1);
+  InternalMono8DecimateThreshold<<<blocks, threads, 0, stream->get()>>>(
+      color_image, width_, decimated_image, thresholded_image, block_cols,
+      block_rows, min_white_black_diff);
+  MaybeCheckAndSynchronize();
 }
 
 }  // namespace
