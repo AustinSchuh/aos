@@ -60,7 +60,7 @@ struct MinMaxExtents {
   }
 };
 
-__align__(16) struct LineFitPoint {
+struct LineFitPoint {
   // TODO(austin): How much precision do we actually need?  The less, the
   // faster...  The less memory too, the faster.
   //
@@ -69,20 +69,26 @@ __align__(16) struct LineFitPoint {
   int64_t Mxx;
   int64_t Myy;
   int64_t Mxy;
-  // TODO(austin): These both fit in 4 byte numbers :)
-  // There are at most 2 * (width + height) -> 13 bits points in a blob.
-  // The weight can be at most 8 bits (probably 9 because it has a sign).
-  // A point has 11 bits of position data in it.
-  //
-  // To do this with sub bit precision:
-  //   2 * (1088 + 1456) * 1456 * 255 -> 0x7098f600
-  //
-  // Which is < 31 bits, so we can hold a sign bit too!
+  // Mx and My are prefix sums of W * (x + 1) and W * (y + 1) over a blob.
+  // SelectBlobs admits blobs of up to 2 * (width + height) points, and W is at
+  // most hypot(255, 255) + 1 = 361, so at 1600x1304 the bound is
+  // 5808 * 361 * 1600 ~= 3.4e9, which doesn't fit in an int32.  FitLine's
+  // int64 Mxx * W similarly passes 2^63 for a segment of about 5200 or more
+  // maximum weight points.  Both need thousands of near maximum gradient points
+  // near the far edge of the image, which real frames don't have.  These limits
+  // are this port's own: aprilrobotics keeps the moments in doubles, which
+  // only lose precision.
   int32_t Mx;
   int32_t My;
   int32_t W;
   uint32_t blob_index;
 };
+
+// DoFitLines copies LineFitPoints into shared memory with 16 byte loads, and
+// its offsets rely on this layout.  Aligning the struct to 16 bytes would pad
+// it to 48 bytes and add 20% to every buffer and read.
+static_assert(sizeof(LineFitPoint) == 40);
+static_assert(alignof(LineFitPoint) == 8);
 
 struct LineFitMoments {
   // See LineFitPoint for more info.

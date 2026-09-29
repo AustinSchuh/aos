@@ -12,7 +12,6 @@
 
 namespace frc::apriltag {
 
-static_assert(sizeof(LineFitPoint) == 40, "Size of LineFitPoint changed");
 static_assert(sizeof(int4) == 16, "Size of int4 changed");
 
 constexpr size_t kPointsPerBlock = 256;
@@ -38,8 +37,9 @@ __device__ double FitLineError(size_t N, int64_t Mx, int64_t My, int64_t Mxx,
 }
 
 struct TempStorage {
-  // Block of points that we pre-load.
-  LineFitPoint tmp_storage[kPointsPerBlock];
+  // Block of points that we pre-load.  ErrorCalculator::Load() fills it with
+  // int4 stores, and LineFitPoint is only 8 byte aligned.
+  alignas(16) LineFitPoint tmp_storage[kPointsPerBlock];
 
   // The errors loaded.  The first kAfterBuffer errors are the indices (could be
   // duplicated) immediately before the first blob.  The last kAfterBuffer
@@ -64,6 +64,7 @@ struct TempStorage {
   static_assert(sizeof(tmp_storage) == sizeof(LineFitPoint) * kPointsPerBlock,
                 "Storage changed size.");
 };
+static_assert(alignof(TempStorage) >= sizeof(int4));
 
 template <size_t kThreads>
 class ErrorCalculator {
@@ -83,6 +84,13 @@ class ErrorCalculator {
   __host__ __device__ void Load() {
     constexpr size_t kLoadSize = sizeof(int4);
     static_assert(kLoadSize == 16, "kload");
+    // The cache starts at a multiple of kPointsPerBlock - 2 * kErrorsBuffer
+    // points, minus kErrorsBuffer, so it always starts on a 16 byte boundary
+    // and the division below is exact.
+    static_assert((kPointsPerBlock - 2 * kErrorsBuffer) * sizeof(LineFitPoint) %
+                      kLoadSize ==
+                  0);
+    static_assert(kErrorsBuffer * sizeof(LineFitPoint) % kLoadSize == 0);
 
     // Global index in 128 bit loads.
     const uint32_t global_index =
