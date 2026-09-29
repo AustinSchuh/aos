@@ -13,6 +13,7 @@
 #include "device_launch_parameters.h"
 #include "frc/orin/cuda.h"
 #include "frc/orin/decode_pool.h"
+#include "frc/orin/distortion.h"
 #include "frc/orin/gpu_image.h"
 #include "frc/orin/line_fit_filter.h"
 #include "frc/orin/points.h"
@@ -71,55 +72,6 @@ struct BlobPairTable {
   // are empty, so BlobPairExtents skips them.
   uint32_t num_nonempty_selected_extents;
 };
-
-struct CameraMatrix {
-  double fx;
-  double cx;
-  double fy;
-  double cy;
-};
-
-struct DistCoeffs {
-  double k1;
-  double k2;
-  double p1;
-  double p2;
-  double k3;
-  double k4;
-  double k5;
-  double k6;
-  // Are we using 5 or 8 parameter model?
-  int num_params;
-};
-
-// Returns calibration's intrinsics in the forms the detector takes.
-// gpu_apriltag and apriltag_benchmark both use these, so the benchmark
-// undistorts the way the robot does.
-inline CameraMatrix GetCameraMatrix(
-    const frc::vision::calibration::CameraCalibration *calibration) {
-  auto intrinsics = calibration->intrinsics();
-  return CameraMatrix{
-      .fx = intrinsics->Get(0),
-      .cx = intrinsics->Get(2),
-      .fy = intrinsics->Get(4),
-      .cy = intrinsics->Get(5),
-  };
-}
-
-inline DistCoeffs GetDistCoeffs(
-    const frc::vision::calibration::CameraCalibration *calibration) {
-  auto dist_coeffs = calibration->dist_coeffs();
-  int num_params = dist_coeffs->size();
-  return DistCoeffs{.k1 = dist_coeffs->Get(0),
-                    .k2 = dist_coeffs->Get(1),
-                    .p1 = dist_coeffs->Get(2),
-                    .p2 = dist_coeffs->Get(3),
-                    .k3 = dist_coeffs->Get(4),
-                    .k4 = (num_params >= 8 ? dist_coeffs->Get(5) : 0.0),
-                    .k5 = (num_params >= 8 ? dist_coeffs->Get(6) : 0.0),
-                    .k6 = (num_params >= 8 ? dist_coeffs->Get(7) : 0.0),
-                    .num_params = num_params};
-}
 
 // GPU based april tag detector.
 class GpuDetector {
@@ -306,12 +258,13 @@ class GpuDetector {
     distortion_coefficients_ = distortion_coefficients;
   }
 
-  // (Re-)distort pixels based on our camera model, using pinhole camera model
+  // (Re-)distort pixels based on our camera model, using pinhole camera model.
+  // See frc::apriltag::ReDistort.
   static void ReDistort(double *u, double *v, const CameraMatrix *camera_matrix,
                         const DistCoeffs *distortion_coefficients);
 
-  // Undistort pixels based on our camera model, using iterative algorithm
-  // Returns false if we fail to converge
+  // Undistort pixels based on our camera model, using iterative algorithm.
+  // Returns false if we fail to converge.  See frc::apriltag::UnDistort.
   static bool UnDistort(double *u, double *v, const CameraMatrix *camera_matrix,
                         const DistCoeffs *distortion_coefficients);
 

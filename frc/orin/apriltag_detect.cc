@@ -27,9 +27,6 @@
 
 ABSL_FLAG(int32_t, debug_blob_index, 4096, "Blob to print out for");
 
-constexpr int kUndistortIterationThreshold = 100;
-constexpr double kUndistortConvergenceEpsilon = 1e-6;
-
 extern "C" {
 
 void quad_decode_index(apriltag_detector_t *td, struct quad *quad_original,
@@ -304,71 +301,13 @@ void GpuDetector::AdjustPixelCenters() {
   }
 }
 
-// Dewarps points from the image based on various constants
-// Algorithm mainly taken from
-// https://docs.opencv.org/4.0.0/d9/d0c/group__calib3d.html#ga7dfb72c9cf9780a347fbe3d1c47e5d5a
 void GpuDetector::ReDistort(double *x, double *y,
                             const CameraMatrix *camera_matrix,
                             const DistCoeffs *distortion_coefficients) {
-  double k1 = distortion_coefficients->k1;
-  double k2 = distortion_coefficients->k2;
-  double p1 = distortion_coefficients->p1;
-  double p2 = distortion_coefficients->p2;
-  double k3 = distortion_coefficients->k3;
-  double k4 = distortion_coefficients->k4;
-  double k5 = distortion_coefficients->k5;
-  double k6 = distortion_coefficients->k6;
-
-  double fx = camera_matrix->fx;
-  double cx = camera_matrix->cx;
-  double fy = camera_matrix->fy;
-  double cy = camera_matrix->cy;
-
-  double xP = (*x - cx) / fx;
-  double yP = (*y - cy) / fy;
-
-  double rSq = xP * xP + yP * yP;
-
-  double linCoef = (1 + k1 * rSq + k2 * rSq * rSq + k3 * rSq * rSq * rSq) /
-                   (1 + k4 * rSq + k5 * rSq * rSq + k6 * rSq * rSq * rSq);
-  double xPP = xP * linCoef + 2 * p1 * xP * yP + p2 * (rSq + 2 * xP * xP);
-  double yPP = yP * linCoef + p1 * (rSq + 2 * yP * yP) + 2 * p2 * xP * yP;
-
-  *x = xPP * fx + cx;
-  *y = yPP * fy + cy;
+  apriltag::ReDistort(x, y, *camera_matrix, *distortion_coefficients);
 }
 
 namespace {
-
-// One step of UnDistort's fixed point iteration: moves (*x, *y) closer to the
-// normalized point which distorts to (x0, y0).
-inline void UnDistortStep(const DistCoeffs &distortion_coefficients, double x0,
-                          double y0, double *x, double *y) {
-  const double k1 = distortion_coefficients.k1;
-  const double k2 = distortion_coefficients.k2;
-  const double p1 = distortion_coefficients.p1;
-  const double p2 = distortion_coefficients.p2;
-  const double k3 = distortion_coefficients.k3;
-  const double k4 = distortion_coefficients.k4;
-  const double k5 = distortion_coefficients.k5;
-  const double k6 = distortion_coefficients.k6;
-  const double xP = *x;
-  const double yP = *y;
-
-  double rSq = xP * xP + yP * yP;
-
-  double radial_distortion =
-      (1 + (k1 * rSq) + (k2 * rSq * rSq) + (k3 * rSq * rSq * rSq)) /
-      (1 + (k4 * rSq) + (k5 * rSq * rSq) + (k6 * rSq * rSq * rSq));
-
-  double radial_distortion_inv = 1 / radial_distortion;
-
-  double tangential_dx = 2 * p1 * xP * yP + p2 * (rSq + 2 * xP * xP);
-  double tangential_dy = p1 * (rSq + 2 * yP * yP) + 2 * p2 * xP * yP;
-
-  *x = (x0 - tangential_dx) * radial_distortion_inv;
-  *y = (y0 - tangential_dy) * radial_distortion_inv;
-}
 
 // Undistorts the count pixels in u and v in place, with the same results as
 // GpuDetector::UnDistort on each.  Each pixel's iterations are one chain of
@@ -535,62 +474,20 @@ std::optional<double> EdgeOffset(const NormalPixels &pixels) {
 
 }  // namespace
 
-// We're undistorting using math found from this github page
-// https://yangyushi.github.io/code/2020/03/04/opencv-undistort.html
-// Also, see for reference the source code:
-// https://github.com/opencv/opencv/blob/master/modules/calib3d/src/undistort.dispatch.cpp
 bool GpuDetector::UnDistort(double *u, double *v,
                             const CameraMatrix *camera_matrix,
                             const DistCoeffs *distortion_coefficients) {
-  bool converged = true;
-
-  const double fx = camera_matrix->fx;
-  const double cx = camera_matrix->cx;
-  const double fy = camera_matrix->fy;
-  const double cy = camera_matrix->cy;
-
-  const double xPP = (*u - cx) / fx;
-  const double yPP = (*v - cy) / fy;
-
-  double xP = xPP;
-  double yP = yPP;
-
-  double x0 = xP;
-  double y0 = yP;
-
-  double prev_x = 0, prev_y = 0;
-
-  int iterations = 0;
-  do {
-    prev_x = xP;
-    prev_y = yP;
-
-    UnDistortStep(*distortion_coefficients, x0, y0, &xP, &yP);
-
-    if (iterations > kUndistortIterationThreshold) {
-      converged = false;
-      break;
-    }
-
-    iterations++;
-  } while (std::abs(xP - prev_x) > kUndistortConvergenceEpsilon ||
-           std::abs(yP - prev_y) > kUndistortConvergenceEpsilon);
-
-  if (iterations < kUndistortIterationThreshold) {
+  int iterations;
+  const bool converged = apriltag::UnDistort(
+      u, v, *camera_matrix, *distortion_coefficients, &iterations);
+  if (converged) {
     ABSL_VLOG(1) << "Took " << iterations
                  << " iterations to reach convergence.";
   } else {
     ABSL_VLOG(1) << "Took " << iterations
-                 << " iterations and didn't reach convergence with "
-                 << " (xP, yP): "
-                 << " (" << xP << ", " << yP << ")"
-                 << " vs. (prev_x, prev_y): "
-                 << " (" << prev_x << ", " << prev_y << ")";
+                 << " iterations and didn't reach convergence, ending at ("
+                 << *u << ", " << *v << ")";
   }
-
-  *u = xP * fx + cx;
-  *v = yP * fy + cy;
-
   return converged;
 }
 

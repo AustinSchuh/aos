@@ -52,6 +52,13 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "distortion",
+    hdrs = ["distortion.h"],
+    visibility = ["//visibility:public"],
+    deps = ["//frc/vision:calibration_fbs"],
+)
+
 cuda_library(
     name = "threshold",
     srcs = [
@@ -193,6 +200,7 @@ cuda_library(
     deps = [
         ":cuda",
         ":decode_pool",
+        ":distortion",
         ":threshold",
         "//aos/time",
         "//frc/vision:calibration_fbs",
