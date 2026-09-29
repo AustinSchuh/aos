@@ -187,10 +187,18 @@ class GpuDetector {
     gray_image_device_.MemcpyTo(output);
   }
   void CopyDecimatedTo(uint8_t *output) const {
-    decimated_image_device_.MemcpyTo(output);
+    if (use_neon_) {
+      decimated_image_unified_->MemcpyTo(output);
+    } else {
+      decimated_image_gpu_->MemcpyTo(output);
+    }
   }
   void CopyThresholdedTo(uint8_t *output) const {
-    thresholded_image_device_.MemcpyTo(output);
+    if (use_neon_) {
+      thresholded_image_unified_->MemcpyTo(output);
+    } else {
+      thresholded_image_gpu_->MemcpyTo(output);
+    }
   }
   void CopyUnionMarkersTo(uint32_t *output) const {
     union_markers_device_.MemcpyTo(output);
@@ -317,25 +325,15 @@ class GpuDetector {
     }
   }
 
+  // Creates a half resolution GPU image wrapped around data.
   template <typename T>
-  GpuImage<T> ToGpuImage(UnifiedMemory<T> &memory) {
-    if (memory.size() == width_ * height_) {
-      return GpuImage<T>{
-          .data = memory.get(),
-          .rows = height_,
-          .cols = width_,
-          .step = width_,
-      };
-    } else if (memory.size() == width_ * height_ / 4) {
-      return GpuImage<T>{
-          .data = memory.get(),
-          .rows = height_ / 2,
-          .cols = width_ / 2,
-          .step = width_ / 2,
-      };
-    } else {
-      ABSL_LOG(FATAL) << "Unknown image shape";
-    }
+  GpuImage<T> ToDecimatedGpuImage(T *data) {
+    return GpuImage<T>{
+        .data = data,
+        .rows = height_ / 2,
+        .cols = width_ / 2,
+        .step = width_ / 2,
+    };
   }
 
   // Size of the image.
@@ -344,6 +342,10 @@ class GpuDetector {
 
   // Detector parameters.
   apriltag_detector_t *tag_detector_;
+
+  // --use_neon when constructed, which picks the threshold and how the
+  // decimated and thresholded images are allocated.
+  const bool use_neon_;
 
   // Stream to operate on.
   CudaStream stream_;
@@ -409,16 +411,25 @@ class GpuDetector {
   GpuMemory<uint8_t> color_image_device_;
   // Full size gray scale image.
   GpuMemory<uint8_t> gray_image_device_;
-  // decimated_image_device_ and thresholded_image_device_ are attached to
-  // stream_.  Every kernel that touches them runs on stream_, including those
-  // in quad_fitting_graph_, which launches there, and the CPU touches them only
-  // while stream_ is idle: the NEON threshold at the start of Detect() and the
-  // Copy*To methods after it returns.
+  // Half resolution, gray, decimated image, and its thresholded twin.  Kernels
+  // and the NEON threshold use them through decimated_image_device_ and
+  // thresholded_image_device_.
   //
-  // Half resolution, gray, decimated image.
-  UnifiedMemory<uint8_t> decimated_image_device_;
-  // Intermediates for thresholding.
-  UnifiedMemory<uint8_t> thresholded_image_device_;
+  // The GPU threshold writes them on the GPU, so without --use_neon they are
+  // ordinary device memory, which any stream may touch.
+  //
+  // The NEON threshold writes them from the CPU, so with --use_neon they are
+  // managed memory attached to stream_.  Every kernel that touches them then
+  // runs on stream_, including those in quad_fitting_graph_, which launches
+  // there, and the CPU touches them only while stream_ is idle: the NEON
+  // threshold at the start of Detect() and the Copy*To methods after it
+  // returns.
+  std::optional<GpuMemory<uint8_t>> decimated_image_gpu_;
+  std::optional<GpuMemory<uint8_t>> thresholded_image_gpu_;
+  std::optional<UnifiedMemory<uint8_t>> decimated_image_unified_;
+  std::optional<UnifiedMemory<uint8_t>> thresholded_image_unified_;
+  uint8_t *decimated_image_device_ = nullptr;
+  uint8_t *thresholded_image_device_ = nullptr;
 
   // The union markers for each pixel.
   GpuMemory<uint32_t> union_markers_device_;

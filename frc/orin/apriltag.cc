@@ -37,11 +37,10 @@ GpuDetector::GpuDetector(size_t width, size_t height,
     : width_(width),
       height_(height),
       tag_detector_(tag_detector),
+      use_neon_(absl::GetFlag(FLAGS_use_neon)),
       gray_image_host_(width * height),
       color_image_device_(BytesPerPixel(image_format) * width * height),
       gray_image_device_(width * height),
-      decimated_image_device_(width / 2 * height / 2),
-      thresholded_image_device_(width / 2 * height / 2),
       union_markers_device_(width / 2 * height / 2),
       union_markers_size_device_(width / 2 * height / 2),
       label_tile_roots_device_(width / 4 * height / 4),
@@ -58,26 +57,37 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       filtered_is_local_peak_device_(line_fit_points_device_.size()),
       camera_matrix_(camera_matrix),
       distortion_coefficients_(distortion_coefficients),
-      threshold_(absl::GetFlag(FLAGS_use_neon)
-                     ? MakeNeonThreshold(image_format, width, height)
-                     : MakeThreshold(image_format, width, height)),
+      threshold_(use_neon_ ? MakeNeonThreshold(image_format, width, height)
+                           : MakeThreshold(image_format, width, height)),
       image_format_(image_format) {
   quad_corners_host_.reserve(kMaxBlobs);
 
   ABSL_CHECK_EQ(tag_detector_->quad_decimate, 2);
   ABSL_CHECK(!tag_detector_->qtp.deglitch);
   // The NEON threshold reads one byte per pixel from the host image.
-  ABSL_CHECK(!absl::GetFlag(FLAGS_use_neon) ||
-             image_format == vision::ImageFormat::MONO8)
+  ABSL_CHECK(!use_neon_ || image_format == vision::ImageFormat::MONO8)
       << ": --use_neon only supports MONO8 images";
 
-  // The Orin has no concurrent managed access, so the CPU may only touch
-  // globally attached managed memory while no stream in the process has work
-  // in flight.  Attached to stream_, these only need stream_ to be idle.
-  CHECK_CUDA(cudaStreamAttachMemAsync(
-      stream_.get(), decimated_image_device_.get(), 0, cudaMemAttachSingle));
-  CHECK_CUDA(cudaStreamAttachMemAsync(
-      stream_.get(), thresholded_image_device_.get(), 0, cudaMemAttachSingle));
+  const size_t decimated_size = width / 2 * height / 2;
+  if (use_neon_) {
+    decimated_image_unified_.emplace(decimated_size);
+    thresholded_image_unified_.emplace(decimated_size);
+    decimated_image_device_ = decimated_image_unified_->get();
+    thresholded_image_device_ = thresholded_image_unified_->get();
+    // The Orin has no concurrent managed access, so the CPU may only touch
+    // globally attached managed memory while no stream in the process has
+    // work in flight.  Attached to stream_, these only need stream_ to be
+    // idle.
+    CHECK_CUDA(cudaStreamAttachMemAsync(stream_.get(), decimated_image_device_,
+                                        0, cudaMemAttachSingle));
+    CHECK_CUDA(cudaStreamAttachMemAsync(
+        stream_.get(), thresholded_image_device_, 0, cudaMemAttachSingle));
+  } else {
+    decimated_image_gpu_.emplace(decimated_size);
+    thresholded_image_gpu_.emplace(decimated_size);
+    decimated_image_device_ = decimated_image_gpu_->get();
+    thresholded_image_device_ = thresholded_image_gpu_->get();
+  }
   // Every frame leaves the blob pair table empty for the next, with each
   // slot's minimums at their largest.
   char *blob_pairs = reinterpret_cast<char *>(blob_pairs_device_.get());
@@ -1245,14 +1255,14 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   // Threshold the image.
   float neon_threshold_ms = 0;
-  if (absl::GetFlag(FLAGS_use_neon)) {
+  if (use_neon_) {
     // We are being asked to do this on the CPU.  Use the CPU source image, and
     // put it into unified memory so it gets moved over to the GPU in the
     // background.
     const aos::monotonic_clock::time_point before_threshold =
         aos::monotonic_clock::now();
     threshold_->ThresholdAndDecimate(
-        image, decimated_image_device_.get(), thresholded_image_device_.get(),
+        image, decimated_image_device_, thresholded_image_device_,
         tag_detector_->qtp.min_white_black_diff, &stream_);
     neon_threshold_ms =
         float_milli(aos::monotonic_clock::now() - before_threshold).count();
@@ -1271,8 +1281,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
     // Now, threshold on the GPU fully.
     threshold_->ThresholdAndDecimate(
-        image_device, decimated_image_device_.get(),
-        thresholded_image_device_.get(),
+        image_device, decimated_image_device_, thresholded_image_device_,
         tag_detector_->qtp.min_white_black_diff, &stream_);
   }
 
@@ -1332,7 +1341,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     // Every event completed before after_quad_fit_, which the host already
     // waited on.
     stage_times_ms_.clear();
-    if (absl::GetFlag(FLAGS_use_neon)) {
+    if (use_neon_) {
       stage_times_ms_.emplace_back("NEON threshold (host)", neon_threshold_ms);
     }
     for (const Stage &stage : stages_) {
@@ -1375,9 +1384,9 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages) {
 
   // Unionfind the image.
   LabelImage(
-      ToGpuImage(thresholded_image_device_), ToGpuImage(union_markers_device_),
-      ToGpuImage(union_markers_size_device_), label_tile_roots_device_.get(),
-      label_forest_device_.get(), stream_.get(),
+      ToDecimatedGpuImage(thresholded_image_device_),
+      ToGpuImage(union_markers_device_), ToGpuImage(union_markers_size_device_),
+      label_tile_roots_device_.get(), label_forest_device_.get(), stream_.get(),
       record_stages ? std::span<CudaEvent>(after_labeling_kernel_)
                     : std::span<CudaEvent>());
 
@@ -1419,7 +1428,7 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages) {
     ABSL_CHECK_LT(width_ * height_, static_cast<size_t>(1 << 22));
 
     BlobDiff<kBlockWidth, kBlockHeight><<<blocks, threads, 0, stream_.get()>>>(
-        thresholded_image_device_.get(), union_markers_device_.get(),
+        thresholded_image_device_, union_markers_device_.get(),
         union_markers_size_device_.get(), blob_pairs_device_.get(),
         boundary_points_device_.get(), decimated_width, decimated_height);
     MaybeCheckAndSynchronize("BlobDiff");
@@ -1483,7 +1492,7 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages) {
     BuildBlobWorkList<<<1, kWorkListThreads, 0, stream_.get()>>>(
         selected_extents_device_.get(), blob_work_list_device_.get());
     MaybeCheckAndSynchronize("BuildBlobWorkList");
-    TransformLineFitPoint transform(decimated_image_device_.get(), width_ / 2,
+    TransformLineFitPoint transform(decimated_image_device_, width_ / 2,
                                     height_ / 2);
     SortAndScanSmallBlobs<<<kMaxBlobs, kSmallBlobThreads, 0, stream_.get()>>>(
         blob_work_list_device_.get(), selected_blobs_device_.get(),
