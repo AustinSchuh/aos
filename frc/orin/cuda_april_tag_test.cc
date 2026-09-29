@@ -1870,8 +1870,12 @@ class CudaAprilTagDetector {
           // also only doesn't count if the precision needed to differentiate is
           // less than max_allowed_imprecision
           bool is_allowable = false;
-          for (size_t k = j - allowable_swapped_indices;
-               k <= j + allowable_swapped_indices; k++) {
+          const size_t k_begin = j >= allowable_swapped_indices
+                                     ? j - allowable_swapped_indices
+                                     : 0;
+          const size_t k_end = std::min(j + allowable_swapped_indices + 1,
+                                        slope_sorted_points.size());
+          for (size_t k = k_begin; k < k_end; k++) {
             if (cuda_grouped_blob[j].x() == slope_sorted_points[k].x() &&
                 cuda_grouped_blob[j].y() == slope_sorted_points[k].y() &&
                 abs(ComputeTheta(slope_sorted_points[k]) -
