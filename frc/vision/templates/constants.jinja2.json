@@ -4,6 +4,8 @@
       "team": 0,
       "robot_name": "test",
       "data": {
+        /* These all hold 25-07's model, with the principal point moved for the
+           centered 1456x1088 crop of its 1600x1304 image. */
         "calibration": [
           {% include 'frc/vision/constants/test-calibration_cam-1.json' %},
           {% include 'frc/vision/constants/test-calibration_cam-2.json' %},
