@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cub/iterator/transform_input_iterator.cuh>
+#include <limits>
 #include <optional>
 
 #include "third_party/apriltag/apriltag.h"
@@ -164,8 +165,15 @@ class GpuDetector {
   const std::vector<std::pair<std::string_view, float>> &StageTimesMs() const {
     return stage_times_ms_;
   }
+  // Records a CUDA event at the start of Detect() and reads the time since it
+  // at the end so GpuTimeMs() can report it.  Off by default because the
+  // record and the read cost CPU time on every frame.
+  void set_measure_gpu_time(bool measure_gpu_time) {
+    measure_gpu_time_ = measure_gpu_time;
+  }
+
   // GPU time of the last Detect(), from the first event on the main stream to
-  // the end of the last kernel.
+  // the end of the last kernel.  NaN unless measure_gpu_time is on.
   float GpuTimeMs() const { return gpu_time_ms_; }
   // Host time spent after the GPU finished (quad filtering and decoding) in
   // the last Detect().
@@ -350,8 +358,9 @@ class GpuDetector {
   // Stream to operate on.
   CudaStream stream_;
 
-  // Events between the steps.  Detect() always records start_ and the events
-  // it waits on, and records the rest only for stage timing.
+  // Events between the steps.  Detect() always records the events it waits
+  // on, start_ for GPU time or stage timing, and the rest only for stage
+  // timing.
   //
   // Every event the host waits on is a cudaEventBlockingSync event.  Sleeping
   // there instead of spinning frees the core while the GPU is busy, which
@@ -374,8 +383,17 @@ class GpuDetector {
   CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
   // EnqueueQuadFitting(false), captured, unless --sync is set.  Launching it
-  // submits the frame's GPU work after thresholding in one call.
-  std::optional<CudaGraph> quad_fitting_graph_;
+  // submits the frame's GPU work after thresholding in one call.  The GPU
+  // MONO8 threshold reads the image address from image_address_ when it runs,
+  // so the graph starts with it when frame_graph_thresholds_, and then submits
+  // all of the frame's GPU work.
+  std::optional<CudaGraph> frame_graph_;
+  bool frame_graph_thresholds_ = false;
+
+  // The device address of the image the GPU MONO8 threshold reads.  Detect()
+  // writes it before launching the threshold, and the last frame's threshold
+  // finished before the last Detect() returned.
+  MappedHostMemory<const uint8_t *> image_address_{1};
 
   // A stage's time is from begin to end.
   struct Stage {
@@ -420,7 +438,7 @@ class GpuDetector {
   //
   // The NEON threshold writes them from the CPU, so with --use_neon they are
   // managed memory attached to stream_.  Every kernel that touches them then
-  // runs on stream_, including those in quad_fitting_graph_, which launches
+  // runs on stream_, including those in frame_graph_, which launches
   // there, and the CPU touches them only while stream_ is idle: the NEON
   // threshold at the start of Detect() and the Copy*To methods after it
   // returns.
@@ -490,9 +508,10 @@ class GpuDetector {
   bool first_ = true;
 
   bool stage_timing_ = false;
+  bool measure_gpu_time_ = false;
   std::chrono::nanoseconds host_wait_spin_{0};
   std::vector<std::pair<std::string_view, float>> stage_times_ms_;
-  float gpu_time_ms_ = 0;
+  float gpu_time_ms_ = std::numeric_limits<float>::quiet_NaN();
   float host_decode_time_ms_ = 0;
   bool last_frame_overflowed_ = false;
 

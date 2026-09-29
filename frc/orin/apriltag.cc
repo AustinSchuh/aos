@@ -121,11 +121,22 @@ GpuDetector::GpuDetector(size_t width, size_t height,
   zarray_ensure_capacity(detections_, kMaxBlobs);
 
   // Everything from labeling to the quad fit has the same shape every frame,
-  // so capture it once.  That fixes tag_detector_'s quad parameters at their
-  // values now.  --sync synchronizes between kernels, which a graph can't do.
+  // so capture it once, along with the GPU MONO8 threshold, which reads the
+  // image address when it runs.  That fixes tag_detector_'s threshold and quad
+  // parameters at their values now.  --sync synchronizes between kernels,
+  // which a graph can't do.
   if (!absl::GetFlag(FLAGS_sync)) {
-    quad_fitting_graph_.emplace(&stream_,
-                                [this]() { EnqueueQuadFitting(false); });
+    frame_graph_thresholds_ =
+        !use_neon_ && image_format_ == vision::ImageFormat::MONO8;
+    frame_graph_.emplace(&stream_, [this]() {
+      if (frame_graph_thresholds_) {
+        threshold_->ThresholdAndDecimateIndirect(
+            image_address_.device_ptr(), decimated_image_device_,
+            thresholded_image_device_, tag_detector_->qtp.min_white_black_diff,
+            &stream_);
+      }
+      EnqueueQuadFitting(false);
+    });
   }
 }
 
@@ -1253,6 +1264,10 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     }
   };
 
+  // start_ begins the GPU time and the "Memcpy" stage.
+  const bool record_start = measure_gpu_time_ || stage_timing_;
+  const bool use_graph = frame_graph_.has_value() && !stage_timing_;
+
   // Threshold the image.
   float neon_threshold_ms = 0;
   if (use_neon_) {
@@ -1267,10 +1282,14 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     neon_threshold_ms =
         float_milli(aos::monotonic_clock::now() - before_threshold).count();
 
-    start_.Record(&stream_);
+    if (record_start) {
+      start_.Record(&stream_);
+    }
     record_stage(after_image_memcpy_to_device_, &stream_);
   } else {
-    start_.Record(&stream_);
+    if (record_start) {
+      start_.Record(&stream_);
+    }
     // If the image isn't already in device memory, copy it there and update the
     // pointer.
     if (image_device == nullptr) {
@@ -1280,9 +1299,23 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
     record_stage(after_image_memcpy_to_device_, &stream_);
 
     // Now, threshold on the GPU fully.
-    threshold_->ThresholdAndDecimate(
-        image_device, decimated_image_device_, thresholded_image_device_,
-        tag_detector_->qtp.min_white_black_diff, &stream_);
+    if (image_format_ == vision::ImageFormat::MONO8) {
+      // CameraImage.data is a flatbuffer [ubyte] vector, which flatbuffers
+      // only aligns to 4 bytes.
+      ABSL_CHECK_EQ(reinterpret_cast<uintptr_t>(image_device) % 4, 0u)
+          << ": the MONO8 threshold loads the image 4 bytes at a time";
+      *image_address_.mutable_host_ptr() = image_device;
+      if (!(use_graph && frame_graph_thresholds_)) {
+        threshold_->ThresholdAndDecimateIndirect(
+            image_address_.device_ptr(), decimated_image_device_,
+            thresholded_image_device_, tag_detector_->qtp.min_white_black_diff,
+            &stream_);
+      }
+    } else {
+      threshold_->ThresholdAndDecimate(
+          image_device, decimated_image_device_, thresholded_image_device_,
+          tag_detector_->qtp.min_white_black_diff, &stream_);
+    }
   }
 
   record_stage(after_threshold_, &stream_);
@@ -1297,8 +1330,8 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   record_stage(after_memcpy_gray_, &stream_);
 
-  if (quad_fitting_graph_.has_value() && !stage_timing_) {
-    quad_fitting_graph_->Launch(&stream_);
+  if (use_graph) {
+    frame_graph_->Launch(&stream_);
   } else {
     EnqueueQuadFitting(stage_timing_);
   }
@@ -1334,8 +1367,6 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
                << " items";
   ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;
   ABSL_VLOG(1) << "Fit " << quad_corners_host_.size() << " quads";
-  const std::chrono::nanoseconds gpu_time = after_quad_fit_.ElapsedTime(start_);
-  gpu_time_ms_ = float_milli(gpu_time).count();
   host_decode_time_ms_ = float_milli(end_time - before_fit_quads).count();
   if (stage_timing_) {
     // Every event completed before after_quad_fit_, which the host already
@@ -1356,22 +1387,29 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
                << float_milli(end_time - before_fit_quads).count()
                << "ms on host";
 
-  ABSL_VLOG(1) << "Overall " << gpu_time_ms_ << "ms, "
-               << float_milli(end_time - start_time).count() << "ms on host, "
-               << (1000.0 / gpu_time_ms_) << "hz";
-  // Average.  Skip the first one as the kernel is warming up and is slower.
-  if (!first_) {
-    ++execution_count_;
-    execution_duration_ += gpu_time;
-    ABSL_VLOG(1)
-        << "Average overall "
-        << float_milli(execution_duration_ / execution_count_).count() << "ms, "
-        << (1000.0 /
-            float_milli(execution_duration_ / execution_count_).count())
-        << "hz";
+  if (measure_gpu_time_) {
+    const std::chrono::nanoseconds gpu_time =
+        after_quad_fit_.ElapsedTime(start_);
+    gpu_time_ms_ = float_milli(gpu_time).count();
+    ABSL_VLOG(1) << "Overall " << gpu_time_ms_ << "ms, "
+                 << float_milli(end_time - start_time).count() << "ms on host, "
+                 << (1000.0 / gpu_time_ms_) << "hz";
+    // Average.  Skip the first one as the kernel is warming up and is slower.
+    if (!first_) {
+      ++execution_count_;
+      execution_duration_ += gpu_time;
+      ABSL_VLOG(1)
+          << "Average overall "
+          << float_milli(execution_duration_ / execution_count_).count()
+          << "ms, "
+          << (1000.0 /
+              float_milli(execution_duration_ / execution_count_).count())
+          << "hz";
+    }
+    first_ = false;
+  } else {
+    gpu_time_ms_ = std::numeric_limits<float>::quiet_NaN();
   }
-
-  first_ = false;
 }
 
 void GpuDetector::EnqueueQuadFitting(bool record_stages) {

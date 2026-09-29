@@ -1,6 +1,9 @@
 #include <unistd.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cub/device/device_radix_sort.cuh>
+#include <map>
 #include <numbers>
 #include <numeric>
 #include <random>
@@ -1802,30 +1805,56 @@ class CudaAprilTagDetector {
   // Stage timing launches each stage on its own instead of through the CUDA
   // graph, so this picks which of the two runs.
   void set_stage_timing(bool value) { gpu_detector_.set_stage_timing(value); }
+  void set_measure_gpu_time(bool value) {
+    gpu_detector_.set_measure_gpu_time(value);
+  }
+  const std::vector<std::pair<std::string_view, float>> &StageTimesMs() const {
+    return gpu_detector_.StageTimesMs();
+  }
+  float GpuTimeMs() const { return gpu_detector_.GpuTimeMs(); }
 
-  // Checks that the GPU's sorted points and line fit points match those of
-  // the last call, and saves them for the next.  The GPU finds points in a
-  // different order each time, and that must not reach anything past the
-  // sort by angle.
-  void CheckSameAsLastDetect() {
-    if (!last_sorted_selected_blobs_.empty()) {
+  // Checks that the GPU's sorted points, line fit points, and detections match
+  // those of the last call with the same image, and saves them for the next.
+  // The GPU finds points in a different order each time, and that must not
+  // reach anything past the sort by angle.
+  void CheckSameAsLastDetect(size_t image_index = 0) {
+    std::vector<DetectionValues> detections;
+    const zarray_t *gpu_detections = gpu_detector_.Detections();
+    for (int i = 0; i < zarray_size(gpu_detections); ++i) {
+      apriltag_detection_t *det;
+      zarray_get(const_cast<zarray_t *>(gpu_detections), i, &det);
+      DetectionValues &values = detections.emplace_back(DetectionValues{
+          .id = det->id,
+          .hamming = det->hamming,
+          .decision_margin = det->decision_margin,
+      });
+      std::copy_n(det->c, 2, values.c);
+      std::copy_n(&det->p[0][0], 8, &values.p[0][0]);
+    }
+    // The decode threads finish in any order.
+    std::sort(detections.begin(), detections.end());
+
+    LastDetect &last = last_detects_[image_index];
+    if (!last.sorted_selected_blobs.empty()) {
       ABSL_CHECK_EQ(sorted_selected_blobs_cuda_.size(),
-                    last_sorted_selected_blobs_.size());
-      ABSL_CHECK_EQ(line_fit_points_cuda_.size(), last_line_fit_points_.size());
+                    last.sorted_selected_blobs.size());
+      ABSL_CHECK_EQ(line_fit_points_cuda_.size(), last.line_fit_points.size());
       for (size_t i = 0; i < sorted_selected_blobs_cuda_.size(); ++i) {
         ABSL_CHECK_EQ(sorted_selected_blobs_cuda_[i].key,
-                      last_sorted_selected_blobs_[i].key)
+                      last.sorted_selected_blobs[i].key)
             << ": at " << i;
         const LineFitPoint &a = line_fit_points_cuda_[i];
-        const LineFitPoint &b = last_line_fit_points_[i];
+        const LineFitPoint &b = last.line_fit_points[i];
         ABSL_CHECK(a.Mxx == b.Mxx && a.Myy == b.Myy && a.Mxy == b.Mxy &&
                    a.Mx == b.Mx && a.My == b.My && a.W == b.W &&
                    a.blob_index == b.blob_index)
             << ": at " << i;
       }
+      ABSL_CHECK(detections == last.detections);
     }
-    last_sorted_selected_blobs_ = sorted_selected_blobs_cuda_;
-    last_line_fit_points_ = line_fit_points_cuda_;
+    last.sorted_selected_blobs = sorted_selected_blobs_cuda_;
+    last.line_fit_points = line_fit_points_cuda_;
+    last.detections = std::move(detections);
   }
 
   void CheckDetections(zarray_t *aprilrobotics_detections,
@@ -2202,8 +2231,23 @@ class CudaAprilTagDetector {
   std::vector<IndexPoint> selected_blobs_cuda_;
   std::vector<IndexPoint> sorted_selected_blobs_cuda_;
   std::vector<LineFitPoint> line_fit_points_cuda_;
-  std::vector<IndexPoint> last_sorted_selected_blobs_;
-  std::vector<LineFitPoint> last_line_fit_points_;
+  // What CheckSameAsLastDetect() compares.
+  struct DetectionValues {
+    int id;
+    int hamming;
+    float decision_margin;
+    double c[2];
+    double p[4][2];
+
+    auto operator<=>(const DetectionValues &) const = default;
+  };
+  struct LastDetect {
+    std::vector<IndexPoint> sorted_selected_blobs;
+    std::vector<LineFitPoint> line_fit_points;
+    std::vector<DetectionValues> detections;
+  };
+  // By image index.
+  std::map<size_t, LastDetect> last_detects_;
 
   std::vector<double> errors_device_;
   std::vector<double> filtered_errors_device_;
@@ -2244,44 +2288,69 @@ class AprilDetectionTest : public ::testing::Test {
     return color_image;
   }
 
+  // A MONO8 copy of a YUYV test image in host memory registered with CUDA,
+  // the way a CameraImage is, starting offset bytes past a page boundary.
+  class RegisteredMono8 {
+   public:
+    RegisteredMono8(const frc::vision::CameraImage &image, size_t offset) {
+      const cv::Mat color_image(cv::Size(image.cols(), image.rows()), CV_8UC2,
+                                (void *)image.data()->data());
+      cv::Mat gray_image;
+      cv::cvtColor(color_image, gray_image, cv::COLOR_YUV2GRAY_YUYV);
+
+      const size_t image_bytes = gray_image.total();
+      const size_t page_size = sysconf(_SC_PAGESIZE);
+      buffer_bytes_ =
+          (offset + image_bytes + page_size - 1) / page_size * page_size;
+      buffer_ = static_cast<uint8_t *>(aligned_alloc(page_size, buffer_bytes_));
+      ABSL_CHECK(buffer_ != nullptr);
+      uint8_t *image_host = buffer_ + offset;
+      memcpy(image_host, gray_image.data, image_bytes);
+      CHECK_CUDA(
+          cudaHostRegister(buffer_, buffer_bytes_, cudaHostRegisterDefault));
+      uint8_t *buffer_device = nullptr;
+      CHECK_CUDA(cudaHostGetDevicePointer(
+          reinterpret_cast<void **>(&buffer_device), buffer_, 0));
+      image_device_ = buffer_device + offset;
+      image_ = cv::Mat(gray_image.size(), CV_8UC1, image_host);
+    }
+    RegisteredMono8(const RegisteredMono8 &) = delete;
+    RegisteredMono8 &operator=(const RegisteredMono8 &) = delete;
+
+    ~RegisteredMono8() {
+      CHECK_CUDA(cudaHostUnregister(buffer_));
+      free(buffer_);
+    }
+
+    // The image in host memory.
+    const cv::Mat &image() const { return image_; }
+    // The device alias of image().
+    const uint8_t *image_device() const { return image_device_; }
+
+   private:
+    uint8_t *buffer_;
+    size_t buffer_bytes_;
+    cv::Mat image_;
+    const uint8_t *image_device_;
+  };
+
   // Detects tags in a MONO8 copy of orin_capture_24_04 and checks the GPU
   // intermediates and detections against aprilrobotics.  The detector reads
   // the image through the device alias of host memory registered with CUDA,
   // as it reads a CameraImage, starting offset bytes past a page boundary.
   void DetectRegisteredMono8(size_t offset) {
     auto image = ReadImage("orin_capture_24_04/file/orin_capture_24_04.bfbs");
-    cv::Mat gray_image;
-    cv::cvtColor(ToMat(&image.message()), gray_image, cv::COLOR_YUV2GRAY_YUYV);
+    const RegisteredMono8 mono(image.message(), offset);
 
-    const size_t image_bytes = gray_image.total();
-    const size_t page_size = sysconf(_SC_PAGESIZE);
-    const size_t buffer_bytes =
-        (offset + image_bytes + page_size - 1) / page_size * page_size;
-    uint8_t *buffer =
-        static_cast<uint8_t *>(aligned_alloc(page_size, buffer_bytes));
-    ASSERT_NE(buffer, nullptr);
-    uint8_t *image_host = buffer + offset;
-    memcpy(image_host, gray_image.data, image_bytes);
-    CHECK_CUDA(cudaHostRegister(buffer, buffer_bytes, cudaHostRegisterDefault));
-    uint8_t *buffer_device = nullptr;
-    CHECK_CUDA(cudaHostGetDevicePointer(
-        reinterpret_cast<void **>(&buffer_device), buffer, 0));
-    const cv::Mat mono_image(gray_image.size(), CV_8UC1, image_host);
+    CudaAprilTagDetector cuda_detector(mono.image().cols, mono.image().rows,
+                                       tag36h11_create(),
+                                       vision::ImageFormat::MONO8);
+    cuda_detector.set_undistort(true);
+    cuda_detector.SetCameraFourConstants();
 
-    {
-      CudaAprilTagDetector cuda_detector(gray_image.cols, gray_image.rows,
-                                         tag36h11_create(),
-                                         vision::ImageFormat::MONO8);
-      cuda_detector.set_undistort(true);
-      cuda_detector.SetCameraFourConstants();
-
-      cuda_detector.DetectGPU(mono_image, buffer_device + offset);
-      cuda_detector.DetectCPU(mono_image.clone());
-      cuda_detector.Check(mono_image.clone());
-    }
-
-    CHECK_CUDA(cudaHostUnregister(buffer));
-    free(buffer);
+    cuda_detector.DetectGPU(mono.image(), mono.image_device());
+    cuda_detector.DetectCPU(mono.image().clone());
+    cuda_detector.Check(mono.image().clone());
   }
 
  private:
@@ -3296,4 +3365,58 @@ TEST_F(AprilDetectionTest, GpuMono8) {
     DetectRegisteredMono8(offset);
   }
 }
+
+// Tests the GPU MONO8 threshold in the CUDA graph, which reads the image
+// address Detect() writes before each launch.  Two images alternate, so the
+// address changes between launches, and each goes through the graph and
+// through launching each stage.  Both must agree with each other and with
+// aprilrobotics.
+TEST_F(AprilDetectionTest, GpuMono8GraphAlternatesImages) {
+  absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_use_neon, false);
+  auto front = ReadImage("orin_capture_24_04/file/orin_capture_24_04.bfbs");
+  auto side =
+      ReadImage("orin_capture_24_04_side/file/orin_capture_24_04_side.bfbs");
+  const RegisteredMono8 images[2] = {{front.message(), 0}, {side.message(), 0}};
+  ASSERT_EQ(images[0].image().size(), images[1].image().size());
+
+  CudaAprilTagDetector cuda_detector(images[0].image().cols,
+                                     images[0].image().rows, tag36h11_create(),
+                                     vision::ImageFormat::MONO8);
+  cuda_detector.set_undistort(true);
+  cuda_detector.SetCameraFourConstants();
+
+  for (size_t i = 0; i < 8; ++i) {
+    const size_t image_index = i % 2;
+    const bool stage_timing = (i / 2) % 2 == 1;
+    SCOPED_TRACE("detect " + std::to_string(i) + ", image " +
+                 std::to_string(image_index) +
+                 (stage_timing ? ", stage timing" : ", graph"));
+    const RegisteredMono8 &image = images[image_index];
+    cuda_detector.set_stage_timing(stage_timing);
+    cuda_detector.DetectGPU(image.image(), image.image_device());
+    cuda_detector.CheckSameAsLastDetect(image_index);
+
+    // measure_gpu_time is off, but stage timing still records the start of
+    // the "Memcpy" stage.
+    EXPECT_TRUE(std::isnan(cuda_detector.GpuTimeMs()));
+    if (stage_timing) {
+      const auto &stages = cuda_detector.StageTimesMs();
+      auto memcpy_stage = std::find_if(
+          stages.begin(), stages.end(),
+          [](const auto &stage) { return stage.first == "Memcpy"; });
+      ASSERT_NE(memcpy_stage, stages.end());
+      EXPECT_GE(memcpy_stage->second, 0.0f);
+    }
+
+    cuda_detector.DetectCPU(image.image().clone());
+    cuda_detector.Check(image.image().clone());
+  }
+
+  cuda_detector.set_measure_gpu_time(true);
+  cuda_detector.set_stage_timing(false);
+  cuda_detector.DetectGPU(images[0].image(), images[0].image_device());
+  EXPECT_GT(cuda_detector.GpuTimeMs(), 0.0f);
+}
+
 }  // namespace frc::apriltag::testing

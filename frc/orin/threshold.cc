@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
 
 #include "frc/orin/cuda.h"
 
@@ -214,7 +215,7 @@ constexpr int kFusedBlockRows = 16;
 // decimated image.  Thread blocks overlap by one 4x4 block on each side, so
 // the 3x3 min/max filter of the inner blocks only reads shared memory.
 __global__ void __launch_bounds__(kFusedBlockCols *kFusedBlockRows)
-    InternalMono8DecimateThreshold(const uint8_t *image,
+    InternalMono8DecimateThreshold(const uint8_t *const *image_address,
                                    const apriltag_size_t in_width,
                                    uint8_t *decimated_image,
                                    uint8_t *thresholded_image,
@@ -236,6 +237,7 @@ __global__ void __launch_bounds__(kFusedBlockCols *kFusedBlockRows)
   // Blocks off the image don't change the filter, which skips them.
   uchar2 minmax = make_uchar2(255, 0);
   if (in_image) {
+    const uint8_t *const image = *image_address;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       // The 8 raw pixels under a decimated row, loaded 4 bytes at a time
@@ -295,7 +297,9 @@ class TypedThreshold : public Threshold {
       : width_(width),
         height_(height),
         unfiltered_minmax_image_device_(MinMaxImageBytes(width, height)),
-        minmax_image_device_(MinMaxImageBytes(width, height)) {}
+        minmax_image_device_(MinMaxImageBytes(width, height)),
+        image_address_device_(IMAGE_FORMAT == vision::ImageFormat::MONO8 ? 1
+                                                                         : 0) {}
   // Create a full-size grayscale image from a color image on the provided
   // stream.
   void ToGreyscale(const uint8_t *color_image, uint8_t *gray_image,
@@ -308,6 +312,12 @@ class TypedThreshold : public Threshold {
                             uint8_t *thresholded_image,
                             apriltag_size_t min_white_black_diff,
                             CudaStream *stream) override;
+
+  void ThresholdAndDecimateIndirect(const uint8_t *const *color_image,
+                                    uint8_t *decimated_image,
+                                    uint8_t *thresholded_image,
+                                    apriltag_size_t min_white_black_diff,
+                                    CudaStream *stream) override;
 
   virtual ~TypedThreshold() = default;
 
@@ -325,6 +335,8 @@ class TypedThreshold : public Threshold {
 
   GpuMemory<uint8_t> unfiltered_minmax_image_device_;
   GpuMemory<uint8_t> minmax_image_device_;
+  // Where MONO8's ThresholdAndDecimate has the kernel read the image address.
+  GpuMemory<const uint8_t *> image_address_device_;
 };
 
 template <vision::ImageFormat IMAGE_FORMAT>
@@ -399,18 +411,24 @@ void TypedThreshold<IMAGE_FORMAT>::ThresholdAndDecimate(
   }
 }
 
+template <vision::ImageFormat IMAGE_FORMAT>
+void TypedThreshold<IMAGE_FORMAT>::ThresholdAndDecimateIndirect(
+    const uint8_t *const *color_image, uint8_t *decimated_image,
+    uint8_t *thresholded_image, apriltag_size_t min_white_black_diff,
+    CudaStream *stream) {
+  Threshold::ThresholdAndDecimateIndirect(color_image, decimated_image,
+                                          thresholded_image,
+                                          min_white_black_diff, stream);
+}
+
 // A MONO8 image is already gray, so it decimates and thresholds in one kernel.
 template <>
-void TypedThreshold<vision::ImageFormat::MONO8>::ThresholdAndDecimate(
-    const uint8_t *color_image, uint8_t *decimated_image,
+void TypedThreshold<vision::ImageFormat::MONO8>::ThresholdAndDecimateIndirect(
+    const uint8_t *const *color_image, uint8_t *decimated_image,
     uint8_t *thresholded_image, apriltag_size_t min_white_black_diff,
     CudaStream *stream) {
   ABSL_CHECK((width_ % 8) == 0);
   ABSL_CHECK((height_ % 8) == 0);
-  // CameraImage.data is a flatbuffer [ubyte] vector, which flatbuffers only
-  // aligns to 4 bytes.
-  ABSL_CHECK_EQ(reinterpret_cast<uintptr_t>(color_image) % 4, 0u)
-      << ": the MONO8 threshold loads the image 4 bytes at a time";
 
   // The decimated image in 4x4 blocks.
   const apriltag_size_t block_cols = width_ / 8;
@@ -425,7 +443,32 @@ void TypedThreshold<vision::ImageFormat::MONO8>::ThresholdAndDecimate(
   MaybeCheckAndSynchronize();
 }
 
+template <>
+void TypedThreshold<vision::ImageFormat::MONO8>::ThresholdAndDecimate(
+    const uint8_t *color_image, uint8_t *decimated_image,
+    uint8_t *thresholded_image, apriltag_size_t min_white_black_diff,
+    CudaStream *stream) {
+  // CameraImage.data is a flatbuffer [ubyte] vector, which flatbuffers only
+  // aligns to 4 bytes.
+  ABSL_CHECK_EQ(reinterpret_cast<uintptr_t>(color_image) % 4, 0u)
+      << ": the MONO8 threshold loads the image 4 bytes at a time";
+  // Copying the address in stream order keeps a later call from replacing it
+  // before this kernel reads it.  CUDA reads pageable memory before
+  // cudaMemcpyAsync returns, so color_image may go out of scope.
+  image_address_device_.MemcpyAsyncFrom(&color_image, stream);
+  ThresholdAndDecimateIndirect(image_address_device_.get(), decimated_image,
+                               thresholded_image, min_white_black_diff, stream);
+}
+
 }  // namespace
+
+void Threshold::ThresholdAndDecimateIndirect(
+    const uint8_t *const * /*color_image*/, uint8_t * /*decimated_image*/,
+    uint8_t * /*thresholded_image*/, apriltag_size_t /*min_white_black_diff*/,
+    CudaStream * /*stream*/) {
+  ABSL_LOG(FATAL) << "Only the GPU MONO8 threshold reads the image address "
+                     "on the GPU";
+}
 
 std::unique_ptr<Threshold> MakeThreshold(vision::ImageFormat image_format,
                                          size_t width, size_t height) {

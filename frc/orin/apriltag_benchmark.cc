@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -81,8 +82,13 @@ ABSL_FLAG(uint32_t, min_cluster_pixels, 25,
           "Matches --min_cluster_pixels on the robot.");
 ABSL_FLAG(int32_t, nthreads, 6, "Decode threads per detector.");
 ABSL_FLAG(bool, stage_timing, false,
-          "Report the time each GPU stage takes.  Recording the events costs "
-          "CPU and latency, so leave this off when measuring those.");
+          "Report the time each GPU stage takes.  The stages then run one "
+          "after another on one stream instead of as the frame's CUDA graph, "
+          "and recording their events costs CPU and latency, so leave this "
+          "off when measuring GPU time, CPU or latency.");
+ABSL_FLAG(bool, gpu_time, true,
+          "Report each frame's GPU time.  Recording it costs an event record "
+          "and read on every frame, which the robot skips.");
 ABSL_FLAG(int32_t, realtime_priority, 0,
           "If > 0, run each detector's main thread at this SCHED_FIFO "
           "priority, the way apriltag_detector runs at 21 on the robot.  The "
@@ -458,6 +464,7 @@ DetectorResults RunDetector(
     GpuDetector detector(width, height, tag_detector, calib.camera_matrix,
                          calib.dist_coeffs, first.format());
     detector.set_stage_timing(stage_timing);
+    detector.set_measure_gpu_time(absl::GetFlag(FLAGS_gpu_time));
     detector.set_host_wait_spin(
         std::chrono::microseconds(absl::GetFlag(FLAGS_host_wait_spin_us)));
     ImageSource source(
@@ -644,7 +651,9 @@ void Report(const std::vector<DetectorResults> &all) {
       }
       ++window_frames;
       wall.push_back(timing.wall_ms);
-      gpu.push_back(timing.gpu_ms);
+      if (!std::isnan(timing.gpu_ms)) {
+        gpu.push_back(timing.gpu_ms);
+      }
       host_decode.push_back(timing.host_decode_ms);
       if (timing.tick_ns != 0) {
         latency.push_back(1e-6 * (timing.end_ns - timing.tick_ns));
@@ -671,7 +680,9 @@ void Report(const std::vector<DetectorResults> &all) {
       "  Steady state: %zu frames in the %.3f s all detectors ran\n",
       window_frames, window_s);
   PrintStats("Detect() wall", wall);
-  PrintStats("GPU (events)", gpu);
+  if (!gpu.empty()) {
+    PrintStats("GPU (events)", gpu);
+  }
   PrintStats("Host decode", host_decode);
   if (!latency.empty()) {
     PrintStats("Latency", latency);
@@ -817,9 +828,12 @@ DetectorResults DeserializeTimings(std::string_view data,
     }
     ABSL_CHECK_EQ(tag, "F");
     FrameTiming timing;
+    // gpu_ms is "nan" without --gpu_time, which operator>> doesn't parse.
+    std::string gpu_ms;
     size_t num_stages;
     in >> timing.tick_ns >> timing.start_ns >> timing.end_ns >>
-        timing.wall_ms >> timing.gpu_ms >> timing.host_decode_ms >> num_stages;
+        timing.wall_ms >> gpu_ms >> timing.host_decode_ms >> num_stages;
+    timing.gpu_ms = std::stof(gpu_ms);
     in.ignore();
     for (size_t i = 0; i < num_stages; ++i) {
       std::string line;

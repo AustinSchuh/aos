@@ -214,6 +214,11 @@ class MappedHostMemory {
   // see into, so it doesn't reuse anything read before it.
   std::span<const T> host_span() const { return span_; }
 
+  // Returns the pointer for the host to write through.  A kernel launched
+  // after the write sees it; only write while no GPU work reading it is in
+  // flight.
+  volatile T *mutable_host_ptr() { return span_.data(); }
+
   // Returns the pointer for kernels to use.
   T *device_ptr() { return device_ptr_; }
 

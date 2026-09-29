@@ -45,6 +45,16 @@ class Threshold {
                                     apriltag_size_t min_white_black_diff,
                                     CudaStream *stream) = 0;
 
+  // Like ThresholdAndDecimate, but the GPU reads the image's address from
+  // *color_image when the work runs instead of when it is enqueued, so a CUDA
+  // graph which captures this thresholds whichever image *color_image points
+  // to at each launch.  color_image must be readable by the device, and the
+  // image 4 byte aligned.  Only the GPU MONO8 threshold supports this.
+  virtual void ThresholdAndDecimateIndirect(
+      const uint8_t *const *color_image, uint8_t *decimated_image,
+      uint8_t *thresholded_image, apriltag_size_t min_white_black_diff,
+      CudaStream *stream);
+
   virtual ~Threshold() = default;
 };
 
