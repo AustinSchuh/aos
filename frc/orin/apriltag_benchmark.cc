@@ -4,6 +4,7 @@
 // and compare that against an earlier run, so a change can be checked for both
 // speed and for whether it changed any detections.
 
+#include <pthread.h>
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <filesystem>
@@ -55,6 +57,10 @@ ABSL_FLAG(int32_t, skip_frames, 0,
           "Skip this many frames at the start of the sorted corpus.");
 ABSL_FLAG(int32_t, max_frames, 0, "If > 0, only replay this many frames.");
 ABSL_FLAG(int32_t, iterations, 1, "Number of passes over the corpus.");
+ABSL_FLAG(int32_t, measured_frames, 0,
+          "If > 0, each detector measures this many frames, continuing "
+          "around the corpus from where it starts, instead of --iterations "
+          "passes over it.");
 ABSL_FLAG(int32_t, warmup, 10, "Untimed detections to run before measuring.");
 ABSL_FLAG(int32_t, parallel, 1,
           "Detectors to run at once, each in its own process the way the "
@@ -70,7 +76,16 @@ ABSL_FLAG(double, pace_max_age_ms, 0,
           "With --pace_hz, drop frames older than this when the detector "
           "gets to them, like gpu_apriltag's --max_image_age_ms.  0 drops "
           "every frame a newer one has already arrived behind.");
+ABSL_FLAG(std::string, pace_phases, "seed",
+          "How --pace_hz phases the detectors: \"seed\" gives each one a "
+          "random phase from --pace_seed, and \"aligned\" gives them all the "
+          "same phase, the way cameras triggered together would.");
 ABSL_FLAG(uint32_t, pace_seed, 0, "Seed for the --pace_hz phases.");
+ABSL_FLAG(int32_t, pace_seeds, 1,
+          "Measure this many times, with seeds --pace_seed, --pace_seed + 1, "
+          "and so on, and report all of them together.  One seed's phases "
+          "can happen to keep the detectors apart or pile them up; a range "
+          "of them shows what a robot typically sees.");
 ABSL_FLAG(bool, cold_input, false,
           "Have a helper thread write each image a few frames ahead into a "
           "ring of buffers, the way the camera pipeline writes images on "
@@ -93,6 +108,10 @@ ABSL_FLAG(int32_t, realtime_priority, 0,
           "If > 0, run each detector's main thread at this SCHED_FIFO "
           "priority, the way apriltag_detector runs at 21 on the robot.  The "
           "decode threads stay SCHED_OTHER there and here.");
+ABSL_FLAG(int32_t, gpu_keepalive_us, 0,
+          "If > 0, launch an empty kernel on a stream of its own this often, "
+          "in each detector's process, so the GPU doesn't power gate between "
+          "frames.  Waking up adds about 0.3 ms to a frame.");
 ABSL_FLAG(int32_t, host_wait_spin_us, 0,
           "Microseconds the detector polls each GPU event before it sleeps "
           "on it.");
@@ -144,6 +163,8 @@ struct DetectorResults {
   std::vector<int64_t> dropped_ticks_ns;
   // CPU time of the whole process while measuring.
   double cpu_s = 0;
+  // The part of cpu_s spent copying images in, which the robot doesn't do.
+  double input_cpu_s = 0;
   // Frame name -> formatted detections.
   std::map<std::string, std::vector<std::string>> detections;
   size_t num_detections = 0;
@@ -172,6 +193,14 @@ double CpuSeconds() {
   ABSL_PCHECK(getrusage(RUSAGE_SELF, &usage) == 0);
   return usage.ru_utime.tv_sec + usage.ru_stime.tv_sec +
          1e-6 * (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec);
+}
+
+// CPU time of the thread `clock` belongs to, from pthread_getcpuclockid or
+// CLOCK_THREAD_CPUTIME_ID.
+double ThreadCpuSeconds(clockid_t clock) {
+  struct timespec time;
+  ABSL_PCHECK(clock_gettime(clock, &time) == 0);
+  return time.tv_sec + 1e-9 * time.tv_nsec;
 }
 
 std::vector<Frame> LoadCorpus() {
@@ -301,9 +330,11 @@ const Calibration &CalibrationFor(const std::map<int, Calibration> &calibs,
 }
 
 // When in each --pace_hz period detector `index` gets its frames.
-std::chrono::nanoseconds PacePhase(int index) {
-  std::seed_seq seed{absl::GetFlag(FLAGS_pace_seed),
-                     static_cast<uint32_t>(index)};
+std::chrono::nanoseconds PacePhase(uint32_t pace_seed, int index) {
+  if (absl::GetFlag(FLAGS_pace_phases) == "aligned") {
+    return std::chrono::nanoseconds(0);
+  }
+  std::seed_seq seed{pace_seed, static_cast<uint32_t>(index)};
   std::mt19937 rng(seed);
   return std::chrono::nanoseconds(
       static_cast<int64_t>(std::uniform_real_distribution<double>(
@@ -363,7 +394,9 @@ class ImageSource {
   // valid until the next call.
   std::pair<const uint8_t *, const uint8_t *> Get(size_t sequence) {
     if (!filler_.joinable()) {
+      const double cpu_start = ThreadCpuSeconds(CLOCK_THREAD_CPUTIME_ID);
       memcpy(slots_[0].host, image_for_(sequence), image_bytes_);
+      copy_cpu_s_ += ThreadCpuSeconds(CLOCK_THREAD_CPUTIME_ID) - cpu_start;
       return {slots_[0].host, slots_[0].device};
     }
     std::unique_lock<std::mutex> lock(mutex_);
@@ -373,6 +406,17 @@ class ImageSource {
     Slot &slot = slots_[sequence % kSlots];
     changed_.wait(lock, [&]() { return slot.sequence == sequence; });
     return {slot.host, slot.device};
+  }
+
+  // CPU time spent copying images in so far.  With a filler thread, that is
+  // all of its CPU time.
+  double CopyCpuSeconds() {
+    if (!filler_.joinable()) {
+      return copy_cpu_s_;
+    }
+    clockid_t clock;
+    ABSL_CHECK_EQ(pthread_getcpuclockid(filler_.native_handle(), &clock), 0);
+    return ThreadCpuSeconds(clock);
   }
 
  private:
@@ -413,6 +457,8 @@ class ImageSource {
   const std::function<const uint8_t *(size_t)> image_for_;
   std::vector<Slot> slots_;
   std::thread filler_;
+  // CPU time Get() has spent copying, without a filler thread.
+  double copy_cpu_s_ = 0;
 
   std::mutex mutex_;
   std::condition_variable changed_;
@@ -423,13 +469,50 @@ class ImageSource {
   bool done_ = false;
 };
 
+__global__ void KeepaliveKernel() {}
+
+// Launches an empty kernel every --gpu_keepalive_us so the GPU stays powered
+// up between frames.  The kernel runs on a non-blocking stream of its own and
+// touches no memory, so it doesn't change which managed memory the CPU may
+// access while the detector's stream is idle.
+class GpuKeepalive {
+ public:
+  explicit GpuKeepalive(std::chrono::microseconds period) {
+    if (period > std::chrono::microseconds(0)) {
+      thread_ = std::thread([this, period]() { Run(period); });
+    }
+  }
+  ~GpuKeepalive() {
+    if (thread_.joinable()) {
+      done_ = true;
+      thread_.join();
+    }
+  }
+
+ private:
+  void Run(std::chrono::microseconds period) {
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    while (!done_) {
+      KeepaliveKernel<<<1, 1, 0, stream>>>();
+      CHECK_CUDA(cudaGetLastError());
+      SleepUntil(aos::monotonic_clock::now() + period);
+    }
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaStreamDestroy(stream));
+  }
+
+  std::atomic<bool> done_ = false;
+  std::thread thread_;
+};
+
 // Runs detector `index` of `parallel` over the corpus.  Each one starts at a
 // different place in the corpus so parallel detectors aren't all looking at
 // the same frame.  After warming up, it calls `ready`, which returns when to
 // start measuring.
 DetectorResults RunDetector(
     const std::vector<Frame> &frames, const std::map<int, Calibration> &calibs,
-    int index, int parallel, bool record_detections,
+    int index, int parallel, uint32_t pace_seed, bool record_detections,
     const std::function<aos::monotonic_clock::time_point()> &ready) {
   const vision::CameraImage &first = frames.front().image.message();
   const size_t width = first.cols();
@@ -437,7 +520,9 @@ DetectorResults RunDetector(
   const size_t image_bytes = first.data()->size();
   const size_t offset = index * frames.size() / parallel;
   const size_t warmup = absl::GetFlag(FLAGS_warmup);
-  const size_t total = frames.size() * absl::GetFlag(FLAGS_iterations);
+  const size_t total = absl::GetFlag(FLAGS_measured_frames) > 0
+                           ? absl::GetFlag(FLAGS_measured_frames)
+                           : frames.size() * absl::GetFlag(FLAGS_iterations);
   const double pace_hz = absl::GetFlag(FLAGS_pace_hz);
   const bool stage_timing = absl::GetFlag(FLAGS_stage_timing);
 
@@ -471,6 +556,9 @@ DetectorResults RunDetector(
         image_bytes, absl::GetFlag(FLAGS_cold_input), [&](size_t sequence) {
           return frame_for(sequence).image.message().data()->data();
         });
+    // Started before the realtime priority below, which it doesn't need.
+    GpuKeepalive keepalive(
+        std::chrono::microseconds(absl::GetFlag(FLAGS_gpu_keepalive_us)));
 
     // Makes image `sequence` and its calibration ready for Detect().
     auto prepare = [&](size_t sequence) {
@@ -515,7 +603,8 @@ DetectorResults RunDetector(
             ? std::chrono::nanoseconds(static_cast<int64_t>(1e9 / pace_hz))
             : std::chrono::nanoseconds(0);
     const aos::monotonic_clock::time_point first_tick =
-        epoch + (pace_hz > 0 ? PacePhase(index) : std::chrono::nanoseconds(0));
+        epoch + (pace_hz > 0 ? PacePhase(pace_seed, index)
+                             : std::chrono::nanoseconds(0));
     const aos::monotonic_clock::duration max_age =
         std::chrono::duration_cast<aos::monotonic_clock::duration>(
             std::chrono::duration<double, std::milli>(
@@ -532,6 +621,7 @@ DetectorResults RunDetector(
     };
 
     const double cpu_start = CpuSeconds();
+    const double input_cpu_start = source.CopyCpuSeconds();
     results.timings.reserve(total);
     for (size_t pass_index = 0; pass_index < total; ++pass_index) {
       if (pace_hz > 0) {
@@ -580,6 +670,7 @@ DetectorResults RunDetector(
       }
     }
     results.cpu_s = CpuSeconds() - cpu_start;
+    results.input_cpu_s = source.CopyCpuSeconds() - input_cpu_start;
   }
 
   apriltag_detector_destroy(tag_detector);
@@ -615,67 +706,75 @@ void PrintStats(std::string_view label, const std::vector<float> &values) {
       label, stats.mean, stats.p50, stats.p90, stats.p99, stats.max);
 }
 
-// Reports on the frames inside the window where every detector was measuring,
-// so setup, warmup, and whichever detectors finish first don't dilute the
-// contended numbers.
-void Report(const std::vector<DetectorResults> &all) {
-  int64_t window_start = std::numeric_limits<int64_t>::min();
-  int64_t window_end = std::numeric_limits<int64_t>::max();
+// Reports on the frames inside the window where every detector of a run was
+// measuring, so setup, warmup, and whichever detectors finish first don't
+// dilute the contended numbers.  The runs' windows are reported together.
+void Report(const std::vector<std::vector<DetectorResults>> &runs) {
   size_t frames = 0;
   size_t detections = 0;
   double cpu_s = 0;
-  for (const DetectorResults &results : all) {
-    ABSL_CHECK(!results.timings.empty());
-    window_start = std::max(window_start, results.timings.front().start_ns);
-    window_end = std::min(window_end, results.timings.back().end_ns);
-    frames += results.timings.size();
-    detections += results.num_detections;
-    cpu_s += results.cpu_s;
-  }
-  ABSL_CHECK_LT(window_start, window_end)
-      << ": The detectors never ran at the same time";
-  auto in_window = [&](int64_t ns) {
-    return ns >= window_start && ns <= window_end;
-  };
-
-  std::vector<float> wall, gpu, host_decode, latency;
+  double input_cpu_s = 0;
+  std::vector<float> wall, gpu, host_decode, residual, latency;
   // Stage name -> times, kept in first-seen order.
   std::vector<std::string_view> stage_order;
   std::map<std::string_view, std::vector<float>> stages;
   size_t window_frames = 0;
   size_t window_dropped = 0;
-  for (const DetectorResults &results : all) {
-    for (const FrameTiming &timing : results.timings) {
-      if (!in_window(timing.start_ns) || !in_window(timing.end_ns)) {
-        continue;
-      }
-      ++window_frames;
-      wall.push_back(timing.wall_ms);
-      if (!std::isnan(timing.gpu_ms)) {
-        gpu.push_back(timing.gpu_ms);
-      }
-      host_decode.push_back(timing.host_decode_ms);
-      if (timing.tick_ns != 0) {
-        latency.push_back(1e-6 * (timing.end_ns - timing.tick_ns));
-      }
-      for (const auto &[name, ms] : timing.stages) {
-        auto [it, inserted] = stages.try_emplace(name);
-        if (inserted) {
-          stage_order.push_back(name);
-        }
-        it->second.push_back(ms);
-      }
+  double window_s = 0;
+  for (const std::vector<DetectorResults> &all : runs) {
+    int64_t window_start = std::numeric_limits<int64_t>::min();
+    int64_t window_end = std::numeric_limits<int64_t>::max();
+    for (const DetectorResults &results : all) {
+      ABSL_CHECK(!results.timings.empty());
+      window_start = std::max(window_start, results.timings.front().start_ns);
+      window_end = std::min(window_end, results.timings.back().end_ns);
+      frames += results.timings.size();
+      detections += results.num_detections;
+      cpu_s += results.cpu_s;
+      input_cpu_s += results.input_cpu_s;
     }
-    window_dropped += std::count_if(results.dropped_ticks_ns.begin(),
-                                    results.dropped_ticks_ns.end(), in_window);
+    ABSL_CHECK_LT(window_start, window_end)
+        << ": The detectors never ran at the same time";
+    window_s += 1e-9 * (window_end - window_start);
+    auto in_window = [&](int64_t ns) {
+      return ns >= window_start && ns <= window_end;
+    };
+
+    for (const DetectorResults &results : all) {
+      for (const FrameTiming &timing : results.timings) {
+        if (!in_window(timing.start_ns) || !in_window(timing.end_ns)) {
+          continue;
+        }
+        ++window_frames;
+        wall.push_back(timing.wall_ms);
+        if (!std::isnan(timing.gpu_ms)) {
+          gpu.push_back(timing.gpu_ms);
+          residual.push_back(timing.wall_ms - timing.gpu_ms -
+                             timing.host_decode_ms);
+        }
+        host_decode.push_back(timing.host_decode_ms);
+        if (timing.tick_ns != 0) {
+          latency.push_back(1e-6 * (timing.end_ns - timing.tick_ns));
+        }
+        for (const auto &[name, ms] : timing.stages) {
+          auto [it, inserted] = stages.try_emplace(name);
+          if (inserted) {
+            stage_order.push_back(name);
+          }
+          it->second.push_back(ms);
+        }
+      }
+      window_dropped +=
+          std::count_if(results.dropped_ticks_ns.begin(),
+                        results.dropped_ticks_ns.end(), in_window);
+    }
   }
-  const double window_s = 1e-9 * (window_end - window_start);
 
   std::cout << absl::StrFormat(
       "%zu frames across %zu detector(s), %zu detections, %.1f frames/s, "
-      "%.3f ms CPU/frame\n",
-      frames, all.size(), detections, window_frames / window_s,
-      1000.0 * cpu_s / frames);
+      "%.3f ms CPU/frame, %.3f without copying the input in\n",
+      frames, runs.front().size(), detections, window_frames / window_s,
+      1000.0 * cpu_s / frames, 1000.0 * (cpu_s - input_cpu_s) / frames);
   std::cout << absl::StrFormat(
       "  Steady state: %zu frames in the %.3f s all detectors ran\n",
       window_frames, window_s);
@@ -684,6 +783,26 @@ void Report(const std::vector<DetectorResults> &all) {
     PrintStats("GPU (events)", gpu);
   }
   PrintStats("Host decode", host_decode);
+  if (!residual.empty()) {
+    // What neither the GPU nor the decode accounts for.  When the GPU has
+    // powered down between frames, waking it adds about 0.3 ms before the
+    // first kernel starts, which shows up here on some share of frames.  That
+    // share can be over half, so it is measured from the fastest frames, not
+    // from the median.  When every frame pays it, as a lone detector paced at
+    // 60 Hz does, the share is 0 and only the residual itself shows it.  With
+    // --use_neon, the host threshold runs before the GPU time starts, so the
+    // residual includes it too and can't be compared with the GPU threshold's.
+    PrintStats("Wall - GPU - decode", residual);
+    std::vector<float> sorted = residual;
+    std::sort(sorted.begin(), sorted.end());
+    const float slow = sorted[sorted.size() / 100] + 0.2;
+    std::cout << absl::StrFormat(
+        "  Residual over p1 + 0.2 ms on %.1f%% of frames\n",
+        100.0 *
+            std::count_if(residual.begin(), residual.end(),
+                          [&](float value) { return value > slow; }) /
+            residual.size());
+  }
   if (!latency.empty()) {
     PrintStats("Latency", latency);
     std::cout << absl::StrFormat(
@@ -787,12 +906,15 @@ bool Compare(const DetectorResults &results, const std::string &path) {
 
 // Timings go from a child detector back to the parent as text: a "D <count>"
 // line with the number of detections, a "C <seconds>" line with its CPU time,
-// an "X <tick>" line per dropped frame, then per frame a "F <tick> <start>
+// an "I <seconds>" line with the part of that spent copying images in, an
+// "X <tick>" line per dropped frame, then per frame a "F <tick> <start>
 // <end> <wall> <gpu> <host> <stages>" line followed by that many
 // "<name>\t<ms>" lines.
 std::string SerializeTimings(const DetectorResults &results) {
-  std::string out = absl::StrCat("D ", results.num_detections, "\n", "C ",
-                                 absl::StrFormat("%.9g", results.cpu_s), "\n");
+  std::string out =
+      absl::StrCat("D ", results.num_detections, "\n", "C ",
+                   absl::StrFormat("%.9g", results.cpu_s), "\n", "I ",
+                   absl::StrFormat("%.9g", results.input_cpu_s), "\n");
   for (const int64_t tick_ns : results.dropped_ticks_ns) {
     absl::StrAppend(&out, "X ", tick_ns, "\n");
   }
@@ -820,6 +942,10 @@ DetectorResults DeserializeTimings(std::string_view data,
     }
     if (tag == "C") {
       in >> results.cpu_s;
+      continue;
+    }
+    if (tag == "I") {
+      in >> results.input_cpu_s;
       continue;
     }
     if (tag == "X") {
@@ -875,7 +1001,8 @@ void ReadAll(int fd, void *data, size_t size) {
 // CUDA must not have been touched yet in this process.
 std::vector<DetectorResults> RunInChildren(
     const std::vector<Frame> &frames, const std::map<int, Calibration> &calibs,
-    int parallel, std::set<std::string, std::less<>> *names) {
+    int parallel, uint32_t pace_seed,
+    std::set<std::string, std::less<>> *names) {
   struct Child {
     pid_t pid;
     // Results come back on this.
@@ -897,8 +1024,8 @@ std::vector<DetectorResults> RunInChildren(
         close(child.from_child);
         close(child.to_child);
       }
-      const std::string data = SerializeTimings(
-          RunDetector(frames, calibs, i, parallel, /*record=*/false, [&]() {
+      const std::string data = SerializeTimings(RunDetector(
+          frames, calibs, i, parallel, pace_seed, /*record=*/false, [&]() {
             WriteAll(from_child[1], "W", 1);
             int64_t epoch_ns;
             ReadAll(to_child[0], &epoch_ns, sizeof(epoch_ns));
@@ -968,25 +1095,39 @@ int Main() {
   ABSL_CHECK(absl::GetFlag(FLAGS_pace_hz) <= 0 || !record)
       << ": --detections_out and --compare_to can't use --pace_hz, which "
          "drops frames";
-  if (absl::GetFlag(FLAGS_pace_hz) > 0) {
-    std::cout << absl::StrFormat("Paced at %g Hz, phases",
-                                 absl::GetFlag(FLAGS_pace_hz));
-    for (int i = 0; i < parallel; ++i) {
-      std::cout << absl::StrFormat(" %.2f", 1e-6 * PacePhase(i).count());
-    }
-    std::cout << " ms\n";
-  }
+  const std::string pace_phases = absl::GetFlag(FLAGS_pace_phases);
+  ABSL_CHECK(pace_phases == "seed" || pace_phases == "aligned")
+      << ": Unknown --pace_phases " << pace_phases;
+  const int pace_seeds = absl::GetFlag(FLAGS_pace_seeds);
+  ABSL_CHECK_GE(pace_seeds, 1);
+  ABSL_CHECK(pace_seeds == 1 ||
+             (absl::GetFlag(FLAGS_pace_hz) > 0 && pace_phases == "seed"))
+      << ": --pace_seeds needs --pace_hz and --pace_phases=seed";
 
-  std::vector<DetectorResults> results;
+  std::vector<std::vector<DetectorResults>> runs;
   std::set<std::string, std::less<>> stage_names;
-  if (parallel == 1) {
-    results.push_back(RunDetector(frames, calibs, 0, 1, record, []() {
-      return aos::monotonic_clock::now();
-    }));
-  } else {
-    results = RunInChildren(frames, calibs, parallel, &stage_names);
+  for (int run = 0; run < pace_seeds; ++run) {
+    const uint32_t pace_seed = absl::GetFlag(FLAGS_pace_seed) + run;
+    if (absl::GetFlag(FLAGS_pace_hz) > 0) {
+      std::cout << absl::StrFormat("Paced at %g Hz, phases",
+                                   absl::GetFlag(FLAGS_pace_hz));
+      for (int i = 0; i < parallel; ++i) {
+        std::cout << absl::StrFormat(" %.2f",
+                                     1e-6 * PacePhase(pace_seed, i).count());
+      }
+      std::cout << " ms\n";
+    }
+    if (parallel == 1) {
+      runs.push_back(
+          {RunDetector(frames, calibs, 0, 1, pace_seed, record,
+                       []() { return aos::monotonic_clock::now(); })});
+    } else {
+      runs.push_back(
+          RunInChildren(frames, calibs, parallel, pace_seed, &stage_names));
+    }
   }
-  Report(results);
+  Report(runs);
+  const std::vector<DetectorResults> &results = runs.front();
 
   if (!absl::GetFlag(FLAGS_timing_csv).empty()) {
     std::ofstream out(absl::GetFlag(FLAGS_timing_csv));
