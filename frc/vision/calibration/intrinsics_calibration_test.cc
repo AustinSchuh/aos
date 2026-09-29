@@ -6,6 +6,7 @@
 #include "Eigen/Geometry"
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
+#include "absl/status/status.h"
 #include "gtest/gtest.h"
 #include "opencv2/calib3d.hpp"
 #include "opencv2/core/eigen.hpp"
@@ -15,8 +16,10 @@
 #include "aos/events/shm_event_loop.h"
 #include "aos/events/simulated_event_loop.h"
 #include "aos/init.h"
+#include "aos/json_to_flatbuffer.h"
 #include "aos/testing/path.h"
 #include "aos/testing/random_seed.h"
+#include "aos/testing/tmpdir.h"
 #include "aos/util/math.h"
 #include "frc/vision/calibration/intrinsics_calibration_lib.h"
 #include "tools/cpp/runfiles/runfiles.h"
@@ -24,6 +27,7 @@
 ABSL_DECLARE_FLAG(bool, large_board);
 ABSL_DECLARE_FLAG(bool, coarse_pattern);
 ABSL_DECLARE_FLAG(bool, dict5x5_9x14_board);
+ABSL_DECLARE_FLAG(bool, write_invalid_calibration);
 
 namespace numbers = std::numbers;
 
@@ -66,10 +70,11 @@ void CheckAgainstKnownCalibration(IntrinsicsCalibration &calibrator) {
 // points.
 //
 // Allow for different intrinsics (camera matrix and distortion coefficients) to
-// be used as initial conditions for the solver.
-void RunIntrinsicFromPoints(std::string calib_filename,
-                            cv::Mat camera_mat_init = cv::Mat(),
-                            cv::Mat dist_coeffs_init = cv::Mat()) {
+// be used as initial conditions for the solver.  Returns what MaybeCalibrate
+// does.
+absl::Status RunIntrinsicFromPoints(std::string calib_filename,
+                                    cv::Mat camera_mat_init = cv::Mat(),
+                                    cv::Mat dist_coeffs_init = cv::Mat()) {
   absl::SetFlag(&FLAGS_override_hostname, "orin-971-1");
   aos::FlatbufferDetachedBuffer<aos::Configuration> config =
       aos::configuration::ReadConfig(
@@ -212,7 +217,7 @@ void RunIntrinsicFromPoints(std::string calib_filename,
   calibrator.GetCharucoExtractor().HandleImage(blank_image,
                                                aos::monotonic_clock::now());
   // Run the calibration
-  calibrator.MaybeCalibrate();
+  const absl::Status status = calibrator.MaybeCalibrate();
 
   {
     // For visualizing all points that have been captured
@@ -254,19 +259,24 @@ void RunIntrinsicFromPoints(std::string calib_filename,
   CheckAgainstKnownCalibration(calibrator);
   // Reprojection error should be nearly exact
   EXPECT_NEAR(calibrator.GetReprojectionError(), 0.0, 0.001);
+  return status;
 }
 
 TEST(IntrinsicCalculationTest, SamplingProjectedPoints) {
   // Run using old 5 parameter model (which requires distortion coefficients
   // to be zero-- otherwise our reprojections don't work near the corners of
   // the image)
-  RunIntrinsicFromPoints(ArtifactPath(
-      "frc/vision/test_calib_files/calibration_orin-971-1_cam-24-00.json"));
+  EXPECT_TRUE(RunIntrinsicFromPoints(
+                  ArtifactPath("frc/vision/test_calib_files/"
+                               "calibration_orin-971-1_cam-24-00.json"))
+                  .ok());
 
   // Run the new 8 parameter rational model
-  RunIntrinsicFromPoints(
-      ArtifactPath("frc/vision/test_calib_files/"
-                   "calibration_orin-971-1_cam-24-00_8parameter.json"));
+  EXPECT_TRUE(
+      RunIntrinsicFromPoints(
+          ArtifactPath("frc/vision/test_calib_files/"
+                       "calibration_orin-971-1_cam-24-00_8parameter.json"))
+          .ok());
 
   // Run the 8 parameter model using rough values for the camera matrix and
   // distortion coeficients to check it converges properly
@@ -277,10 +287,58 @@ TEST(IntrinsicCalculationTest, SamplingProjectedPoints) {
   camera_mat_init.at<float>(1, 2) = 1088 / 2.0;
   cv::Mat dist_coeffs_init = cv::Mat::zeros(8, 1, CV_32F);
 
-  RunIntrinsicFromPoints(
-      ArtifactPath("frc/vision/test_calib_files/"
-                   "calibration_orin-971-1_cam-24-00_8parameter.json"),
-      camera_mat_init, dist_coeffs_init);
+  EXPECT_TRUE(
+      RunIntrinsicFromPoints(
+          ArtifactPath("frc/vision/test_calib_files/"
+                       "calibration_orin-971-1_cam-24-00_8parameter.json"),
+          camera_mat_init, dist_coeffs_init)
+          .ok());
+}
+
+// The 5 parameter model team 0's test calibrations used to hold folds inside
+// its 1280x720 image, so WriteValidatedCalibration refuses to write it unless
+// told to.  25-07 is valid, and written.
+TEST(IntrinsicCalculationTest, WritesOnlyValidCalibrations) {
+  const std::string folder = aos::testing::TestTmpDir() + "/write_validated";
+  std::filesystem::remove_all(folder);
+  std::filesystem::create_directories(folder);
+
+  flatbuffers::FlatBufferBuilder fbb;
+  const auto intrinsics = fbb.CreateVector<float>(
+      {893.759521, 0, 645.470764, 0, 893.222351, 388.150269, 0, 0, 1});
+  const auto dist_coeffs = fbb.CreateVector<float>(
+      {-0.44902, 0.248409, -0.000537, -0.000112, -0.076989});
+  calibration::CameraCalibration::Builder builder(fbb);
+  builder.add_intrinsics(intrinsics);
+  builder.add_dist_coeffs(dist_coeffs);
+  fbb.Finish(builder.Finish());
+  const aos::FlatbufferDetachedBuffer<calibration::CameraCalibration> fallback(
+      fbb.Release());
+
+  const std::string invalid = folder + "/invalid.json";
+  EXPECT_EQ(IntrinsicsCalibration::WriteValidatedCalibration(
+                fallback.message(), cv::Size(1280, 720), invalid)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_FALSE(std::filesystem::exists(invalid));
+
+  absl::SetFlag(&FLAGS_write_invalid_calibration, true);
+  EXPECT_TRUE(IntrinsicsCalibration::WriteValidatedCalibration(
+                  fallback.message(), cv::Size(1280, 720), invalid)
+                  .ok());
+  absl::SetFlag(&FLAGS_write_invalid_calibration, false);
+  EXPECT_TRUE(std::filesystem::exists(invalid));
+
+  const std::string valid = folder + "/valid.json";
+  EXPECT_TRUE(IntrinsicsCalibration::WriteValidatedCalibration(
+                  aos::JsonFileToFlatbuffer<calibration::CameraCalibration>(
+                      ArtifactPath("frc/vision/test_calib_files/"
+                                   "calibration_orin1-4646-0_cam-25-07_2025-02-"
+                                   "18_13-23-39.json"))
+                      .message(),
+                  cv::Size(1600, 1304), valid)
+                  .ok());
+  EXPECT_TRUE(std::filesystem::exists(valid));
 }
 
 // Test intrinsic calibration when loading from a series of images from disk
@@ -320,7 +378,7 @@ TEST(IntrinsicCalculationTest, ImagePlayback) {
                  << test_images_path.string();
   absl::SetFlag(&FLAGS_image_load_path, test_images_path.string());
   calibrator.LoadImagesFromPath(test_images_path);
-  calibrator.MaybeCalibrate();
+  EXPECT_TRUE(calibrator.MaybeCalibrate().ok());
 
   CheckAgainstKnownCalibration(calibrator);
   // Validate that reprojection error is < 1

@@ -7,6 +7,7 @@
 
 #include "Eigen/Dense"
 #include "Eigen/Geometry"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "opencv2/calib3d.hpp"
 #include "opencv2/highgui/highgui.hpp"
@@ -49,7 +50,11 @@ class IntrinsicsCalibration {
   void DrawCornersOnImage(cv::Mat image, uint index, std::vector<cv::Mat> tvecs,
                           std::vector<cv::Mat> rvecs, cv::Mat camera_matrix,
                           cv::Mat dist_coeffs);
-  void MaybeCalibrate();
+  // Calibrates from the captures, if there are enough, and writes the
+  // calibration file.  Returns an error, and writes nothing, if the
+  // calibration fails ValidateCalibration at the captured image size and
+  // --write_invalid_calibration is false.
+  absl::Status MaybeCalibrate();
 
   // Expose CharucoExtractor for testing purposes
   CharucoExtractor &GetCharucoExtractor() { return charuco_extractor_; };
@@ -60,6 +65,13 @@ class IntrinsicsCalibration {
                    std::string_view node_name, std::string_view camera_channel,
                    std::string_view camera_id, uint16_t team_number,
                    double reprojection_error);
+
+  // Writes calibration to filename if it passes ValidateCalibration at
+  // image_size, or --write_invalid_calibration says to write it anyway.
+  // Returns an error, having written nothing, otherwise.
+  static absl::Status WriteValidatedCalibration(
+      const calibration::CameraCalibration &calibration, cv::Size image_size,
+      const std::string &filename);
 
   // Return how many captures we've made so far
   int NumCaptures() const { return all_charuco_ids_.size(); };

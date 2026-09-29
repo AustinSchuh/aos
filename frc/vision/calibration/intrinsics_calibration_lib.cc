@@ -7,7 +7,11 @@
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "absl/log/die_if_null.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "opencv2/core/eigen.hpp"
+
+#include "frc/vision/calibration/calibration_validator.h"
 
 // NOTE: This will flip any annotations / text that has already been drawn on
 // the image (e.g., in charuco_lib.cc)
@@ -32,6 +36,9 @@ ABSL_DECLARE_FLAG(bool, visualize);
 
 ABSL_FLAG(bool, grayscale, false,
           "If true, calibrate in grayscale, otherwise, calibrate in color");
+ABSL_FLAG(bool, write_invalid_calibration, false,
+          "If true, write the calibration file even if it fails "
+          "frc::vision::ValidateCalibration at the calibrated image size.");
 
 namespace frc::vision {
 
@@ -467,7 +474,38 @@ void IntrinsicsCalibration::DrawCornersOnImage(cv::Mat image, uint index,
   }
 }
 
-void IntrinsicsCalibration::MaybeCalibrate() {
+absl::Status IntrinsicsCalibration::WriteValidatedCalibration(
+    const calibration::CameraCalibration &calibration, cv::Size image_size,
+    const std::string &filename) {
+  CalibrationReport report;
+  const absl::Status validation = ValidateCalibration(
+      calibration, image_size.width, image_size.height, &report);
+  if (validation.ok()) {
+    ABSL_LOG(INFO) << "The calibration is valid: " << report;
+  } else {
+    ABSL_LOG(ERROR) << "The calibration fails validation at the "
+                    << image_size.width << "x" << image_size.height
+                    << " it was calibrated at, so the AprilTag detector "
+                       "can't reliably undistort all of the image with it:\n"
+                    << validation.message() << "\n"
+                    << report;
+    if (!absl::GetFlag(FLAGS_write_invalid_calibration)) {
+      const absl::Status status = absl::FailedPreconditionError(absl::StrCat(
+          "Not writing ", filename,
+          ", which fails validation.  Recalibrate with more captures of the "
+          "board in the image's corners, rerun with "
+          "--write_invalid_calibration to write it anyway, or copy it from "
+          "the log above."));
+      ABSL_LOG(ERROR) << status.message();
+      return status;
+    }
+  }
+  aos::util::WriteStringToFileOrDie(
+      filename, aos::FlatbufferToJson(&calibration, {.multi_line = true}));
+  return absl::OkStatus();
+}
+
+absl::Status IntrinsicsCalibration::MaybeCalibrate() {
   // TODO: This number should depend on coarse vs. fine pattern
   // Maybe just on total # of ids found, not just images
   if (all_charuco_ids_.size() >= absl::GetFlag(FLAGS_min_images_to_calibrate)) {
@@ -536,9 +574,8 @@ void IntrinsicsCalibration::MaybeCalibrate() {
     ABSL_LOG(INFO) << calibration_filename << " -> "
                    << aos::FlatbufferToJson(camera_calibration,
                                             {.multi_line = true});
-    aos::util::WriteStringToFileOrDie(
-        calibration_filename,
-        aos::FlatbufferToJson(camera_calibration, {.multi_line = true}));
+    const absl::Status status = WriteValidatedCalibration(
+        camera_calibration.message(), image_size_, calibration_filename);
 
     // If desired, review the images (requires we're loading from disk);
     if (absl::GetFlag(FLAGS_review_images) &&
@@ -554,8 +591,9 @@ void IntrinsicsCalibration::MaybeCalibrate() {
         index++;
       }
     }
-  } else {
-    ABSL_LOG(INFO) << "Skipping calibration due to not enough images.";
+    return status;
   }
+  ABSL_LOG(INFO) << "Skipping calibration due to not enough images.";
+  return absl::OkStatus();
 }
 }  // namespace frc::vision
