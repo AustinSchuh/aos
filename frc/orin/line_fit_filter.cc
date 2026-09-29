@@ -981,7 +981,6 @@ __device__ __forceinline__ void QuadFitTail(
       const QuadCorners corners = UnrankCorners(best.combination);
       FitQuad &fit_quad = fit_quads_device[blob_index];
       fit_quad.blob_index = blob_index;
-      fit_quad.valid = true;
       const uint32_t i0 = storage.point_indices[corners.m0];
       const uint32_t i1 = storage.point_indices[corners.m1];
       const uint32_t i2 = storage.point_indices[corners.m2];

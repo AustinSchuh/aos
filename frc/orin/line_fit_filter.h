@@ -123,7 +123,6 @@ constexpr std::array<float, 7> FilterCoefficients() {
 
 struct FitQuad {
   uint16_t blob_index;
-  bool valid;
   uint16_t indices[4];
   LineFitMoments moments[4];
 };

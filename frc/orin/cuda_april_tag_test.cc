@@ -3001,7 +3001,7 @@ TEST_F(AprilDetectionTest, ImageRepeat) {
 
 // Returns whether two quad fits are the same.
 bool SameFitQuad(const FitQuad &a, const FitQuad &b) {
-  if (a.blob_index != b.blob_index || a.valid != b.valid ||
+  if (a.blob_index != b.blob_index ||
       !std::equal(std::begin(a.indices), std::end(a.indices),
                   std::begin(b.indices))) {
     return false;
