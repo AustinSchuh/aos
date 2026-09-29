@@ -75,13 +75,30 @@ __device__ __forceinline__ uint32_t ImageNode(uint32_t tile_x, uint32_t tile_y,
          tile_x * kTilePixels + local % kTilePixels;
 }
 
-// Returns the root of n in a union-find forest in shared memory.
-__device__ __forceinline__ uint32_t SharedFind(volatile uint32_t *parent,
-                                               uint32_t n) {
-  uint32_t p = parent[n];
+// Returns the root of n in a union-find forest in shared memory, pointing each
+// node on the way at its grandparent (path splitting).  Other threads' unions
+// run concurrently, so the reads are volatile to see their links, and the
+// shortcuts are atomicMins so a parent only ever decreases.
+//
+// A concurrent union can relink n after this reads its parent, and the shortcut
+// then moves n out of the tree that union just put it in.  No join is lost:
+// every node that has been n's parent stays joined to the others, by current
+// links and the pairs unions still hold, through nodes smaller than n.  Those
+// aren't in n's subtree, which is all a write to parent[n] moves.  When a
+// SharedUnion's atomicMin lowers a parent that is no longer a root, the union
+// carries on with the new and old parents, and a shortcut's gp has been p's
+// parent, while p has been n's, so the same holds one level down.  Labels
+// depend on SharedUnion carrying on like that.
+__device__ __forceinline__ uint32_t SharedFind(uint32_t *parent, uint32_t n) {
+  const volatile uint32_t *links = parent;
+  uint32_t p = links[n];
   while (p != n) {
+    const uint32_t gp = links[p];
+    if (gp != p) {
+      atomicMin(parent + n, gp);
+    }
     n = p;
-    p = parent[n];
+    p = gp;
   }
   return n;
 }
