@@ -5,6 +5,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <tuple>
 
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
@@ -1797,6 +1798,10 @@ class CudaAprilTagDetector {
 
   void set_undistort(bool value) { undistort_ = value; }
 
+  // Stage timing launches each stage on its own instead of through the CUDA
+  // graph, so this picks which of the two runs.
+  void set_stage_timing(bool value) { gpu_detector_.set_stage_timing(value); }
+
   // Checks that the GPU's sorted points and line fit points match those of
   // the last call, and saves them for the next.  The GPU finds points in a
   // different order each time, and that must not reach anything past the
@@ -2255,6 +2260,9 @@ TEST_F(AprilDetectionTest, ImageRepeat) {
 
   for (size_t i = 0; i < 4; ++i) {
     ABSL_LOG(INFO) << "Attempt " << i;
+    // Alternate between the CUDA graph and launching each stage, which must
+    // agree.
+    cuda_detector.set_stage_timing(i % 2 == 1);
     cuda_detector.DetectGPU(color_image.clone());
     cuda_detector.CheckSameAsLastDetect();
     cuda_detector.DetectCPU(color_image.clone());
@@ -2265,19 +2273,24 @@ TEST_F(AprilDetectionTest, ImageRepeat) {
   }
 }
 
+// Parameterized on the image, and on whether stage timing is on, which runs
+// each stage on its own instead of through the CUDA graph.
 class SingleAprilDetectionTest
-    : public ::testing::WithParamInterface<std::string_view>,
+    : public ::testing::WithParamInterface<std::tuple<std::string_view, bool>>,
       public AprilDetectionTest {};
 
 // Tests a single image.
 TEST_P(SingleAprilDetectionTest, Image) {
-  auto image = ReadImage(GetParam());
+  const auto [path, stage_timing] = GetParam();
+  auto image = ReadImage(path);
 
-  ABSL_LOG(INFO) << "Testing " << GetParam() << " with dimensions "
-                 << image.message().cols() << " x " << image.message().rows();
+  ABSL_LOG(INFO) << "Testing " << path << " with dimensions "
+                 << image.message().cols() << " x " << image.message().rows()
+                 << (stage_timing ? " with" : " without") << " stage timing";
 
   CudaAprilTagDetector cuda_detector(image.message().cols(),
                                      image.message().rows());
+  cuda_detector.set_stage_timing(stage_timing);
 
   const cv::Mat color_image = ToMat(&image.message());
 
@@ -2292,31 +2305,33 @@ TEST_P(SingleAprilDetectionTest, Image) {
 // Tests that both algorithms agree on a bunch of pixels.
 INSTANTIATE_TEST_SUITE_P(
     CapturedImages, SingleAprilDetectionTest,
-    ::testing::Values(
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-54-16.869057537.bfbs",
-        "orin_image_apriltag/file/orin_image_apriltag.bfbs",
-        "orin_large_image_apriltag/file/orin_large_gs_apriltag.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-54-09.501047728.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-51-24.861065764.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-52-01.846912552.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-52-33.462848049.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-54-24.931661979.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_09-29-16.806073486.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_09-33-00.993756514.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-57-00.171120695.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-57-17.858752817.bfbs",
-        "apriltag_test_bfbs_images/"
-        "bfbs-capture-2013-01-18_08-57-08.096597542.bfbs"));
+    ::testing::Combine(
+        ::testing::Values(
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-54-16.869057537.bfbs",
+            "orin_image_apriltag/file/orin_image_apriltag.bfbs",
+            "orin_large_image_apriltag/file/orin_large_gs_apriltag.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-54-09.501047728.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-51-24.861065764.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-52-01.846912552.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-52-33.462848049.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-54-24.931661979.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_09-29-16.806073486.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_09-33-00.993756514.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-57-00.171120695.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-57-17.858752817.bfbs",
+            "apriltag_test_bfbs_images/"
+            "bfbs-capture-2013-01-18_08-57-08.096597542.bfbs"),
+        ::testing::Bool()));
 
 // Tests that the filter coefficients produced by FilterCoefficients() match the
 // implementation in AprilRobotics.

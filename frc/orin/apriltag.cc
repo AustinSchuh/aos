@@ -7,6 +7,7 @@
 #include <numbers>
 #include <vector>
 
+#include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
@@ -19,6 +20,7 @@
 namespace numbers = std::numbers;
 
 ABSL_FLAG(bool, use_neon, false, "Use NEON optimized threshold");
+ABSL_DECLARE_FLAG(bool, sync);
 
 namespace frc::apriltag {
 namespace {
@@ -107,6 +109,14 @@ GpuDetector::GpuDetector(size_t width, size_t height,
 
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
   zarray_ensure_capacity(detections_, kMaxBlobs);
+
+  // Everything from labeling to the quad fit has the same shape every frame,
+  // so capture it once.  That fixes tag_detector_'s quad parameters at their
+  // values now.  --sync synchronizes between kernels, which a graph can't do.
+  if (!absl::GetFlag(FLAGS_sync)) {
+    quad_fitting_graph_.emplace(&stream_,
+                                [this]() { EnqueueQuadFitting(false); });
+  }
 }
 
 GpuDetector::~GpuDetector() {
@@ -1278,12 +1288,97 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
 
   record_stage(after_memcpy_gray_, &stream_);
 
+  if (quad_fitting_graph_.has_value() && !stage_timing_) {
+    quad_fitting_graph_->Launch(&stream_);
+  } else {
+    EnqueueQuadFitting(stage_timing_);
+  }
+  // The host reads the quads where FitQuads writes them, so this is Detect()'s
+  // only wait on the GPU.
+  after_quad_fit_.Record(&stream_);
+  after_quad_fit_.Synchronize(host_wait_spin_);
+
+  // selected_extents_device_ and the other per-blob buffers only hold kMaxBlobs
+  // blobs, so the GPU filtered every blob out of an overflowing frame.
+  last_frame_overflowed_ = frame_status_.host_ptr()->overflow != 0;
+  const uint32_t num_blob_pairs = frame_status_.host_ptr()->num_blob_pairs;
+  if (last_frame_overflowed_) {
+    ABSL_LOG_EVERY_N_SEC(ERROR, 1)
+        << "Dropping a frame with " << num_blob_pairs
+        << " or more blob pairs, more than " << kMaxBlobs;
+  }
+
+  const aos::monotonic_clock::time_point before_fit_quads =
+      aos::monotonic_clock::now();
+  UpdateFitQuads();
+  AdjustPixelCenters();
+
+  DecodeTags();
+
+  const aos::monotonic_clock::time_point end_time = aos::monotonic_clock::now();
+
+  // TODO(austin): Bring it back to the CPU and see how good we did.
+
+  // Report out how long things took.
+
+  ABSL_VLOG(1) << "Found " << frame_status_.host_ptr()->num_boundary_points
+               << " items";
+  ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;
+  ABSL_VLOG(1) << "Fit " << quad_corners_host_.size() << " quads";
+  const std::chrono::nanoseconds gpu_time = after_quad_fit_.ElapsedTime(start_);
+  gpu_time_ms_ = float_milli(gpu_time).count();
+  host_decode_time_ms_ = float_milli(end_time - before_fit_quads).count();
+  if (stage_timing_) {
+    // Every event completed before after_quad_fit_, which the host already
+    // waited on.
+    stage_times_ms_.clear();
+    if (absl::GetFlag(FLAGS_use_neon)) {
+      stage_times_ms_.emplace_back("NEON threshold (host)", neon_threshold_ms);
+    }
+    for (const Stage &stage : stages_) {
+      stage_times_ms_.emplace_back(
+          stage.name,
+          float_milli(stage.end->ElapsedTime(*stage.begin)).count());
+      ABSL_VLOG(1) << "    " << stage.name << " "
+                   << stage_times_ms_.back().second << "ms";
+    }
+  }
+  ABSL_VLOG(1) << "  FitQuads "
+               << float_milli(end_time - before_fit_quads).count()
+               << "ms on host";
+
+  ABSL_VLOG(1) << "Overall " << gpu_time_ms_ << "ms, "
+               << float_milli(end_time - start_time).count() << "ms on host, "
+               << (1000.0 / gpu_time_ms_) << "hz";
+  // Average.  Skip the first one as the kernel is warming up and is slower.
+  if (!first_) {
+    ++execution_count_;
+    execution_duration_ += gpu_time;
+    ABSL_VLOG(1)
+        << "Average overall "
+        << float_milli(execution_duration_ / execution_count_).count() << "ms, "
+        << (1000.0 /
+            float_milli(execution_duration_ / execution_count_).count())
+        << "hz";
+  }
+
+  first_ = false;
+}
+
+void GpuDetector::EnqueueQuadFitting(bool record_stages) {
+  // Records event on stream if timing every stage.
+  auto record_stage = [record_stages](CudaEvent &event, CudaStream *stream) {
+    if (record_stages) {
+      event.Record(stream);
+    }
+  };
+
   // Unionfind the image.
   LabelImage(
       ToGpuImage(thresholded_image_device_), ToGpuImage(union_markers_device_),
       ToGpuImage(union_markers_size_device_), label_tile_roots_device_.get(),
       label_forest_device_.get(), stream_.get(),
-      stage_timing_ ? std::span<CudaEvent>(after_labeling_kernel_)
+      record_stages ? std::span<CudaEvent>(after_labeling_kernel_)
                     : std::span<CudaEvent>());
 
   record_stage(after_unionfinding_, &stream_);
@@ -1410,8 +1505,6 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
            &stream_);
   record_stage(after_line_filter_, &stream_);
 
-  // The host reads the quads where this writes them, so this is Detect()'s
-  // only wait on the GPU.
   apriltag::FitQuads(
       filtered_is_local_peak_device_.get(), line_fit_points_device_.get(),
       selected_extents_device_.get(), kMaxBlobs, max_april_tag_perimeter,
@@ -1419,75 +1512,6 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
       tag_detector_->qtp.cos_critical_rad, fit_quads_host_.device_ptr(),
       fit_quad_valid_host_.device_ptr(), &stream_);
   MaybeCheckAndSynchronize("FitQuads");
-  after_quad_fit_.Record(&stream_);
-  after_quad_fit_.Synchronize(host_wait_spin_);
-
-  // selected_extents_device_ and the 12 bit blob index in IndexPoint only hold
-  // kMaxBlobs blobs, so the GPU filtered every blob out of an overflowing
-  // frame.
-  last_frame_overflowed_ = frame_status_.host_ptr()->overflow != 0;
-  const uint32_t num_blob_pairs = frame_status_.host_ptr()->num_blob_pairs;
-  if (last_frame_overflowed_) {
-    ABSL_LOG_EVERY_N_SEC(ERROR, 1)
-        << "Dropping a frame with " << num_blob_pairs
-        << " or more blob pairs, more than " << kMaxBlobs;
-  }
-
-  const aos::monotonic_clock::time_point before_fit_quads =
-      aos::monotonic_clock::now();
-  UpdateFitQuads();
-  AdjustPixelCenters();
-
-  DecodeTags();
-
-  const aos::monotonic_clock::time_point end_time = aos::monotonic_clock::now();
-
-  // TODO(austin): Bring it back to the CPU and see how good we did.
-
-  // Report out how long things took.
-
-  ABSL_VLOG(1) << "Found " << frame_status_.host_ptr()->num_boundary_points
-               << " items";
-  ABSL_VLOG(1) << "Found compressed runs: " << num_blob_pairs;
-  ABSL_VLOG(1) << "Fit " << quad_corners_host_.size() << " quads";
-  const std::chrono::nanoseconds gpu_time = after_quad_fit_.ElapsedTime(start_);
-  gpu_time_ms_ = float_milli(gpu_time).count();
-  host_decode_time_ms_ = float_milli(end_time - before_fit_quads).count();
-  if (stage_timing_) {
-    // Every event completed before after_quad_fit_, which the host already
-    // waited on.
-    stage_times_ms_.clear();
-    if (absl::GetFlag(FLAGS_use_neon)) {
-      stage_times_ms_.emplace_back("NEON threshold (host)", neon_threshold_ms);
-    }
-    for (const Stage &stage : stages_) {
-      stage_times_ms_.emplace_back(
-          stage.name,
-          float_milli(stage.end->ElapsedTime(*stage.begin)).count());
-      ABSL_VLOG(1) << "    " << stage.name << " "
-                   << stage_times_ms_.back().second << "ms";
-    }
-  }
-  ABSL_VLOG(1) << "  FitQuads "
-               << float_milli(end_time - before_fit_quads).count()
-               << "ms on host";
-
-  ABSL_VLOG(1) << "Overall " << gpu_time_ms_ << "ms, "
-               << float_milli(end_time - start_time).count() << "ms on host, "
-               << (1000.0 / gpu_time_ms_) << "hz";
-  // Average.  Skip the first one as the kernel is warming up and is slower.
-  if (!first_) {
-    ++execution_count_;
-    execution_duration_ += gpu_time;
-    ABSL_VLOG(1)
-        << "Average overall "
-        << float_milli(execution_duration_ / execution_count_).count() << "ms, "
-        << (1000.0 /
-            float_milli(execution_duration_ / execution_count_).count())
-        << "hz";
-  }
-
-  first_ = false;
 }
 
 }  // namespace frc::apriltag

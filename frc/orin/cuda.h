@@ -106,6 +106,43 @@ class CudaEvent {
   cudaEvent_t event_;
 };
 
+// Class to manage the lifetime of an executable CUDA graph, captured from the
+// work a function enqueues on a stream.  Launching it submits all that work in
+// one call, which takes less CPU time than launching each piece, and the GPU
+// can't run out of queued work while the launching thread is preempted.
+class CudaGraph {
+ public:
+  // Captures what enqueue() enqueues on stream.  enqueue() must enqueue work on
+  // stream only, and must not wait for the GPU.
+  template <typename Enqueue>
+  CudaGraph(CudaStream *stream, Enqueue &&enqueue) {
+    CHECK_CUDA(cudaStreamBeginCapture(stream->get(),
+                                      cudaStreamCaptureModeThreadLocal));
+    enqueue();
+    cudaGraph_t graph;
+    CHECK_CUDA(cudaStreamEndCapture(stream->get(), &graph));
+    CHECK_CUDA(cudaGetLastError());
+    // cudaGraphInstantiate's signature differs between CUDA 11 and 12.
+    CHECK_CUDA(cudaGraphInstantiateWithFlags(&exec_, graph, 0));
+    CHECK_CUDA(cudaGraphDestroy(graph));
+  }
+
+  CudaGraph(const CudaGraph &) = delete;
+  CudaGraph &operator=(const CudaGraph &) = delete;
+  CudaGraph(const CudaGraph &&) noexcept = delete;
+  CudaGraph &operator=(const CudaGraph &&) noexcept = delete;
+
+  ~CudaGraph() { CHECK_CUDA(cudaGraphExecDestroy(exec_)); }
+
+  // Enqueues the captured work on stream.
+  void Launch(CudaStream *stream) {
+    CHECK_CUDA(cudaGraphLaunch(exec_, stream->get()));
+  }
+
+ private:
+  cudaGraphExec_t exec_;
+};
+
 // Class to manage the lifetime of page locked host memory for fast copies back
 // to host memory.
 template <typename T>

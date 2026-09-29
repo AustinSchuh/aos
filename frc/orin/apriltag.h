@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cub/iterator/transform_input_iterator.cuh>
+#include <optional>
 
 #include "third_party/apriltag/apriltag.h"
 
@@ -149,7 +150,8 @@ class GpuDetector {
 
   // Records a CUDA event between every GPU stage of Detect() so StageTimesMs()
   // can report them.  Off by default because each record costs launch-path CPU
-  // time and the report adds to Detect()'s latency.
+  // time and the report adds to Detect()'s latency, and because it launches
+  // each stage on its own instead of as one CUDA graph.
   void set_stage_timing(bool stage_timing) {
     stage_timing_ = stage_timing;
     stage_times_ms_.clear();
@@ -273,6 +275,10 @@ class GpuDetector {
                         const DistCoeffs *distortion_coefficients);
 
  private:
+  // Enqueues everything from labeling the thresholded image to fitting quads
+  // on stream_, recording the stage events if record_stages.
+  void EnqueueQuadFitting(bool record_stages);
+
   void UpdateFitQuads();
 
   void AdjustPixelCenters();
@@ -357,6 +363,10 @@ class GpuDetector {
   CudaEvent after_line_filter_;
   CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
+  // EnqueueQuadFitting(false), captured, unless --sync is set.  Launching it
+  // submits the frame's GPU work after thresholding in one call.
+  std::optional<CudaGraph> quad_fitting_graph_;
+
   // A stage's time is from begin to end.
   struct Stage {
     std::string_view name;
@@ -392,9 +402,10 @@ class GpuDetector {
   // Full size gray scale image.
   GpuMemory<uint8_t> gray_image_device_;
   // decimated_image_device_ and thresholded_image_device_ are attached to
-  // stream_.  Every kernel that touches them runs on stream_, and the CPU
-  // touches them only while stream_ is idle: the NEON threshold at the start of
-  // Detect() and the Copy*To methods after it returns.
+  // stream_.  Every kernel that touches them runs on stream_, including those
+  // in quad_fitting_graph_, which launches there, and the CPU touches them only
+  // while stream_ is idle: the NEON threshold at the start of Detect() and the
+  // Copy*To methods after it returns.
   //
   // Half resolution, gray, decimated image.
   UnifiedMemory<uint8_t> decimated_image_device_;
