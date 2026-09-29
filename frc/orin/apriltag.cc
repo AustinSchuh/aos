@@ -27,6 +27,9 @@ namespace {
 
 typedef std::chrono::duration<float, std::milli> float_milli;
 
+// Returns the priority of each SortAndScanBigBlobs launch in graph.
+std::vector<int> BigBlobSortPriorities(const CudaGraph &graph);
+
 }  // namespace
 
 GpuDetector::GpuDetector(size_t width, size_t height,
@@ -143,15 +146,24 @@ GpuDetector::GpuDetector(size_t width, size_t height,
   if (!absl::GetFlag(FLAGS_sync)) {
     frame_graph_thresholds_ =
         !use_neon_ && image_format_ == vision::ImageFormat::MONO8;
-    frame_graph_.emplace(&stream_, [this]() {
-      if (frame_graph_thresholds_) {
-        threshold_->ThresholdAndDecimateIndirect(
-            image_address_.device_ptr(), decimated_image_device_,
-            thresholded_image_device_, tag_detector_->qtp.min_white_black_diff,
-            &stream_);
-      }
-      EnqueueQuadFitting(false);
-    });
+    frame_graph_.emplace(
+        &stream_,
+        [this]() {
+          if (frame_graph_thresholds_) {
+            threshold_->ThresholdAndDecimateIndirect(
+                image_address_.device_ptr(), decimated_image_device_,
+                thresholded_image_device_,
+                tag_detector_->qtp.min_white_black_diff, &stream_);
+          }
+          EnqueueQuadFitting(/*record_stages=*/false, /*fork_big_blobs=*/true);
+        },
+        /*use_node_priority=*/true);
+    // The big-blob sort's overlap with the small-blob sort rests on its
+    // priority, and nothing else would notice it going missing.
+    const std::vector<int> big_blob_priorities =
+        BigBlobSortPriorities(*frame_graph_);
+    ABSL_CHECK_EQ(big_blob_priorities.size(), 1u);
+    ABSL_CHECK_EQ(big_blob_priorities[0], big_blob_priority_);
   }
 }
 
@@ -1348,6 +1360,10 @@ __global__ void __launch_bounds__(kBigBlobThreads) SortAndScanBigBlobs(
   }
 }
 
+std::vector<int> BigBlobSortPriorities(const CudaGraph &graph) {
+  return graph.KernelPriorities(SortAndScanBigBlobs);
+}
+
 }  // namespace
 
 void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
@@ -1429,7 +1445,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   if (use_graph) {
     frame_graph_->Launch(&stream_);
   } else {
-    EnqueueQuadFitting(stage_timing_);
+    EnqueueQuadFitting(stage_timing_, /*fork_big_blobs=*/false);
   }
   // The host reads the quads where FitQuads writes them, so this is Detect()'s
   // only wait on the GPU.
@@ -1508,7 +1524,7 @@ void GpuDetector::Detect(const uint8_t *image, const uint8_t *image_device) {
   }
 }
 
-void GpuDetector::EnqueueQuadFitting(bool record_stages) {
+void GpuDetector::EnqueueQuadFitting(bool record_stages, bool fork_big_blobs) {
   // Records event on stream if timing every stage.
   auto record_stage = [record_stages](CudaEvent &event, CudaStream *stream) {
     if (record_stages) {
@@ -1628,17 +1644,40 @@ void GpuDetector::EnqueueQuadFitting(bool record_stages) {
     MaybeCheckAndSynchronize("BuildBlobWorkList");
     TransformLineFitPoint transform(decimated_image_device_, width_ / 2,
                                     height_ / 2);
-    SortAndScanSmallBlobs<<<kMaxBlobs, kSmallBlobThreads, 0, stream_.get()>>>(
-        blob_work_list_device_.get(), selected_blobs_device_.get(),
-        selected_extents_device_.get(), transform,
-        sorted_selected_blobs_device_.get(), line_fit_points_device_.get());
-    MaybeCheckAndSynchronize("SortAndScanSmallBlobs");
-    record_stage(after_small_blob_sort_, &stream_);
-    SortAndScanBigBlobs<<<kBigBlobBlocks, kBigBlobThreads, 0, stream_.get()>>>(
-        blob_work_list_device_.get(), selected_blobs_device_.get(),
-        selected_extents_device_.get(), transform,
-        sorted_selected_blobs_device_.get(), line_fit_points_device_.get());
-    MaybeCheckAndSynchronize("SortAndScanBigBlobs");
+    auto sort_small_blobs = [&]() {
+      SortAndScanSmallBlobs<<<kMaxBlobs, kSmallBlobThreads, 0, stream_.get()>>>(
+          blob_work_list_device_.get(), selected_blobs_device_.get(),
+          selected_extents_device_.get(), transform,
+          sorted_selected_blobs_device_.get(), line_fit_points_device_.get());
+      MaybeCheckAndSynchronize("SortAndScanSmallBlobs");
+    };
+    auto sort_big_blobs = [&](CudaStream *stream) {
+      SortAndScanBigBlobs<<<kBigBlobBlocks, kBigBlobThreads, 0,
+                            stream->get()>>>(
+          blob_work_list_device_.get(), selected_blobs_device_.get(),
+          selected_extents_device_.get(), transform,
+          sorted_selected_blobs_device_.get(), line_fit_points_device_.get());
+      MaybeCheckAndSynchronize("SortAndScanBigBlobs");
+    };
+    if (fork_big_blobs) {
+      // Each big-blob block needs a whole SM's registers, so after the
+      // small-blob sort, the few of them would leave most SMs idle.  On a
+      // branch of its own, the big-blob sort overlaps the small-blob sort
+      // instead, as long as its blocks are dispatched before the small-blob
+      // blocks fill the SMs.  Its stream's priority sees to that, whatever
+      // order the graph's ready kernels would otherwise go in.  The two sorts
+      // write disjoint blobs, and FitLines, after the join, reads them first.
+      fork_big_blobs_.Record(&stream_);
+      big_blob_stream_.Wait(&fork_big_blobs_);
+      sort_big_blobs(&big_blob_stream_);
+      sort_small_blobs();
+      join_big_blobs_.Record(&big_blob_stream_);
+      stream_.Wait(&join_big_blobs_);
+    } else {
+      sort_small_blobs();
+      record_stage(after_small_blob_sort_, &stream_);
+      sort_big_blobs(&stream_);
+    }
   }
   record_stage(after_big_blob_sort_, &stream_);
 

@@ -312,8 +312,10 @@ class GpuDetector {
 
  private:
   // Enqueues everything from labeling the thresholded image to fitting quads
-  // on stream_, recording the stage events if record_stages.
-  void EnqueueQuadFitting(bool record_stages);
+  // on stream_, recording the stage events if record_stages.  With
+  // fork_big_blobs, the big-blob sort runs on big_blob_stream_, parallel to
+  // the small-blob sort.
+  void EnqueueQuadFitting(bool record_stages, bool fork_big_blobs);
 
   void UpdateFitQuads();
 
@@ -371,6 +373,12 @@ class GpuDetector {
 
   // Stream to operate on.
   CudaStream stream_;
+  // The big-blob sort's branch of frame_graph_, at the greatest priority, and
+  // the events which fork it from stream_ and join it back.
+  const int big_blob_priority_ = GreatestStreamPriority();
+  CudaStream big_blob_stream_{big_blob_priority_};
+  CudaEvent fork_big_blobs_{cudaEventDisableTiming};
+  CudaEvent join_big_blobs_{cudaEventDisableTiming};
 
   // Events between the steps.  Detect() always records the events it waits
   // on, start_ for GPU time or stage timing, and the rest only for stage
@@ -396,11 +404,11 @@ class GpuDetector {
   CudaEvent after_line_filter_;
   CudaEvent after_quad_fit_{cudaEventBlockingSync};
 
-  // EnqueueQuadFitting(false), captured, unless --sync is set.  Launching it
-  // submits the frame's GPU work after thresholding in one call.  The GPU
-  // MONO8 threshold reads the image address from image_address_ when it runs,
-  // so the graph starts with it when frame_graph_thresholds_, and then submits
-  // all of the frame's GPU work.
+  // EnqueueQuadFitting(false, true), captured, unless --sync is set.
+  // Launching it submits the frame's GPU work after thresholding in one call.
+  // The GPU MONO8 threshold reads the image address from image_address_ when
+  // it runs, so the graph starts with it when frame_graph_thresholds_, and
+  // then submits all of the frame's GPU work.
   std::optional<CudaGraph> frame_graph_;
   bool frame_graph_thresholds_ = false;
 
@@ -451,11 +459,15 @@ class GpuDetector {
   // ordinary device memory, which any stream may touch.
   //
   // The NEON threshold writes them from the CPU, so with --use_neon they are
-  // managed memory attached to stream_.  Every kernel that touches them then
-  // runs on stream_, including those in frame_graph_, which launches
-  // there, and the CPU touches them only while stream_ is idle: the NEON
-  // threshold at the start of Detect() and the Copy*To methods after it
-  // returns.
+  // managed memory attached to stream_, and the CPU touches them only while
+  // stream_ is idle: the NEON threshold at the start of Detect() and the
+  // Copy*To methods after it returns.  Every kernel that touches them runs on
+  // stream_, or in frame_graph_, which launches there.  That includes the
+  // big-blob sort on frame_graph_'s big_blob_stream_ branch, which reads the
+  // decimated image.  CUDA leaves reads from a stream the memory isn't
+  // attached to undefined on a GPU without concurrent managed access, like
+  // the Orin's, but a microtest there found a graph branch reading memory
+  // attached to the launch stream always saw the CPU's latest writes.
   std::optional<GpuMemory<uint8_t>> decimated_image_gpu_;
   std::optional<GpuMemory<uint8_t>> thresholded_image_gpu_;
   std::optional<UnifiedMemory<uint8_t>> decimated_image_unified_;

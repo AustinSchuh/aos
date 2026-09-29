@@ -15,6 +15,39 @@ void CudaStream::Wait(CudaEvent *event) {
   CHECK_CUDA(cudaStreamWaitEvent(stream_, event->get(), 0));
 }
 
+std::vector<int> CudaGraph::KernelPriorities(const void *kernel) const {
+  size_t num_nodes = 0;
+  CHECK_CUDA(cudaGraphGetNodes(graph_, nullptr, &num_nodes));
+  std::vector<cudaGraphNode_t> nodes(num_nodes);
+  CHECK_CUDA(cudaGraphGetNodes(graph_, nodes.data(), &num_nodes));
+  std::vector<int> priorities;
+  for (cudaGraphNode_t node : nodes) {
+    cudaGraphNodeType type;
+    CHECK_CUDA(cudaGraphNodeGetType(node, &type));
+    if (type != cudaGraphNodeTypeKernel) {
+      continue;
+    }
+    cudaKernelNodeParams params;
+    CHECK_CUDA(cudaGraphKernelNodeGetParams(node, &params));
+    if (params.func != kernel) {
+      continue;
+    }
+    cudaKernelNodeAttrValue value;
+    CHECK_CUDA(cudaGraphKernelNodeGetAttribute(
+        node, cudaKernelNodeAttributePriority, &value));
+    priorities.push_back(value.priority);
+  }
+  return priorities;
+}
+
+int GreatestStreamPriority() {
+  int least_priority;
+  int greatest_priority;
+  CHECK_CUDA(
+      cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+  return greatest_priority;
+}
+
 void CheckAndSynchronize(std::string_view message) {
   CHECK_CUDA(cudaDeviceSynchronize()) << message;
   CHECK_CUDA(cudaGetLastError()) << message;

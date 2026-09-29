@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <span>
+#include <vector>
 
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
@@ -27,6 +28,13 @@ class CudaEvent;
 class CudaStream {
  public:
   CudaStream() { CHECK_CUDA(cudaStreamCreate(&stream_)); }
+  // Creates a stream at priority, which doesn't synchronize with the legacy
+  // default stream.  Lower numbers are higher priorities; see
+  // GreatestStreamPriority().
+  explicit CudaStream(int priority) {
+    CHECK_CUDA(cudaStreamCreateWithPriority(&stream_, cudaStreamNonBlocking,
+                                            priority));
+  }
 
   CudaStream(const CudaStream &) = delete;
   CudaStream &operator=(const CudaStream &) = delete;
@@ -113,18 +121,24 @@ class CudaEvent {
 class CudaGraph {
  public:
   // Captures what enqueue() enqueues on stream.  enqueue() must enqueue work on
-  // stream only, and must not wait for the GPU.
+  // stream, or on other streams which wait on an event recorded on stream and
+  // which stream then waits on, and must not wait for the GPU.
+  //
+  // With use_node_priority, each kernel runs at the priority it was captured
+  // with, which is that of the stream it was enqueued on, instead of at the
+  // priority of the stream the graph launches on.
   template <typename Enqueue>
-  CudaGraph(CudaStream *stream, Enqueue &&enqueue) {
+  CudaGraph(CudaStream *stream, Enqueue &&enqueue,
+            bool use_node_priority = false) {
     CHECK_CUDA(cudaStreamBeginCapture(stream->get(),
                                       cudaStreamCaptureModeThreadLocal));
     enqueue();
-    cudaGraph_t graph;
-    CHECK_CUDA(cudaStreamEndCapture(stream->get(), &graph));
+    CHECK_CUDA(cudaStreamEndCapture(stream->get(), &graph_));
     CHECK_CUDA(cudaGetLastError());
     // cudaGraphInstantiate's signature differs between CUDA 11 and 12.
-    CHECK_CUDA(cudaGraphInstantiateWithFlags(&exec_, graph, 0));
-    CHECK_CUDA(cudaGraphDestroy(graph));
+    CHECK_CUDA(cudaGraphInstantiateWithFlags(
+        &exec_, graph_,
+        use_node_priority ? cudaGraphInstantiateFlagUseNodePriority : 0));
   }
 
   CudaGraph(const CudaGraph &) = delete;
@@ -132,14 +146,28 @@ class CudaGraph {
   CudaGraph(const CudaGraph &&) noexcept = delete;
   CudaGraph &operator=(const CudaGraph &&) noexcept = delete;
 
-  ~CudaGraph() { CHECK_CUDA(cudaGraphExecDestroy(exec_)); }
+  ~CudaGraph() {
+    CHECK_CUDA(cudaGraphExecDestroy(exec_));
+    CHECK_CUDA(cudaGraphDestroy(graph_));
+  }
 
   // Enqueues the captured work on stream.
   void Launch(CudaStream *stream) {
     CHECK_CUDA(cudaGraphLaunch(exec_, stream->get()));
   }
 
+  // Returns the priority each captured launch of kernel has, in no particular
+  // order.
+  template <typename... Args>
+  std::vector<int> KernelPriorities(void (*kernel)(Args...)) const {
+    return KernelPriorities(reinterpret_cast<const void *>(kernel));
+  }
+
  private:
+  std::vector<int> KernelPriorities(const void *kernel) const;
+
+  // The captured graph, which KernelPriorities() reads.
+  cudaGraph_t graph_;
   cudaGraphExec_t exec_;
 };
 
@@ -386,6 +414,10 @@ void CheckAndSynchronize(std::string_view message = "");
 // so we can leave debugging in the code.
 void MaybeCheckAndSynchronize();
 void MaybeCheckAndSynchronize(std::string_view message);
+
+// Returns the current device's greatest stream priority, which the GPU
+// dispatches ahead of all others.
+int GreatestStreamPriority();
 
 // Returns how many blocks of kernel, with threads threads each, fit on the GPU
 // at once.
