@@ -1658,16 +1658,39 @@ Result<const Message *> MessageSorter::Front() {
         const auto raw_timestamp = msg->monotonic_sent_time;
         const auto channel_index = msg->channel_index;
         const auto raw_queue_index = msg->queue_index;
-        messages_.insert(Message{
-            .header = std::move(msg),
-            .data = std::move(data),
-            .raw_timestamp = raw_timestamp,
-            .boot = parts().boot_count,
-            .monotonic_remote_boot = monotonic_remote_boot,
-            .monotonic_timestamp_boot = monotonic_timestamp_boot,
-            .channel_index = channel_index,
-            .raw_queue_index = raw_queue_index,
-        });
+
+        uint32_t storage_index;
+        if (free_storage_.empty()) {
+          storage_index = message_storage_.size();
+          message_storage_.emplace_back();
+        } else {
+          storage_index = free_storage_.back();
+          free_storage_.pop_back();
+        }
+
+        // A message which sorts the same as one we already have is a
+        // duplicate, and the first one wins.
+        if (messages_
+                .insert(SortedMessage{
+                    .raw_timestamp = raw_timestamp,
+                    .channel_index = channel_index,
+                    .raw_queue_index = raw_queue_index,
+                    .storage_index = storage_index,
+                })
+                .second) {
+          message_storage_[storage_index] = Message{
+              .header = std::move(msg),
+              .data = std::move(data),
+              .raw_timestamp = raw_timestamp,
+              .boot = parts().boot_count,
+              .monotonic_remote_boot = monotonic_remote_boot,
+              .monotonic_timestamp_boot = monotonic_timestamp_boot,
+              .channel_index = channel_index,
+              .raw_queue_index = raw_queue_index,
+          };
+        } else {
+          free_storage_.push_back(storage_index);
+        }
       }
 
       // Now, update sorted_until_ to match the new message.
@@ -1692,22 +1715,29 @@ Result<const Message *> MessageSorter::Front() {
   ABSL_CHECK_GE(messages_.begin()->raw_timestamp, last_message_time_)
       << DebugString() << " reading " << parts_message_reader_.filename();
   last_message_time_ = messages_.begin()->raw_timestamp;
+  const Message *const front =
+      &message_storage_[messages_.begin()->storage_index];
   ABSL_VLOG(1) << this << " Front, sorted until " << sorted_until_ << " for "
-               << (*messages_.begin()) << " on "
-               << parts_message_reader_.filename();
-  return &(*messages_.begin());
+               << *front << " on " << parts_message_reader_.filename();
+  return front;
 }
 
-void MessageSorter::PopFront() { messages_.erase(messages_.begin()); }
+void MessageSorter::PopFront() {
+  const uint32_t storage_index = messages_.begin()->storage_index;
+  messages_.erase(messages_.begin());
+  // Let go of the message now, instead of whenever the storage gets reused.
+  message_storage_[storage_index] = Message{};
+  free_storage_.push_back(storage_index);
+}
 
 std::string MessageSorter::DebugString() const {
   std::stringstream ss;
   ss << "messages: [\n";
   int count = 0;
   bool no_dots = true;
-  for (const Message &msg : messages_) {
+  for (const SortedMessage &sorted_message : messages_) {
     if (count < 15 || count > static_cast<int>(messages_.size()) - 15) {
-      ss << msg << "\n";
+      ss << message_storage_[sorted_message.storage_index] << "\n";
     } else if (no_dots) {
       ss << "...\n";
       no_dots = false;

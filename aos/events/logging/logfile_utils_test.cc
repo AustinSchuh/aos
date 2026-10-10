@@ -785,6 +785,107 @@ TEST_F(MessageSorterTest, WayBeforeStart) {
   EXPECT_EQ(output[4].raw_timestamp, e + chrono::milliseconds(2000));
 }
 
+// Tests that a message which is in a file twice only comes out once, and that
+// the first copy is the one which wins.
+TEST_F(MessageSorterTest, DuplicateInOneFile) {
+  const aos::monotonic_clock::time_point e = monotonic_clock::epoch();
+  {
+    TestDetachedBufferWriter writer(logfile0_);
+    writer.QueueSpan(config0_.span());
+    writer.WriteSizedFlatbuffer(
+        MakeLogMessage(e + chrono::milliseconds(1000), 0, 0x005));
+    // Reuse the queue index so this has the same time, channel, and queue
+    // index as the message before it.  The contents differ so we can tell
+    // which one we got.
+    --queue_index_[0];
+    writer.WriteSizedFlatbuffer(
+        MakeLogMessage(e + chrono::milliseconds(1000), 0, 0x006));
+    writer.WriteSizedFlatbuffer(
+        MakeLogMessage(e + chrono::milliseconds(2000), 0, 0x007));
+  }
+
+  const std::vector<LogFile> parts = SortParts({logfile0_});
+
+  MessageSorter message_sorter(parts[0].parts[0]);
+
+  const auto value = [](const Message *message) {
+    return flatbuffers::GetRoot<TestMessage>((*message->data)->data())->value();
+  };
+
+  const Message *message = CheckExpected(message_sorter.Front());
+  ASSERT_TRUE(message != nullptr);
+  EXPECT_EQ(message->raw_timestamp, e + chrono::milliseconds(1000));
+  EXPECT_EQ(value(message), 0x005);
+  message_sorter.PopFront();
+
+  message = CheckExpected(message_sorter.Front());
+  ASSERT_TRUE(message != nullptr);
+  EXPECT_EQ(message->raw_timestamp, e + chrono::milliseconds(2000));
+  EXPECT_EQ(value(message), 0x007);
+  message_sorter.PopFront();
+
+  ASSERT_TRUE(CheckExpected(message_sorter.Front()) == nullptr);
+}
+
+// Tests that a long run of messages written the way the logger writes them, a
+// burst per channel at a time, comes out in order with each message still
+// attached to its own data.  This has messages being inserted between ones
+// which are already queued while others are being popped, for long enough that
+// the sorter is reusing storage from popped messages.
+TEST_F(MessageSorterTest, InterleavedChannels) {
+  const aos::monotonic_clock::time_point e = monotonic_clock::epoch();
+  constexpr int kChannels = 3;
+  constexpr int kBursts = 100;
+  constexpr int kMessagesPerBurst = 5;
+  // What each message was written with, indexed by its value.
+  std::vector<std::pair<monotonic_clock::time_point, int>> written;
+  {
+    TestDetachedBufferWriter writer(logfile0_);
+    writer.QueueSpan(config0_.span());
+    for (int burst = 0; burst < kBursts; ++burst) {
+      for (int channel = 0; channel < kChannels; ++channel) {
+        for (int i = 0; i < kMessagesPerBurst; ++i) {
+          // Each burst covers 50 ms, which keeps everything inside the 100 ms
+          // the file promises to be sorted within.
+          const monotonic_clock::time_point time =
+              e + chrono::milliseconds(1000 + 50 * burst + 10 * i + channel);
+          writer.WriteSizedFlatbuffer(
+              MakeLogMessage(time, channel, written.size()));
+          written.emplace_back(time, channel);
+        }
+      }
+    }
+  }
+
+  const std::vector<LogFile> parts = SortParts({logfile0_});
+
+  MessageSorter message_sorter(parts[0].parts[0]);
+
+  monotonic_clock::time_point last_time = monotonic_clock::min_time;
+  size_t count = 0;
+  while (true) {
+    const Message *message = CheckExpected(message_sorter.Front());
+    if (message == nullptr) {
+      break;
+    }
+    const int value =
+        flatbuffers::GetRoot<TestMessage>((*message->data)->data())->value();
+    ASSERT_GE(value, 0);
+    ASSERT_LT(static_cast<size_t>(value), written.size());
+    EXPECT_EQ(message->raw_timestamp, written[value].first);
+    EXPECT_EQ(message->header->monotonic_sent_time, written[value].first);
+    EXPECT_EQ(message->channel_index,
+              static_cast<uint32_t>(written[value].second));
+    EXPECT_EQ(message->header->channel_index,
+              static_cast<uint32_t>(written[value].second));
+    EXPECT_GE(message->raw_timestamp, last_time);
+    last_time = message->raw_timestamp;
+    ++count;
+    message_sorter.PopFront();
+  }
+  EXPECT_EQ(count, written.size());
+}
+
 // Tests that messages too far out of order trigger death.
 TEST_F(MessageSorterDeathTest, Pull) {
   const aos::monotonic_clock::time_point e = monotonic_clock::epoch();

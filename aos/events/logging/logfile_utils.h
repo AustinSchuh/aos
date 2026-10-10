@@ -694,9 +694,37 @@ class MessageSorter {
   // backwards.
   monotonic_clock::time_point last_message_time_ = monotonic_clock::min_time;
 
-  // Set used for efficient sorting of messages.  We can benchmark and evaluate
-  // other data structures if this proves to be the bottleneck.
-  absl::btree_set<Message> messages_;
+  // What a message gets sorted by, and where the message is.  A btree shuffles
+  // its elements around every time one is inserted or removed, and a Message is
+  // both big enough that only 4 fit in a node and expensive to move because of
+  // the shared_ptrs in it.  So sort these, and leave the messages where they
+  // are.
+  struct SortedMessage {
+    monotonic_clock::time_point raw_timestamp;
+    uint32_t channel_index;
+    uint32_t raw_queue_index;
+    // The index of the message in message_storage_.
+    uint32_t storage_index;
+
+    // Orders the same way Message does.  Every message from a set of parts is
+    // from the same boot, so the boot does not need to be compared.
+    bool operator<(const SortedMessage &other) const {
+      if (raw_timestamp != other.raw_timestamp) {
+        return raw_timestamp < other.raw_timestamp;
+      }
+      if (channel_index != other.channel_index) {
+        return channel_index < other.channel_index;
+      }
+      return raw_queue_index < other.raw_queue_index;
+    }
+  };
+
+  // The messages which have been read and not popped, in sorted order.
+  absl::btree_set<SortedMessage> messages_;
+  // Storage for the messages in messages_.  Elements never move, and get
+  // reused through free_storage_ when their message is popped.
+  std::deque<Message> message_storage_;
+  std::vector<uint32_t> free_storage_;
 
   // Mapping from channel to source node.
   // TODO(austin): Should we put this in Boots so it can be cached for everyone?
