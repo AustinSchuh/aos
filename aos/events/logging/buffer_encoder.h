@@ -144,6 +144,13 @@ class DataDecoder {
   // will always fill the whole range.
   virtual size_t Read(uint8_t *begin, uint8_t *end) = 0;
 
+  // Reads data into the given range like Read(), except that this is allowed
+  // to return before the range is full when carrying on would cost more than
+  // being called again will.  Returns 0 only if all bytes have been read.
+  virtual size_t ReadSome(uint8_t *begin, uint8_t *end) {
+    return Read(begin, end);
+  }
+
   // Returns the underlying filename, for debugging purposes.
   virtual std::string_view filename() const = 0;
 };

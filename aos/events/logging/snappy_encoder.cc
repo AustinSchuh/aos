@@ -162,6 +162,14 @@ void SnappyEncoder::DetachedBufferSource::Append(Copier *copy) {
 }
 
 size_t SnappyDecoder::Read(uint8_t *begin, uint8_t *end) {
+  return ReadChunks(begin, end, true);
+}
+
+size_t SnappyDecoder::ReadSome(uint8_t *begin, uint8_t *end) {
+  return ReadChunks(begin, end, false);
+}
+
+size_t SnappyDecoder::ReadChunks(uint8_t *begin, uint8_t *end, bool fill) {
   // Decoding process:
   // We maintain an uncompressed_buffer_ of data that may have been uncompressed
   // in the past but which hasn't been read yet.
@@ -170,96 +178,104 @@ size_t SnappyDecoder::Read(uint8_t *begin, uint8_t *end) {
   // need to read things from the file in one-chunk units. Snappy expects to
   // uncompress an entire chunk at once, so there isn't any value in attempting
   // to be more incremental. Each chunk will be of some variable size (specified
-  // at the start of the chunk). Once we read and uncompress the chunk, we can
-  // then copy it into the user's buffer until either we run out of data and
-  // need to uncompress a new chunk or user's buffer runs out in which case
-  // we fill up their buffer and store the extra data in uncompressed_buffer_
-  // to be populated later.
+  // at the start of the chunk). If the chunk fits in what is left of the user's
+  // buffer, we uncompress it straight into there.  Otherwise it has to go
+  // through uncompressed_buffer_, which costs a copy of the whole chunk.  When
+  // we are allowed to return less than was asked for, we avoid that by handing
+  // back what we have and holding the compressed chunk in compressed_buffer_
+  // until the next call, when it gets the whole of the user's buffer to fit
+  // in.
 
   uint8_t *current_output = begin;
-  if (uncompressed_buffer_.size() > 0) {
+  if (uncompressed_consumed_ < uncompressed_buffer_.size()) {
     const size_t amount_to_copy =
-        std::min<size_t>(uncompressed_buffer_.size(), end - current_output);
-    std::memcpy(current_output, uncompressed_buffer_.data(), amount_to_copy);
+        std::min<size_t>(uncompressed_buffer_.size() - uncompressed_consumed_,
+                         end - current_output);
+    std::memcpy(current_output,
+                uncompressed_buffer_.data() + uncompressed_consumed_,
+                amount_to_copy);
     current_output += amount_to_copy;
-    uncompressed_buffer_.erase_front(amount_to_copy);
+    uncompressed_consumed_ += amount_to_copy;
   }
 
   while (current_output != end) {
-    uint8_t header[4];
-    const size_t read_length = underlying_decoder_->Read(header, header + 4);
-    if (read_length == 0) {
-      break;
-    }
-    if (read_length != 4u) {
-      ABSL_LOG(WARNING) << "Logfile data is truncated.";
-      break;
-    }
-    const uint8_t chunk_type = header[0];
-    const size_t chunk_size = header[1] + (header[2] << 8) + (header[3] << 16);
-    compressed_buffer_.resize(chunk_size);
-    if (chunk_size !=
-        underlying_decoder_->Read(compressed_buffer_.data(),
-                                  compressed_buffer_.data() + chunk_size)) {
-      ABSL_LOG(WARNING) << "Logfile data is truncated.";
-      break;
-    }
-    if (chunk_type == 0xFF) {
-      // Start of file, don't bother
-      // checking the contents.
-      continue;
-    } else if (chunk_type == 0x00) {
+    if (!chunk_pending_) {
+      uint8_t header[4];
+      const size_t read_length = underlying_decoder_->Read(header, header + 4);
+      if (read_length == 0) {
+        break;
+      }
+      if (read_length != 4u) {
+        ABSL_LOG(WARNING) << "Logfile data is truncated.";
+        break;
+      }
+      const uint8_t chunk_type = header[0];
+      const size_t chunk_size =
+          header[1] + (header[2] << 8) + (header[3] << 16);
+      compressed_buffer_.resize(chunk_size);
+      if (chunk_size !=
+          underlying_decoder_->Read(compressed_buffer_.data(),
+                                    compressed_buffer_.data() + chunk_size)) {
+        ABSL_LOG(WARNING) << "Logfile data is truncated.";
+        break;
+      }
+      if (chunk_type == 0xFF) {
+        // Start of file, don't bother
+        // checking the contents.
+        continue;
+      } else if (chunk_type != 0x00) {
+        // Unimplemented.
+        ABSL_LOG(FATAL) << "Unsupported snappy chunk type "
+                        << static_cast<int>(chunk_type);
+      }
       if (compressed_buffer_.size() < 4u) {
         ABSL_LOG(WARNING) << "Logfile data is truncated.";
         break;
       }
-      const uint32_t checksum = compressed_buffer_.data()[0] +
-                                (compressed_buffer_.data()[1] << 8) +
-                                (compressed_buffer_.data()[2] << 16) +
-                                (compressed_buffer_.data()[3] << 24);
+    }
+    chunk_pending_ = false;
 
-      const char *input_data =
-          reinterpret_cast<char *>(compressed_buffer_.data() + 4);
-      const size_t input_size = compressed_buffer_.size() - 4;
+    const uint32_t checksum = compressed_buffer_.data()[0] +
+                              (compressed_buffer_.data()[1] << 8) +
+                              (compressed_buffer_.data()[2] << 16) +
+                              (compressed_buffer_.data()[3] << 24);
 
-      size_t uncompressed_length;
-      ABSL_CHECK(snappy::GetUncompressedLength(input_data, input_size,
-                                               &uncompressed_length));
+    const char *input_data =
+        reinterpret_cast<char *>(compressed_buffer_.data() + 4);
+    const size_t input_size = compressed_buffer_.size() - 4;
 
-      // If the user's buffer can fit the entire uncompressed data, we
-      // will uncompress directly into their buffer. Otherwise, we uncompress
-      // into a separate buffer and then copy the correct number of bytes out
-      // to fill up the user's buffer.
+    size_t uncompressed_length;
+    ABSL_CHECK(snappy::GetUncompressedLength(input_data, input_size,
+                                             &uncompressed_length));
+
+    if (uncompressed_length <= static_cast<size_t>(end - current_output)) {
+      ABSL_CHECK(snappy::RawUncompress(
+          input_data, input_size, reinterpret_cast<char *>(current_output)))
+          << ": Corrupted snappy chunk.";
+      ABSL_CHECK_EQ(checksum,
+                    SnappyChecksum(current_output, uncompressed_length))
+          << ": Checksum mismatch.";
+
+      current_output += uncompressed_length;
+    } else if (!fill && current_output != begin) {
+      chunk_pending_ = true;
+      break;
+    } else {
       // TODO(james): In the future, overload a snappy::Sink to avoid
       // unnecessary copies by extracting the initial N bytes directly into
       // the user's buffer.
-      if (end > (uncompressed_length + current_output)) {
-        ABSL_CHECK(snappy::RawUncompress(
-            input_data, input_size, reinterpret_cast<char *>(current_output)))
-            << ": Corrupted snappy chunk.";
-        ABSL_CHECK_EQ(checksum,
-                      SnappyChecksum(current_output, uncompressed_length))
-            << ": Checksum mismatch.";
-
-        current_output += uncompressed_length;
-      } else {
-        uncompressed_buffer_.resize(uncompressed_length);
-        ABSL_CHECK(snappy::RawUncompress(
-            input_data, input_size,
-            reinterpret_cast<char *>(uncompressed_buffer_.data())))
-            << ": Corrupted snappy chunk.";
-        ABSL_CHECK_EQ(checksum, SnappyChecksum(uncompressed_buffer_.data(),
-                                               uncompressed_buffer_.size()))
-            << ": Checksum mismatch.";
-        std::memcpy(current_output, uncompressed_buffer_.data(),
-                    end - current_output);
-        uncompressed_buffer_.erase_front(end - current_output);
-        current_output = end;
-      }
-    } else {
-      // Unimplemented.
-      ABSL_LOG(FATAL) << "Unsupported snappy chunk type "
-                      << static_cast<int>(chunk_type);
+      uncompressed_buffer_.resize(uncompressed_length);
+      ABSL_CHECK(snappy::RawUncompress(
+          input_data, input_size,
+          reinterpret_cast<char *>(uncompressed_buffer_.data())))
+          << ": Corrupted snappy chunk.";
+      ABSL_CHECK_EQ(checksum, SnappyChecksum(uncompressed_buffer_.data(),
+                                             uncompressed_buffer_.size()))
+          << ": Checksum mismatch.";
+      uncompressed_consumed_ = end - current_output;
+      std::memcpy(current_output, uncompressed_buffer_.data(),
+                  uncompressed_consumed_);
+      current_output = end;
     }
   }
   total_output_ += current_output - begin;

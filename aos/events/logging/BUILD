@@ -361,11 +361,14 @@ cc_test(
     ],
     shard_count = 4,
     deps = [
+        ":buffer_encoder",
         ":buffer_encoder_param_test",
         ":snappy_encoder",
         "//aos/testing:googletest",
+        "//aos/testing:tmpdir",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/types:span",
     ],
 )
 

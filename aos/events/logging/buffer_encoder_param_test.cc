@@ -1,5 +1,7 @@
 #include "aos/events/logging/buffer_encoder_param_test.h"
 
+#include <cmath>
+
 #include "absl/log/absl_check.h"
 #include "gmock/gmock.h"
 
@@ -91,6 +93,53 @@ TEST_P(BufferEncoderTest, RoundTrip) {
     }
     ASSERT_THAT(Flatten(decoded_buffers),
                 ::testing::Eq(Flatten(encoded_buffers)));
+  }
+}
+
+// Runs data through the encoder and decoder like RoundTrip does, but reads it
+// back with ReadSome(), across a wide enough range of buffer sizes to hit both
+// requests much smaller than what a decoder works in and much bigger.
+TEST_P(BufferEncoderTest, RoundTripReadSome) {
+  std::uniform_int_distribution<int> quantity_distribution(20, 60);
+  const std::string test_dir = aos::testing::TestTmpDir();
+  const std::string file_path = test_dir + "/foo";
+
+  std::vector<std::vector<uint8_t>> encoded_buffers;
+  {
+    const int encode_chunks = quantity_distribution(*random_number_generator());
+    const auto encoder = MakeEncoder();
+    encoded_buffers = CreateAndEncode(encode_chunks, encoder.get());
+    encoder->Finish();
+
+    std::ofstream output_file(file_path, std::ios::binary);
+    for (auto span : encoder->queue()) {
+      output_file.write(reinterpret_cast<const char *>(span.data()),
+                        span.size());
+    }
+  }
+
+  const std::vector<uint8_t> expected = Flatten(encoded_buffers);
+
+  // Pick sizes evenly across orders of magnitude, from 16 bytes to 256k.
+  std::uniform_real_distribution<double> log2_size_distribution(4.0, 18.0);
+  for (int i = 0; i < 20; ++i) {
+    const auto decoder = MakeDecoder(file_path);
+    std::vector<uint8_t> decoded;
+    while (true) {
+      const size_t chunk_size = static_cast<size_t>(
+          std::pow(2.0, log2_size_distribution(*random_number_generator())));
+      std::vector<uint8_t> chunk(chunk_size);
+      const size_t read_result =
+          decoder->ReadSome(chunk.data(), chunk.data() + chunk_size);
+      ASSERT_LE(read_result, chunk_size);
+      if (read_result == 0) {
+        // 0 is only allowed once everything has been returned.
+        break;
+      }
+      decoded.insert(decoded.end(), chunk.begin(), chunk.begin() + read_result);
+      ASSERT_LE(decoded.size(), expected.size());
+    }
+    ASSERT_THAT(decoded, ::testing::Eq(expected));
   }
 }
 

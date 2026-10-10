@@ -91,20 +91,28 @@ class SnappyDecoder final : public DataDecoder {
       : SnappyDecoder(std::make_unique<DummyDecoder>(filename)) {}
 
   size_t Read(uint8_t *begin, uint8_t *end) final;
+  size_t ReadSome(uint8_t *begin, uint8_t *end) final;
   std::string_view filename() const final {
     return underlying_decoder_->filename();
   }
 
  private:
+  // Implements Read() if fill is true, and ReadSome() if it is false.
+  size_t ReadChunks(uint8_t *begin, uint8_t *end, bool fill);
+
   // decoder to use for reading data out of the file itself.
   std::unique_ptr<DataDecoder> underlying_decoder_;
   // Buffer to use for reading data from the file. This being a member variable
   // is purely an optimization to avoid constant reallocations on every call to
   // Read().
   ResizeableBuffer compressed_buffer_;
-  // Buffer of any uncompressed data that we've read but which hasn't yet been
-  // consumed by a call to Read().
+  // True if compressed_buffer_ holds a data chunk which has not been
+  // uncompressed yet, because the last call had nowhere to put it.
+  bool chunk_pending_ = false;
+  // Buffer for a chunk which was too big for the buffer we were asked to fill,
+  // and how much of it has been returned so far.
   ResizeableBuffer uncompressed_buffer_;
+  size_t uncompressed_consumed_ = 0;
 
   size_t total_output_ = 0;
 };

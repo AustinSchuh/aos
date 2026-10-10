@@ -1080,7 +1080,7 @@ bool SpanReader::ReadBlock() {
   data_.resize(starting_size + kReadSize);
 
   const size_t count =
-      decoder_->Read(data_.begin() + starting_size, data_.end());
+      decoder_->ReadSome(data_.begin() + starting_size, data_.end());
   data_.resize(starting_size + count);
   if (count == 0) {
     return false;
