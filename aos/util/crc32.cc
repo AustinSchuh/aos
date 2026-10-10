@@ -1,66 +1,221 @@
 #include "aos/util/crc32.h"
 
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstring>
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#endif
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
+
 namespace aos {
 
 namespace {
-const uint32_t kCrc32Table[256] = {
-    0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
-    0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
-    0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91, 0x1db71064, 0x6ab020f2,
-    0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
-    0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9,
-    0xfa0f3d63, 0x8d080df5, 0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172,
-    0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b, 0x35b5a8fa, 0x42b2986c,
-    0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
-    0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423,
-    0xcfba9599, 0xb8bda50f, 0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924,
-    0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d, 0x76dc4190, 0x01db7106,
-    0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
-    0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d,
-    0x91646c97, 0xe6635c01, 0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e,
-    0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457, 0x65b0d9c6, 0x12b7e950,
-    0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
-    0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7,
-    0xa4d1c46d, 0xd3d6f4fb, 0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0,
-    0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9, 0x5005713c, 0x270241aa,
-    0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
-    0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81,
-    0xb7bd5c3b, 0xc0ba6cad, 0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a,
-    0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683, 0xe3630b12, 0x94643b84,
-    0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
-    0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb,
-    0x196c3671, 0x6e6b06e7, 0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc,
-    0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5, 0xd6d6a3e8, 0xa1d1937e,
-    0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
-    0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55,
-    0x316e8eef, 0x4669be79, 0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236,
-    0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f, 0xc5ba3bbe, 0xb2bd0b28,
-    0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
-    0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f,
-    0x72076785, 0x05005713, 0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38,
-    0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21, 0x86d3d2d4, 0xf1d4e242,
-    0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
-    0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69,
-    0x616bffd3, 0x166ccf45, 0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2,
-    0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db, 0xaed16a4a, 0xd9d65adc,
-    0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
-    0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693,
-    0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
-    0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d};
+
+// The reflected form of the CRC-32 (IEEE 802.3) polynomial.  Every
+// implementation below works in the reflected domain, where bit 0 of a byte is
+// the highest order coefficient.
+constexpr uint32_t kPolynomial = 0xEDB88320;
+
+// Builds the lookup tables for slicing-by-8.  kTables[0] is the classic
+// byte-at-a-time table; kTables[n][b] is the CRC of byte b followed by n zero
+// bytes, which is what lets 8 input bytes be folded in with 8 independent
+// lookups instead of 8 lookups that each wait on the last.
+constexpr std::array<std::array<uint32_t, 256>, 8> MakeTables() {
+  std::array<std::array<uint32_t, 256>, 8> tables{};
+  for (uint32_t byte = 0; byte < 256; ++byte) {
+    uint32_t crc = byte;
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ ((crc & 1) ? kPolynomial : 0);
+    }
+    tables[0][byte] = crc;
+  }
+  for (size_t slice = 1; slice < tables.size(); ++slice) {
+    for (uint32_t byte = 0; byte < 256; ++byte) {
+      const uint32_t previous = tables[slice - 1][byte];
+      tables[slice][byte] = (previous >> 8) ^ tables[0][previous & 0xFF];
+    }
+  }
+  return tables;
 }
+
+constexpr std::array<std::array<uint32_t, 256>, 8> kTables = MakeTables();
+
+// The word-at-a-time loads below read the input as little endian.
+static_assert(std::endian::native == std::endian::little);
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define AOS_CRC32_HAS_PCLMUL 1
+
+// Returns x^power mod the CRC polynomial, in the reflected 32 bit form.
+constexpr uint32_t XPowModPolynomial(int power) {
+  // x^0, since the highest order coefficient is bit 0.
+  uint32_t result = 0x80000000;
+  for (int i = 0; i < power; ++i) {
+    result = (result >> 1) ^ ((result & 1) ? kPolynomial : 0);
+  }
+  return result;
+}
+
+// Returns the constant which a 64 bit reflected value can be carry-less
+// multiplied by to move it bits further up the message, modulo the CRC
+// polynomial.  A reflected carry-less multiply produces one more factor of x
+// than the operands hold, hence the "- 1".
+constexpr uint64_t FoldConstant(int bits) {
+  return static_cast<uint64_t>(XPowModPolynomial(bits - 1)) << 32;
+}
+
+// These need to be variables to force them to be computed at compile time.
+// Computing them takes far longer than checksumming a small message does.
+constexpr uint64_t kFoldBy512Low = FoldConstant(512 + 64);
+constexpr uint64_t kFoldBy512High = FoldConstant(512);
+constexpr uint64_t kFoldBy128Low = FoldConstant(128 + 64);
+constexpr uint64_t kFoldBy128High = FoldConstant(128);
+
+// Folds state forwards by the distance baked into constants, and adds data in
+// at the place it landed.  The low half of state is 64 bits earlier in the
+// message than the high half, so it has 64 bits further to go and needs its
+// own constant.
+__attribute__((target("pclmul"))) inline __m128i Fold(__m128i state,
+                                                      __m128i constants,
+                                                      __m128i data) {
+  return _mm_xor_si128(
+      _mm_xor_si128(_mm_clmulepi64_si128(state, constants, 0x00),
+                    _mm_clmulepi64_si128(state, constants, 0x11)),
+      data);
+}
+
+// Reduces data to 16 bytes which have the same CRC that all of data did when
+// started from crc, and returns those bytes in out.  size must be a multiple
+// of 16 and at least 64.
+//
+// This is the folding scheme from Intel's "Fast CRC Computation for Generic
+// Polynomials Using PCLMULQDQ Instruction": 128 bits of message are congruent
+// to themselves multiplied by x^n and placed n bits later, so 4 lanes of state
+// leapfrog down the buffer 64 bytes at a time without any dependency between
+// them.
+__attribute__((target("pclmul"))) void FoldTo16Bytes(const uint8_t *data,
+                                                     size_t size, uint32_t crc,
+                                                     uint8_t *out) {
+  const auto load = [](const uint8_t *pointer) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(pointer));
+  };
+
+  // Starting from crc is the same as starting from 0 with crc xored into the
+  // first 4 bytes.
+  __m128i lane0 = _mm_xor_si128(load(data), _mm_cvtsi32_si128(crc));
+  __m128i lane1 = load(data + 16);
+  __m128i lane2 = load(data + 32);
+  __m128i lane3 = load(data + 48);
+  data += 64;
+  size -= 64;
+
+  const __m128i fold_by_512 = _mm_set_epi64x(kFoldBy512High, kFoldBy512Low);
+  while (size >= 64) {
+    lane0 = Fold(lane0, fold_by_512, load(data));
+    lane1 = Fold(lane1, fold_by_512, load(data + 16));
+    lane2 = Fold(lane2, fold_by_512, load(data + 32));
+    lane3 = Fold(lane3, fold_by_512, load(data + 48));
+    data += 64;
+    size -= 64;
+  }
+
+  // Each lane is 16 bytes in front of the next, so fold them together one at a
+  // time, and then keep going for whatever whole blocks are left.
+  const __m128i fold_by_128 = _mm_set_epi64x(kFoldBy128High, kFoldBy128Low);
+  __m128i state = Fold(lane0, fold_by_128, lane1);
+  state = Fold(state, fold_by_128, lane2);
+  state = Fold(state, fold_by_128, lane3);
+  while (size >= 16) {
+    state = Fold(state, fold_by_128, load(data));
+    data += 16;
+    size -= 16;
+  }
+
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(out), state);
+}
+
+bool HasPclmul() {
+  static const bool result = __builtin_cpu_supports("pclmul");
+  return result;
+}
+#endif  // defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+
+}  // namespace
+
+namespace crc32_internal {
+
+uint32_t AccumulateCrc32Portable(const absl::Span<const uint8_t> data,
+                                 uint32_t crc) {
+  const uint8_t *pointer = data.data();
+  size_t size = data.size();
+  while (size >= 8) {
+    uint32_t low;
+    uint32_t high;
+    memcpy(&low, pointer, sizeof(low));
+    memcpy(&high, pointer + sizeof(low), sizeof(high));
+    low ^= crc;
+    crc = kTables[7][low & 0xFF] ^ kTables[6][(low >> 8) & 0xFF] ^
+          kTables[5][(low >> 16) & 0xFF] ^ kTables[4][low >> 24] ^
+          kTables[3][high & 0xFF] ^ kTables[2][(high >> 8) & 0xFF] ^
+          kTables[1][(high >> 16) & 0xFF] ^ kTables[0][high >> 24];
+    pointer += 8;
+    size -= 8;
+  }
+  while (size > 0) {
+    crc = kTables[0][(crc ^ *pointer) & 0xFF] ^ (crc >> 8);
+    ++pointer;
+    --size;
+  }
+  return crc;
+}
+
+}  // namespace crc32_internal
 
 uint32_t ComputeCrc32(const absl::Span<const uint8_t> data) {
   return AccumulateCrc32(data, std::nullopt);
 }
 
-uint32_t AccumulateCrc32(const absl::Span<const uint8_t> data,
+uint32_t AccumulateCrc32(absl::Span<const uint8_t> data,
                          std::optional<uint32_t> current_checksum) {
   uint32_t crc =
       current_checksum.has_value() ? current_checksum.value() : 0xFF'FF'FF'FF;
-  for (const uint8_t n : data) {
-    crc = kCrc32Table[(crc ^ n) & 0xFF] ^ (crc >> 8);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+  // ARMv8's CRC32 instructions use this polynomial, so there is nothing to
+  // fall back from.
+  const uint8_t *pointer = data.data();
+  size_t size = data.size();
+  while (size >= 8) {
+    uint64_t word;
+    memcpy(&word, pointer, sizeof(word));
+    crc = __crc32d(crc, word);
+    pointer += 8;
+    size -= 8;
+  }
+  while (size > 0) {
+    crc = __crc32b(crc, *pointer);
+    ++pointer;
+    --size;
   }
   return crc;
+#else
+#if defined(AOS_CRC32_HAS_PCLMUL)
+  if (data.size() >= 64 && HasPclmul()) {
+    const size_t folded_size = data.size() & ~static_cast<size_t>(15);
+    std::array<uint8_t, 16> folded;
+    FoldTo16Bytes(data.data(), folded_size, crc, folded.data());
+    // The folded bytes stand in for everything up to folded_size, so finish
+    // them and the tail off the ordinary way.
+    crc = crc32_internal::AccumulateCrc32Portable(folded, 0);
+    data = data.subspan(folded_size);
+  }
+#endif
+  return crc32_internal::AccumulateCrc32Portable(data, crc);
+#endif
 }
 
 }  // namespace aos

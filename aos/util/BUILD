@@ -565,6 +565,16 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "crc32_test",
+    srcs = ["crc32_test.cc"],
+    deps = [
+        ":crc32",
+        "//aos/testing:googletest",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 py_library(
     name = "python_init",
     srcs = ["__init__.py"],
