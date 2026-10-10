@@ -1,7 +1,9 @@
 #ifndef AOS_EVENTS_LOGGING_LOGFILE_UTILS_H_
 #define AOS_EVENTS_LOGGING_LOGFILE_UTILS_H_
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -264,6 +266,7 @@ std::optional<SizePrefixedFlatbufferVector<LogFileHeader>> ReadHeader(
 std::optional<SizePrefixedFlatbufferVector<MessageHeader>> ReadNthMessage(
     std::string_view filename, size_t n);
 
+class MessageArena;
 class UnpackedMessageHeader;
 
 // Class which handles reading the header and messages from the log file.  This
@@ -355,6 +358,9 @@ class MessageReader {
 
   bool crash_on_corrupt_message_flag_ = true;
   bool ignore_corrupt_messages_flag_ = false;
+
+  // The memory which the next message gets put in, if it fits.
+  std::shared_ptr<MessageArena> arena_;
 };
 
 // A class to seamlessly read messages from a list of part files.
@@ -438,6 +444,45 @@ class PartsMessageReader {
   std::vector<std::optional<size_t>> boot_counts_;
 
   const std::chrono::nanoseconds max_out_of_order_duration_;
+};
+
+// A block of memory which the messages read from a log file are put in one
+// after another, so that a message does not cost an allocation when it is read
+// and another to free it once it has been used.
+//
+// The block is freed when the last message in it goes away.  That means
+// holding on to one message holds on to everything which was read alongside
+// it, which is why the blocks are small, and why a big message gets memory of
+// its own instead.
+class MessageArena {
+ public:
+  // How much memory there is in one of these.
+  static constexpr size_t kSize = 64 * 1024;
+  // Anything bigger than this should be allocated on its own.
+  static constexpr size_t kMaxAllocationSize = kSize / 4;
+
+  // Leaves the memory uninitialized, since whoever allocates it writes it.
+  MessageArena() {}
+  MessageArena(const MessageArena &) = delete;
+  MessageArena &operator=(const MessageArena &) = delete;
+
+  // Returns size bytes which are aligned for anything, or nullptr if there are
+  // not that many left.
+  void *Allocate(size_t size) {
+    if (size > kSize - used_) {
+      return nullptr;
+    }
+    void *const result = data_ + used_;
+    // Round up so that whatever comes next starts out aligned too.
+    constexpr size_t kAlignment = alignof(std::max_align_t);
+    used_ =
+        std::min(kSize, (used_ + size + kAlignment - 1) & ~(kAlignment - 1));
+    return result;
+  }
+
+ private:
+  size_t used_ = 0;
+  alignas(std::max_align_t) uint8_t data_[kSize];
 };
 
 // Stores MessageHeader as a flat header and inline, aligned block of data.
@@ -548,8 +593,10 @@ class UnpackedMessageHeader {
   // Accessing via remote_queue_index() is recommended.
   uint32_t maybe_remote_queue_index;
 
+  // Unpacks message.  The result goes in *arena if it is small enough, which
+  // replaces *arena with a new one whenever it runs out of room.
   static std::shared_ptr<UnpackedMessageHeader> MakeMessage(
-      const MessageHeader &message);
+      const MessageHeader &message, std::shared_ptr<MessageArena> *arena);
 
   char actual_data[];
 

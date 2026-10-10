@@ -1037,6 +1037,7 @@ cc_test(
         ":logfile_utils",
         ":logger_fbs",
         ":test_message_fbs",
+        "//aos/ipc_lib:data_alignment",
         "//aos/testing:googletest",
         "//aos/testing:path",
         "//aos/testing:random_seed",

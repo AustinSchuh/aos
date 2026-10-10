@@ -8,6 +8,7 @@
 #include <climits>
 #include <filesystem>
 #include <sstream>
+#include <type_traits>
 
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
@@ -1298,7 +1299,7 @@ std::shared_ptr<UnpackedMessageHeader> MessageReader::ReadMessage() {
     total_verified_before_ += msg_data.size();
   }
 
-  auto result = UnpackedMessageHeader::MakeMessage(msg.message());
+  auto result = UnpackedMessageHeader::MakeMessage(msg.message(), &arena_);
 
   const monotonic_clock::time_point timestamp = result->monotonic_sent_time;
 
@@ -1317,8 +1318,11 @@ std::shared_ptr<UnpackedMessageHeader> MessageReader::ReadMessage() {
   return result;
 }
 
+// Nothing runs when a message in a MessageArena goes away.
+static_assert(std::is_trivially_destructible_v<UnpackedMessageHeader>);
+
 std::shared_ptr<UnpackedMessageHeader> UnpackedMessageHeader::MakeMessage(
-    const MessageHeader &message) {
+    const MessageHeader &message, std::shared_ptr<MessageArena> *arena) {
   ABSL_CHECK(message.has_channel_index());
   ABSL_CHECK(message.has_monotonic_sent_time());
 
@@ -1342,46 +1346,59 @@ std::shared_ptr<UnpackedMessageHeader> UnpackedMessageHeader::MakeMessage(
   }
 
   const size_t data_size = message.has_data() ? message.data()->size() : 0;
+  // The data goes after the header, wherever it has to start for its end to
+  // be aligned.  Messages with no data (timestamps) are common, and do not
+  // need the room to do that.
+  const size_t size =
+      sizeof(UnpackedMessageHeader) +
+      (data_size > 0 ? data_size + kChannelDataAlignment - 1 : 0);
+
+  void *memory = nullptr;
+  const bool use_arena = size <= MessageArena::kMaxAllocationSize;
+  if (use_arena) {
+    if (*arena != nullptr) {
+      memory = (*arena)->Allocate(size);
+    }
+    if (memory == nullptr) {
+      *arena = std::make_shared<MessageArena>();
+      memory = (*arena)->Allocate(size);
+    }
+  } else {
+    memory = malloc(size);
+  }
+  ABSL_CHECK(memory != nullptr);
+
+  UnpackedMessageHeader *const unpacked_message =
+      reinterpret_cast<UnpackedMessageHeader *>(memory);
+  const absl::Span<uint8_t> span =
+      data_size > 0 ? absl::Span<uint8_t>(
+                          reinterpret_cast<uint8_t *>(RoundChannelData(
+                              &unpacked_message->actual_data[0], data_size)),
+                          data_size)
+                    : absl::Span<uint8_t>();
+  new (unpacked_message) UnpackedMessageHeader(
+      private_constructor(), message.channel_index(),
+      monotonic_clock::time_point(
+          chrono::nanoseconds(message.monotonic_sent_time())),
+      realtime_clock::time_point(
+          chrono::nanoseconds(message.realtime_sent_time())),
+      message.queue_index(), monotonic_remote_time, realtime_remote_time,
+      monotonic_remote_transmit_time, remote_queue_index,
+      monotonic_clock::time_point(
+          std::chrono::nanoseconds(message.monotonic_timestamp_time())),
+      message.has_monotonic_timestamp_time(), span);
+
   if (data_size > 0) {
-    UnpackedMessageHeader *const unpacked_message =
-        reinterpret_cast<UnpackedMessageHeader *>(
-            malloc(sizeof(UnpackedMessageHeader) + data_size +
-                   kChannelDataAlignment - 1));
-    const absl::Span<uint8_t> span =
-        absl::Span<uint8_t>(reinterpret_cast<uint8_t *>(RoundChannelData(
-                                &unpacked_message->actual_data[0], data_size)),
-                            data_size);
-    new (unpacked_message) UnpackedMessageHeader(
-        private_constructor(), message.channel_index(),
-        monotonic_clock::time_point(
-            chrono::nanoseconds(message.monotonic_sent_time())),
-        realtime_clock::time_point(
-            chrono::nanoseconds(message.realtime_sent_time())),
-        message.queue_index(), monotonic_remote_time, realtime_remote_time,
-        monotonic_remote_transmit_time, remote_queue_index,
-        monotonic_clock::time_point(
-            std::chrono::nanoseconds(message.monotonic_timestamp_time())),
-        message.has_monotonic_timestamp_time(), span);
-
     memcpy(span.data(), message.data()->data(), data_size);
+  }
 
+  if (use_arena) {
+    // The arena owns the memory, so the message shares its reference count
+    // rather than getting one of its own.
+    return std::shared_ptr<UnpackedMessageHeader>(*arena, unpacked_message);
+  } else {
     return std::shared_ptr<UnpackedMessageHeader>(unpacked_message,
                                                   &DestroyAndFree);
-  } else {
-    // We see a lot of messages with no data (timestamps), so using
-    // std::make_shared to allocate the shared_ptr control block together with
-    // the header saves a lot of allocations and consequently a lot of memory.
-    return std::make_shared<UnpackedMessageHeader>(
-        private_constructor(), message.channel_index(),
-        monotonic_clock::time_point(
-            chrono::nanoseconds(message.monotonic_sent_time())),
-        realtime_clock::time_point(
-            chrono::nanoseconds(message.realtime_sent_time())),
-        message.queue_index(), monotonic_remote_time, realtime_remote_time,
-        monotonic_remote_transmit_time, remote_queue_index,
-        monotonic_clock::time_point(
-            std::chrono::nanoseconds(message.monotonic_timestamp_time())),
-        message.has_monotonic_timestamp_time(), absl::Span<uint8_t>());
   }
 }
 

@@ -1,9 +1,12 @@
 #include "aos/events/logging/logfile_utils.h"
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/flags/flag.h"
 #include "absl/flags/reflection.h"
@@ -17,6 +20,7 @@
 #include "aos/events/logging/test_message_generated.h"
 #include "aos/flatbuffer_merge.h"
 #include "aos/flatbuffers.h"
+#include "aos/ipc_lib/data_alignment.h"
 #include "aos/json_to_flatbuffer.h"
 #include "aos/macros.h"
 #include "aos/testing/path.h"
@@ -127,6 +131,161 @@ TEST(MessageReaderTest, ReadWrite) {
   EXPECT_EQ(reader.newest_timestamp(),
             monotonic_clock::time_point(chrono::nanoseconds(2)));
   EXPECT_FALSE(reader.ReadMessage());
+}
+
+// Tests that a MessageArena hands out aligned memory which does not overlap
+// until there is none left.
+TEST(MessageArenaTest, Allocate) {
+  MessageArena arena;
+  std::vector<std::pair<uint8_t *, size_t>> allocations;
+  size_t total = 0;
+  for (size_t size = 1;; size = size * 3 + 1) {
+    if (size > MessageArena::kMaxAllocationSize) {
+      size = 1;
+    }
+    uint8_t *const allocation = static_cast<uint8_t *>(arena.Allocate(size));
+    if (allocation == nullptr) {
+      break;
+    }
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(allocation) % alignof(std::max_align_t),
+        0u);
+    if (!allocations.empty()) {
+      EXPECT_GE(allocation,
+                allocations.back().first + allocations.back().second);
+    }
+    memset(allocation, allocations.size(), size);
+    allocations.emplace_back(allocation, size);
+    total += size;
+  }
+  // It should have been close to full before it gave up.
+  EXPECT_GT(total, MessageArena::kSize - MessageArena::kMaxAllocationSize);
+  EXPECT_LE(total, MessageArena::kSize);
+
+  for (size_t i = 0; i < allocations.size(); ++i) {
+    for (size_t j = 0; j < allocations[i].second; ++j) {
+      ASSERT_EQ(allocations[i].first[j], static_cast<uint8_t>(i));
+    }
+  }
+
+  // Being full is not the same as being unable to fit one thing.
+  EXPECT_EQ(arena.Allocate(MessageArena::kSize), nullptr);
+}
+
+// A log file full of messages which can each be checked from nothing but
+// their position in the file.
+class PatternedLog {
+ public:
+  // Enough messages to need a lot of trips between a thread reading the file
+  // and one using the messages, and to hold more than the reading thread is
+  // allowed to get ahead by.
+  static constexpr size_t kMessages = 2000;
+
+  // Returns how much data message i has.  This covers messages with no data,
+  // ones which share a MessageArena, ones which are too big to, and ones which
+  // are a good part of a batch all by themselves.
+  static size_t DataSize(size_t i) {
+    if (i % 10 == 0) {
+      return 0;
+    } else if (i % 97 == 0) {
+      return 100000;
+    } else if (i % 13 == 0) {
+      return MessageArena::kMaxAllocationSize + i;
+    } else {
+      return (i * 37) % 3000;
+    }
+  }
+
+  static uint8_t DataByte(size_t i, size_t offset) {
+    return static_cast<uint8_t>(i * 31 + offset * 7);
+  }
+
+  static flatbuffers::DetachedBuffer MakeMessage(size_t i) {
+    flatbuffers::FlatBufferBuilder fbb;
+    fbb.ForceDefaults(true);
+    flatbuffers::Offset<flatbuffers::Vector<uint8_t>> data_offset;
+    const size_t data_size = DataSize(i);
+    if (data_size > 0) {
+      std::vector<uint8_t> data(data_size);
+      for (size_t offset = 0; offset < data_size; ++offset) {
+        data[offset] = DataByte(i, offset);
+      }
+      data_offset = fbb.CreateVector(data);
+    }
+    MessageHeader::Builder builder(fbb);
+    builder.add_channel_index(i % 5);
+    builder.add_monotonic_sent_time(i);
+    builder.add_queue_index(i);
+    if (data_size > 0) {
+      builder.add_data(data_offset);
+    }
+    fbb.FinishSizePrefixed(builder.Finish());
+    return fbb.Release();
+  }
+
+  // Writes kMessages messages to logfile, with whatever is in garbage after
+  // the first garbage_after of them.
+  static void Write(const std::string &logfile,
+                    size_t garbage_after = kMessages,
+                    absl::Span<const uint8_t> garbage = {}) {
+    unlink(logfile.c_str());
+    const aos::SizePrefixedFlatbufferDetachedBuffer<LogFileHeader> header =
+        JsonToSizedFlatbuffer<LogFileHeader>(
+            R"({ "max_out_of_order_duration": 100000000 })");
+    TestDetachedBufferWriter writer(logfile);
+    writer.QueueSpan(header.span());
+    for (size_t i = 0; i < kMessages; ++i) {
+      if (i == garbage_after) {
+        writer.QueueSpan(garbage);
+      }
+      writer.WriteSizedFlatbuffer(MakeMessage(i));
+    }
+  }
+
+  // Checks that message is message i.
+  static void Check(size_t i, const UnpackedMessageHeader &message) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(message.channel_index, i % 5);
+    EXPECT_EQ(message.monotonic_sent_time,
+              monotonic_clock::time_point(chrono::nanoseconds(i)));
+    EXPECT_EQ(message.queue_index, i);
+    ASSERT_EQ(message.span.size(), DataSize(i));
+    if (!message.span.empty()) {
+      CheckChannelDataAlignment(message.span.data(), message.span.size());
+    }
+    for (size_t offset = 0; offset < message.span.size(); ++offset) {
+      ASSERT_EQ(message.span[offset], DataByte(i, offset)) << ": at " << offset;
+    }
+  }
+};
+
+// Tests that messages are still good after the reader which read them, and
+// the messages which they shared memory with, have gone away.
+TEST(MessageReaderTest, MessagesOutliveTheReader) {
+  const std::string logfile = aos::testing::TestTmpDir() + "/patterned.bfbs";
+  PatternedLog::Write(logfile);
+
+  std::vector<std::shared_ptr<UnpackedMessageHeader>> messages;
+  {
+    MessageReader reader(logfile);
+    for (size_t i = 0; i < PatternedLog::kMessages; ++i) {
+      messages.emplace_back(reader.ReadMessage());
+      ASSERT_TRUE(messages.back());
+      PatternedLog::Check(i, *messages.back());
+    }
+    EXPECT_FALSE(reader.ReadMessage());
+  }
+
+  // Let go of all but every 7th one, which leaves most of them as the only
+  // thing left in the block of memory they were read into.
+  for (size_t i = 0; i < PatternedLog::kMessages; ++i) {
+    if (i % 7 != 0) {
+      messages[i].reset();
+    }
+  }
+  for (size_t i = 0; i < PatternedLog::kMessages; i += 7) {
+    PatternedLog::Check(i, *messages[i]);
+  }
 }
 
 // Tests that we explode when messages are too far out of order.
