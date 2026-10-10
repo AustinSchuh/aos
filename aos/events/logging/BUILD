@@ -229,6 +229,7 @@ cc_library(
         "//aos:flatbuffer_merge",
         "//aos:flatbuffers",
         "//aos:macros",
+        "//aos:realtime",
         "//aos:sha256",
         "//aos:uuid",
         "//aos/containers:error_list",
@@ -240,6 +241,7 @@ cc_library(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
     ] + select({
         # s3_fetcher is x86_64-only (it depends on the AWS SDK), so gate these on

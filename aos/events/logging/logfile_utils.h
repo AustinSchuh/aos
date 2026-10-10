@@ -3,13 +3,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -30,6 +33,7 @@
 #include "aos/events/logging/logger_generated.h"
 #include "aos/flatbuffers.h"
 #include "aos/network/remote_message_generated.h"
+#include "aos/realtime.h"
 #include "aos/util/status.h"
 
 namespace aos::logger {
@@ -308,6 +312,22 @@ class MessageReader {
   // Returns an error if we encountered an issue in reading the log.
   std::shared_ptr<UnpackedMessageHeader> ReadMessage();
 
+  // Does what ReadMessage() does, except that where ReadMessage() would crash
+  // on a corrupted message, this returns nullptr and makes corruption_error()
+  // return what the crash would have said.  Nothing more is read after that.
+  //
+  // This is for somebody who reads ahead, so that they can hold off on the
+  // crash until everything in front of the corrupted message has been used.
+  std::shared_ptr<UnpackedMessageHeader> ReadMessageOrCorruption();
+
+  // Returns why ReadMessageOrCorruption() stopped early, or an empty string if
+  // it has not.
+  const std::string &corruption_error() const { return corruption_error_; }
+
+  // Makes the next message start a new block of memory, rather than going
+  // after the last one read.  See MessageArena.
+  void ReleaseArena() { arena_.reset(); }
+
   // The time at which we need to read another chunk from the logfile.
   monotonic_clock::time_point queue_data_time() const {
     return newest_timestamp() - max_out_of_order_duration();
@@ -359,8 +379,110 @@ class MessageReader {
   bool crash_on_corrupt_message_flag_ = true;
   bool ignore_corrupt_messages_flag_ = false;
 
+  // What ReadMessage() should crash with, once a corrupted message has been
+  // found and we are meant to crash on those.
+  std::string corruption_error_;
+
   // The memory which the next message gets put in, if it fits.
   std::shared_ptr<MessageArena> arena_;
+};
+
+// Reads the messages from a log file on another thread, staying a bounded
+// distance in front of whoever is asking for them.  Reading, decompressing,
+// verifying and copying a message is most of the work of getting it out of a
+// file, and none of that has to wait for the message before it to be used.
+//
+// The thread is started by the first call to ReadMessage(), so one of these
+// which only ever gets asked for its header costs nothing extra.  With
+// --noread_ahead_threads there is no thread, and ReadMessage() does the
+// reading itself.
+class ReadAheadMessageReader {
+ public:
+  explicit ReadAheadMessageReader(SpanReader span_reader);
+  ReadAheadMessageReader(ReadAheadMessageReader &&) = default;
+  ReadAheadMessageReader &operator=(ReadAheadMessageReader &&other);
+  ~ReadAheadMessageReader();
+
+  std::string_view filename() const { return state_->reader.filename(); }
+
+  // Returns the header from the log file.
+  const LogFileHeader *log_file_header() const {
+    return state_->reader.log_file_header();
+  }
+
+  // Returns the newest timestamp on any message which ReadMessage() has
+  // returned.  The thread will have read further than this.
+  monotonic_clock::time_point newest_timestamp() const {
+    return newest_timestamp_;
+  }
+
+  // Returns the next message if there is one (nullptr if we reached the end of
+  // the log).  This crashes on anything MessageReader::ReadMessage() would
+  // have crashed on, and does that at the same message.
+  std::shared_ptr<UnpackedMessageHeader> ReadMessage();
+
+ private:
+  // The thread hands messages over once it has this many bytes of them, so
+  // that the lock is taken once for a lot of messages rather than once each.
+  static constexpr size_t kBatchBytes = 128 * 1024;
+  // The thread stops reading while this much is waiting to be picked up.  One
+  // batch is always allowed, however big it is.
+  static constexpr size_t kMaxQueuedBytes = 512 * 1024;
+
+  using Batch = std::vector<std::shared_ptr<UnpackedMessageHeader>>;
+
+  // Everything the thread touches.  This lives on the heap so that it stays
+  // put when the ReadAheadMessageReader moves.
+  struct State {
+    explicit State(SpanReader span_reader) : reader(std::move(span_reader)) {}
+
+    // Only the thread reads messages from this once it has started.
+    MessageReader reader;
+
+    // The process the thread was started in.  A fork()ed child gets a copy of
+    // everything here except for the thread.
+    pid_t thread_process = 0;
+    std::thread thread;
+
+    // Protects everything below.
+    std::mutex mutex;
+    // Signaled when there is room for the thread to read more, and when it
+    // should exit.
+    std::condition_variable wake_thread;
+    // Signaled when the thread has queued a batch or has finished.
+    std::condition_variable wake_consumer;
+
+    // Batches which are waiting to be picked up, oldest first, and how many
+    // bytes of messages are in them.
+    std::deque<Batch> queue;
+    size_t queued_bytes = 0;
+    // True once the thread has queued everything it is going to.
+    bool finished = false;
+    // True once the thread should give up on reading the rest.
+    bool shutdown = false;
+  };
+
+  static void Run(State *state);
+  // Stops the thread if it is running.
+  void Stop();
+  // Replaces batches_ with everything the thread has read since the last
+  // call, starting the thread if it is not running yet, and waiting for it to
+  // have something.  Returns false if there is nothing more to read.
+  bool WaitForBatches();
+
+  std::unique_ptr<State> state_;
+  // False if the messages should be read by whoever calls ReadMessage()
+  // instead.
+  bool use_thread_;
+
+  // The batches which have been picked up from the thread, oldest first, and
+  // the next message to return from the first of them.
+  std::deque<Batch> batches_;
+  size_t next_message_ = 0;
+  // True once the thread has handed everything over and has been joined.
+  bool thread_finished_ = false;
+
+  monotonic_clock::time_point newest_timestamp_ = monotonic_clock::min_time;
 };
 
 // A class to seamlessly read messages from a list of part files.
@@ -420,14 +542,14 @@ class PartsMessageReader {
   size_t next_part_index_ = 1u;
   bool done_ = false;
 
-  MessageReader message_reader_;
+  ReadAheadMessageReader message_reader_;
   // We instantiate the next one early, to allow implementations to prefetch.
   // TODO(Brian): To get optimal performance when downloading, this needs more
   // communication with the implementation to prioritize the next part and add
   // more parallelism when it helps. Maybe some kind of a queue of parts in
   // order, and the implementation gets to pull however many make sense off the
   // front?
-  std::optional<MessageReader> next_message_reader_;
+  std::optional<ReadAheadMessageReader> next_message_reader_;
 
   // True after we have seen a message after the start of the log.  The
   // guarentees on logging essentially are that all data from before the

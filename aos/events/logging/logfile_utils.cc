@@ -15,6 +15,7 @@
 #include "absl/log/absl_log.h"
 #include "absl/log/absl_vlog_is_on.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/str_cat.h"
 #include "flatbuffers/flatbuffers.h"
 
 #include "aos/configuration.h"
@@ -54,6 +55,11 @@ ABSL_FLAG(bool, ignore_corrupt_messages, false,
           "When true, and crash_on_corrupt_message is false, then any "
           "corrupt message found by MessageReader be silently ignored, "
           "providing access to all uncorrupted messages in a logfile.");
+
+ABSL_FLAG(bool, read_ahead_threads, true,
+          "If true, read each log file in a thread of its own which stays a "
+          "little ahead of where the log is being used.  If false, read "
+          "everything in the thread which uses it.");
 
 ABSL_DECLARE_FLAG(bool, quiet_sorting);
 
@@ -1219,6 +1225,17 @@ MessageReader::MessageReader(SpanReader span_reader)
 }
 
 std::shared_ptr<UnpackedMessageHeader> MessageReader::ReadMessage() {
+  std::shared_ptr<UnpackedMessageHeader> result = ReadMessageOrCorruption();
+  ABSL_CHECK(corruption_error_.empty()) << ": " << corruption_error_;
+  return result;
+}
+
+std::shared_ptr<UnpackedMessageHeader>
+MessageReader::ReadMessageOrCorruption() {
+  if (!corruption_error_.empty()) {
+    return nullptr;
+  }
+
   absl::Span<const uint8_t> msg_data = span_reader_.ReadMessage();
   if (msg_data.empty()) {
     if (is_corrupted()) {
@@ -1240,13 +1257,14 @@ std::shared_ptr<UnpackedMessageHeader> MessageReader::ReadMessage() {
   SizePrefixedFlatbufferSpan<MessageHeader> msg(msg_data);
 
   if (crash_on_corrupt_message_flag_) {
-    ABSL_CHECK(msg.Verify())
-        << "Corrupted message at offset " << total_verified_before_
-        << " found within " << filename()
-        << "; set --nocrash_on_corrupt_message to see summary;"
-        << " also set --ignore_corrupt_messages to process"
-        << " anyway";
-
+    if (!msg.Verify()) {
+      corruption_error_ = absl::StrCat(
+          "Corrupted message at offset ", total_verified_before_,
+          " found within ", filename(),
+          "; set --nocrash_on_corrupt_message to see summary; also set "
+          "--ignore_corrupt_messages to process anyway");
+      return nullptr;
+    }
   } else if (!msg.Verify()) {
     ABSL_LOG(ERROR) << "Corrupted message at offset " << total_verified_before_
                     << " from " << filename();
@@ -1400,6 +1418,162 @@ std::shared_ptr<UnpackedMessageHeader> UnpackedMessageHeader::MakeMessage(
     return std::shared_ptr<UnpackedMessageHeader>(unpacked_message,
                                                   &DestroyAndFree);
   }
+}
+
+ReadAheadMessageReader::ReadAheadMessageReader(SpanReader span_reader)
+    : state_(std::make_unique<State>(std::move(span_reader))),
+      use_thread_(absl::GetFlag(FLAGS_read_ahead_threads)) {}
+
+ReadAheadMessageReader &ReadAheadMessageReader::operator=(
+    ReadAheadMessageReader &&other) {
+  Stop();
+  state_ = std::move(other.state_);
+  use_thread_ = other.use_thread_;
+  batches_ = std::move(other.batches_);
+  next_message_ = other.next_message_;
+  thread_finished_ = other.thread_finished_;
+  newest_timestamp_ = other.newest_timestamp_;
+  return *this;
+}
+
+ReadAheadMessageReader::~ReadAheadMessageReader() { Stop(); }
+
+void ReadAheadMessageReader::Stop() {
+  if (!state_ || !state_->thread.joinable()) {
+    return;
+  }
+  if (state_->thread_process != GetProcessId()) {
+    // We are a fork()ed child, which has no thread to stop.  The std::thread
+    // does not know that, and the only safe thing to do with one which refers
+    // to a thread that is not there is to never destroy it.
+    (void)state_.release();
+    return;
+  }
+  {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    state_->shutdown = true;
+  }
+  state_->wake_thread.notify_one();
+  state_->thread.join();
+}
+
+void ReadAheadMessageReader::Run(State *state) {
+#ifdef __linux__
+  SetCurrentThreadName("log_read_ahead");
+#endif
+  while (true) {
+    Batch batch;
+    size_t batch_bytes = 0;
+    bool finished = false;
+    while (batch_bytes < kBatchBytes) {
+      std::shared_ptr<UnpackedMessageHeader> message =
+          state->reader.ReadMessageOrCorruption();
+      if (!message) {
+        finished = true;
+        break;
+      }
+      batch_bytes += sizeof(UnpackedMessageHeader) + message->span.size();
+      batch.emplace_back(std::move(message));
+    }
+    // This batch gets used before the next one is.  Start the next one in a
+    // new arena, or we would be adding references to the arena this one ends
+    // in while whoever uses it drops them, and the two of us would spend our
+    // time passing its reference count back and forth.
+    state->reader.ReleaseArena();
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!batch.empty()) {
+      state->queued_bytes += batch_bytes;
+      state->queue.emplace_back(std::move(batch));
+    }
+    state->finished = finished;
+    state->wake_consumer.notify_one();
+    if (finished) {
+      return;
+    }
+    state->wake_thread.wait(lock, [state]() {
+      return state->shutdown || state->queued_bytes < kMaxQueuedBytes;
+    });
+    if (state->shutdown) {
+      return;
+    }
+  }
+}
+
+bool ReadAheadMessageReader::WaitForBatches() {
+  batches_.clear();
+  next_message_ = 0;
+
+  if (!thread_finished_) {
+    State *const state = state_.get();
+    if (!state->thread.joinable()) {
+      state->thread_process = GetProcessId();
+      state->thread = std::thread([state]() { Run(state); });
+    } else {
+      ABSL_CHECK_EQ(state->thread_process, GetProcessId())
+          << ": This process was forked while another thread was part way "
+             "through reading "
+          << filename()
+          << ", and fork() does not copy threads.  If this is a death test, "
+             "either read the log inside of the statement which is expected "
+             "to die, or use --gtest_death_test_style=threadsafe.";
+    }
+
+    bool finished;
+    {
+      std::unique_lock<std::mutex> lock(state->mutex);
+      state->wake_consumer.wait(
+          lock, [state]() { return state->finished || !state->queue.empty(); });
+      // Take everything, not just the first batch.  That is fewer trips
+      // through here, and it means that we are done with the thread as soon
+      // as it is done.
+      batches_.swap(state->queue);
+      state->queued_bytes = 0;
+      finished = state->finished;
+    }
+    if (finished) {
+      // Setting finished was the last thing the thread did.
+      state->thread.join();
+      thread_finished_ = true;
+    } else {
+      state->wake_thread.notify_one();
+    }
+
+    if (!batches_.empty()) {
+      return true;
+    }
+  }
+
+  // Everything which the thread managed to read has been used, which makes
+  // this the point where the first corrupted message would have been read
+  // without it.
+  ABSL_CHECK(state_->reader.corruption_error().empty())
+      << ": " << state_->reader.corruption_error();
+  return false;
+}
+
+std::shared_ptr<UnpackedMessageHeader> ReadAheadMessageReader::ReadMessage() {
+  std::shared_ptr<UnpackedMessageHeader> result;
+  if (use_thread_) {
+    while (batches_.empty() || next_message_ == batches_.front().size()) {
+      if (batches_.size() > 1) {
+        batches_.pop_front();
+        next_message_ = 0;
+      } else if (!WaitForBatches()) {
+        return nullptr;
+      }
+    }
+    result = std::move(batches_.front()[next_message_]);
+    ++next_message_;
+  } else {
+    result = state_->reader.ReadMessage();
+    if (!result) {
+      return nullptr;
+    }
+  }
+
+  newest_timestamp_ = std::max(newest_timestamp_, result->monotonic_sent_time);
+  return result;
 }
 
 SpanReader PartsMessageReader::MakeSpanReader(

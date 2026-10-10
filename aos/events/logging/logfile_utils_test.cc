@@ -29,6 +29,8 @@
 #include "aos/util/file.h"
 
 ABSL_DECLARE_FLAG(double, max_network_delay);
+ABSL_DECLARE_FLAG(bool, crash_on_corrupt_message);
+ABSL_DECLARE_FLAG(bool, read_ahead_threads);
 
 namespace aos::logger::testing {
 namespace chrono = std::chrono;
@@ -287,6 +289,192 @@ TEST(MessageReaderTest, MessagesOutliveTheReader) {
     PatternedLog::Check(i, *messages[i]);
   }
 }
+
+// Reads a PatternedLog with a ReadAheadMessageReader.  The parameter is
+// whether to read the file in another thread.
+class ReadAheadMessageReaderTest : public ::testing::TestWithParam<bool> {
+ public:
+  static constexpr size_t kMessages = PatternedLog::kMessages;
+
+  ReadAheadMessageReaderTest()
+      : logfile_(aos::testing::TestTmpDir() + "/read_ahead.bfbs") {
+    absl::SetFlag(&FLAGS_read_ahead_threads, GetParam());
+  }
+
+  // Reads message i, and checks that it is the right one.
+  static std::shared_ptr<UnpackedMessageHeader> ReadAndCheck(
+      ReadAheadMessageReader *reader, size_t i) {
+    std::shared_ptr<UnpackedMessageHeader> message = reader->ReadMessage();
+    EXPECT_TRUE(message) << ": no message " << i;
+    if (message) {
+      PatternedLog::Check(i, *message);
+    }
+    // However far ahead the file has been read, this only moves when a
+    // message is handed over.
+    EXPECT_EQ(reader->newest_timestamp(),
+              monotonic_clock::time_point(chrono::nanoseconds(i)));
+    return message;
+  }
+
+  absl::FlagSaver flag_saver_;
+  const std::string logfile_;
+};
+
+using ReadAheadMessageReaderDeathTest = ReadAheadMessageReaderTest;
+
+// Tests that every message comes out, in order, and that the end of the file
+// is still the end of the file when asked again.
+TEST_P(ReadAheadMessageReaderTest, ReadsEverythingInOrder) {
+  PatternedLog::Write(logfile_);
+  ReadAheadMessageReader reader{SpanReader(logfile_)};
+  EXPECT_EQ(reader.filename(), logfile_);
+  EXPECT_EQ(reader.log_file_header()->max_out_of_order_duration(), 100000000);
+  EXPECT_EQ(reader.newest_timestamp(), monotonic_clock::min_time);
+
+  for (size_t i = 0; i < kMessages; ++i) {
+    ASSERT_TRUE(ReadAndCheck(&reader, i));
+  }
+  EXPECT_FALSE(reader.ReadMessage());
+  EXPECT_FALSE(reader.ReadMessage());
+}
+
+// Tests that messages are still good after the reader which read them, and
+// the messages which were read alongside them, have gone away.
+TEST_P(ReadAheadMessageReaderTest, MessagesOutliveTheReader) {
+  PatternedLog::Write(logfile_);
+  std::vector<std::shared_ptr<UnpackedMessageHeader>> messages;
+  {
+    ReadAheadMessageReader reader{SpanReader(logfile_)};
+    for (size_t i = 0; i < kMessages; ++i) {
+      messages.emplace_back(ReadAndCheck(&reader, i));
+      ASSERT_TRUE(messages.back());
+    }
+    EXPECT_FALSE(reader.ReadMessage());
+  }
+
+  // Let go of all but every 7th one, which leaves most of them as the only
+  // thing left in the block of memory they were read into.
+  for (size_t i = 0; i < kMessages; ++i) {
+    if (i % 7 != 0) {
+      messages[i].reset();
+    }
+  }
+  for (size_t i = 0; i < kMessages; i += 7) {
+    PatternedLog::Check(i, *messages[i]);
+  }
+}
+
+// Tests that a reader can be destroyed at any point in the file, including
+// while its thread still has most of the file to go.
+TEST_P(ReadAheadMessageReaderTest, DestroyedPartWayThrough) {
+  PatternedLog::Write(logfile_);
+  for (const size_t count : {size_t{0}, size_t{1}, size_t{2}, size_t{500},
+                             kMessages - 1, kMessages}) {
+    SCOPED_TRACE(count);
+    std::vector<std::shared_ptr<UnpackedMessageHeader>> messages;
+    {
+      ReadAheadMessageReader reader{SpanReader(logfile_)};
+      for (size_t i = 0; i < count; ++i) {
+        messages.emplace_back(ReadAndCheck(&reader, i));
+        ASSERT_TRUE(messages.back());
+      }
+    }
+    for (size_t i = 0; i < count; ++i) {
+      PatternedLog::Check(i, *messages[i]);
+    }
+  }
+}
+
+// Tests that moving a reader, which PartsMessageReader does to get to the
+// next file, carries on from where it was, and stops the reader which got
+// replaced.
+TEST_P(ReadAheadMessageReaderTest, Moved) {
+  PatternedLog::Write(logfile_);
+  ReadAheadMessageReader original{SpanReader(logfile_)};
+  size_t i = 0;
+  for (; i < 100; ++i) {
+    ASSERT_TRUE(ReadAndCheck(&original, i));
+  }
+
+  ReadAheadMessageReader constructed(std::move(original));
+  for (; i < 200; ++i) {
+    ASSERT_TRUE(ReadAndCheck(&constructed, i));
+  }
+
+  // Something which is part way through the file itself, to be replaced.
+  ReadAheadMessageReader assigned{SpanReader(logfile_)};
+  for (size_t j = 0; j < 50; ++j) {
+    ASSERT_TRUE(ReadAndCheck(&assigned, j));
+  }
+  assigned = std::move(constructed);
+  for (; i < kMessages; ++i) {
+    ASSERT_TRUE(ReadAndCheck(&assigned, i));
+  }
+  EXPECT_FALSE(assigned.ReadMessage());
+
+  // And then replace one which has finished with one which has not started,
+  // like moving on to the next file does.
+  assigned = ReadAheadMessageReader{SpanReader(logfile_)};
+  for (size_t j = 0; j < kMessages; ++j) {
+    ASSERT_TRUE(ReadAndCheck(&assigned, j));
+  }
+  EXPECT_FALSE(assigned.ReadMessage());
+}
+
+// Tests that a corrupted message is not fatal until it is the next message,
+// however long ago the thread found it.  Somebody looking at why a log is
+// corrupted wants everything in front of the corruption.
+TEST_P(ReadAheadMessageReaderDeathTest, CorruptionWaitsItsTurn) {
+  // Starts out like a proper flatbuffer, and then is not one.
+  const std::vector<uint8_t> garbage{8, 0, 0, 0, 16, 0, 0, 0, 4, 0, 0, 0};
+  // Few enough messages in front of it that the thread finds it straight away.
+  constexpr size_t kGoodMessages = 20;
+  PatternedLog::Write(logfile_, kGoodMessages, garbage);
+
+  ReadAheadMessageReader reader{SpanReader(logfile_)};
+  for (size_t i = 0; i < kGoodMessages; ++i) {
+    ASSERT_TRUE(ReadAndCheck(&reader, i));
+  }
+  EXPECT_DEATH(reader.ReadMessage(), "Corrupted message at offset");
+}
+
+// Tests that a corrupted message ends the file when we have been asked not to
+// crash on one.
+TEST_P(ReadAheadMessageReaderTest, CorruptionEndsTheFile) {
+  const std::vector<uint8_t> garbage{8, 0, 0, 0, 16, 0, 0, 0, 4, 0, 0, 0};
+  constexpr size_t kGoodMessages = 20;
+  PatternedLog::Write(logfile_, kGoodMessages, garbage);
+
+  absl::SetFlag(&FLAGS_crash_on_corrupt_message, false);
+  ReadAheadMessageReader reader{SpanReader(logfile_)};
+  for (size_t i = 0; i < kGoodMessages; ++i) {
+    ASSERT_TRUE(ReadAndCheck(&reader, i));
+  }
+  EXPECT_FALSE(reader.ReadMessage());
+}
+
+// Tests that a process which forks while a thread is still reading says so,
+// instead of waiting forever for messages from a thread it does not have.
+TEST_P(ReadAheadMessageReaderDeathTest, ForkedWhileReading) {
+  if (!GetParam()) {
+    GTEST_SKIP() << "There is no thread to lose.";
+  }
+  PatternedLog::Write(logfile_);
+  ReadAheadMessageReader reader{SpanReader(logfile_)};
+  ASSERT_TRUE(ReadAndCheck(&reader, 0));
+  EXPECT_DEATH(
+      {
+        while (reader.ReadMessage()) {
+        }
+      },
+      "This process was forked while another thread was part way through "
+      "reading");
+}
+
+INSTANTIATE_TEST_SUITE_P(Threaded, ReadAheadMessageReaderTest,
+                         ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(Threaded, ReadAheadMessageReaderDeathTest,
+                         ::testing::Bool());
 
 // Tests that we explode when messages are too far out of order.
 TEST(PartsMessageReaderDeathTest, TooFarOutOfOrder) {
