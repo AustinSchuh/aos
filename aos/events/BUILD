@@ -768,6 +768,7 @@ cc_test(
         "//aos/testing/ping_pong:ping_lib",
         "//aos/testing/ping_pong:pong_lib",
         "//aos/util:file",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 

@@ -2,11 +2,14 @@
 
 #include <chrono>
 #include <functional>
+#include <future>
 #include <string_view>
+#include <thread>
 
 #include "absl/flags/flag.h"
 #include "absl/flags/reflection.h"
 #include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
 #include "gmock/gmock-matchers.h"
 #include "gtest/gtest.h"
 
@@ -645,6 +648,44 @@ TEST_P(ReplayRateSimulatedEventLoopTest, ReplayRate) {
 
   EXPECT_GE(actual_delta, ideal_delta - kJitterBuffer);
   EXPECT_LE(actual_delta, ideal_delta + kJitterBuffer);
+}
+
+// A finite-rate replay that runs out of events returns from Run(), as an
+// infinite-rate one does.  Running out is loop_body()'s to handle: it ends the
+// run.  So when the schedule empties, the loop still has to call it once more,
+// and at a finite rate that means arming the timer for "now" rather than for
+// the next event, which no longer exists.
+TEST_P(ReplayRateSimulatedEventLoopTest, RunReturnsWhenEventsRunOut) {
+  SimulatedEventLoopTestFactory factory;
+  factory.event_loop_factory()->SetRealtimeReplayRate(GetParam());
+
+  std::unique_ptr<EventLoop> event_loop = factory.Make("loop");
+  event_loop->SkipTimingReport();
+  event_loop->SkipAosLog();
+
+  int fired = 0;
+  TimerHandler *timer = event_loop->AddTimer([&fired]() { ++fired; });
+  event_loop->OnRun([&event_loop, timer] {
+    timer->Schedule(event_loop->monotonic_now() +
+                    std::chrono::milliseconds(10));
+  });
+
+  // Run() on its own thread, so that a regression -- Run() never returning --
+  // fails here with a message instead of hanging the test until bazel kills
+  // it.  The thread is detached rather than joined in that case: there is
+  // nothing to join.
+  std::promise<bool> done;
+  std::future<bool> finished = done.get_future();
+  std::thread runner(
+      [&factory, &done]() { done.set_value(factory.Run().has_value()); });
+  if (finished.wait_for(std::chrono::seconds(10)) !=
+      std::future_status::ready) {
+    runner.detach();
+    ABSL_LOG(FATAL) << "Run() did not return after the events ran out.";
+  }
+  runner.join();
+  EXPECT_TRUE(finished.get());
+  EXPECT_EQ(fired, 1);
 }
 
 INSTANTIATE_TEST_SUITE_P(ReplayRates, ReplayRateSimulatedEventLoopTest,
