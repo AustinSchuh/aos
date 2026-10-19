@@ -460,9 +460,14 @@ Result<void> EventSchedulerScheduler::RunMaybeRealtimeLoop(F loop_body) {
           last_monotonic_clock = next_trigger;
           last_distributed_clock = next_event_time;
         } else {
-          // We're out of events. Let loop_body deal with that above. It will
-          // set is_running_ to false and do any additional bookkeeping that it
-          // needs to do.
+          // We're out of events.  loop_body deals with that: it sets
+          // is_running_ to false and does any other bookkeeping it needs.  At
+          // an infinite rate the loop below runs it again right away.
+          // Otherwise there is no next event to arm the timer for, so arm it
+          // for now, and the next callback runs it.
+          if (replay_rate_ != std::numeric_limits<double>::infinity()) {
+            timerfd.SetTime(monotonic_clock::now(), std::chrono::seconds(0));
+          }
           continue;
         }
       }
