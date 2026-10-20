@@ -624,7 +624,8 @@ class TimerHandler {
 
   // Timer should sleep until base, base + offset, base + offset * 2, ...
   // If repeat_offset isn't set, the timer only expires once.
-  // base must be greater than or equal to zero.
+  // base must be greater than or equal to zero, and repeat_offset must not be
+  // negative.
   virtual void Schedule(monotonic_clock::time_point base,
                         monotonic_clock::duration repeat_offset =
                             ::aos::monotonic_clock::zero()) = 0;

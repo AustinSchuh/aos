@@ -1239,6 +1239,15 @@ TEST_P(AbstractEventLoopDeathTest, NegativeTimeTimer) {
       "-1.000");
 }
 
+// A negative period would never reach the next expiration, so it is refused.
+TEST_P(AbstractEventLoopDeathTest, NegativeRepeatOffsetTimer) {
+  auto loop = Make();
+  TimerHandler *time = loop->AddTimer([]() {});
+  EXPECT_DEATH(
+      time->Schedule(loop->monotonic_now(), -std::chrono::milliseconds(10)),
+      "repeat_offset");
+}
+
 // Verify that registering a watcher twice for "/test" fails.
 TEST_P(AbstractEventLoopDeathTest, TwoWatcher) {
   auto loop = Make();

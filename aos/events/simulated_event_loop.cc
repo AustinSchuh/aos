@@ -1522,6 +1522,7 @@ SimulatedTimerHandler::SimulatedTimerHandler(
 void SimulatedTimerHandler::Schedule(monotonic_clock::time_point base,
                                      monotonic_clock::duration repeat_offset) {
   ABSL_CHECK_GE(base, monotonic_clock::epoch());
+  ABSL_CHECK_GE(repeat_offset, monotonic_clock::zero());
   // The allocations in here are due to infrastructure and don't count in the no
   // mallocs in RT code.
   ScopedNotRealtime nrt;

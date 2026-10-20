@@ -690,6 +690,7 @@ class ShmTimerHandler final : public TimerHandler {
   void Schedule(monotonic_clock::time_point base,
                 monotonic_clock::duration repeat_offset) override {
     shm_event_loop_->CheckCurrentThread();
+    ABSL_CHECK_GE(repeat_offset, monotonic_clock::zero());
     if (event_.valid()) {
       shm_event_loop_->RemoveEvent(&event_);
     }
