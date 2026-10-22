@@ -1,10 +1,13 @@
 #ifndef AOS_UTIL_PROC_STAT_H_
 #define AOS_UTIL_PROC_STAT_H_
 
+#include <sys/types.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aos::util {
 // ProcStat is a struct to hold all the fields available in /proc/[pid]/stat.
@@ -15,6 +18,11 @@ namespace aos::util {
 // Things are signed or unsigned based on whether they are listed
 // as signed/unsigned in man 5 proc. We just make everything 64 bits wide
 // because otherwise we have to write out way too many casts everywhere.
+//
+// macOS has no /proc.  There, ReadProcStat() fills in pid, name, state,
+// parent_pid, the user and kernel mode ticks, num_threads, start_time_ticks,
+// virtual_memory_size and resident_set_size from libproc, in the same units
+// Linux uses, and leaves everything else zero.
 struct ProcStat {
   int pid;
   std::string name;
@@ -80,8 +88,20 @@ struct ProcStat {
 // and tid are provided, it reads the thread's stat file at
 // /proc/[pid]/task/[tid]/stat. Returns nullopt if unable to read or parse the
 // file.
+//
+// On macOS, only processes owned by the same user can be read (or any, as
+// root), and threads can't be read at all.
 std::optional<ProcStat> ReadProcStat(pid_t pid,
                                      std::optional<pid_t> tid = std::nullopt);
+
+// Returns the ids of the threads of a process which ReadProcStat(pid, tid) can
+// read, or nullopt if they can't be listed (e.g. the process exited).  Always
+// empty on macOS, where there is no way to look up another process's thread
+// by id.
+std::optional<std::vector<pid_t>> ListThreads(pid_t pid);
+
+// Returns the pid of every process on the system.
+std::vector<pid_t> ListProcesses();
 
 // Whether the /proc mount described by the given /proc/self/mountinfo contents
 // hides other users' processes (mounted with hidepid=1, 2, invisible, or

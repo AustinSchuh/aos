@@ -1,6 +1,5 @@
 #include "aos/util/top.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -60,25 +59,13 @@ void Top::MaybeAddThreadIds(pid_t pid, std::set<pid_t> *pids) {
     return;
   }
 
-  // Add all the threads in /proc/pid/task
-  std::string task_dir = absl::StrCat("/proc/", std::to_string(pid), "/task/");
-  DIR *dir = opendir(task_dir.data());
-  if (dir == nullptr) {
-    ABSL_LOG(WARNING) << "Unable to open " << task_dir;
+  // Add all the threads of the process.
+  const std::optional<std::vector<pid_t>> tids = ListThreads(pid);
+  if (!tids.has_value()) {
+    ABSL_LOG(WARNING) << "Unable to list the threads of " << pid;
     return;
   }
-
-  while (true) {
-    struct dirent *const dir_entry = readdir(dir);
-    if (dir_entry == nullptr) {
-      break;
-    }
-    pid_t tid;
-    if (absl::SimpleAtoi(dir_entry->d_name, &tid)) {
-      pids->emplace(tid);
-    }
-  }
-  closedir(dir);
+  pids->insert(tids->begin(), tids->end());
 }
 
 ThreadState CharToThreadState(const char state) {
@@ -105,43 +92,17 @@ ThreadState CharToThreadState(const char state) {
 }
 
 void Top::UpdateThreadReadings(pid_t pid, ProcessReadings &process) {
-  // Construct the path to the task directory which lists all threads
-  std::string task_dir = absl::StrFormat("/proc/%d/task", pid);
-
-  // Verify we can open the directory.
-  DIR *dir = opendir(task_dir.c_str());
-  if (dir == nullptr) {
+  const std::optional<std::vector<pid_t>> tids = ListThreads(pid);
+  if (!tids.has_value()) {
     ABSL_LOG_EVERY_N_SEC(WARNING, 10)
-        << "Unable to open directory: " << task_dir
-        << ", error: " << strerror(errno);
+        << "Unable to list the threads of " << pid;
     return;
   }
 
   // Use a set to track all the threads that we process.
   std::set<pid_t> updated_threads;
 
-  // Iterate over all entries in the directory.
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != nullptr) {
-    // Skip non-directories
-    if (entry->d_type != DT_DIR) {
-      continue;
-    }
-
-    // Skip "." and "..".
-    const bool is_current_dir = strcmp(entry->d_name, ".") == 0;
-    const bool is_parent_dir = strcmp(entry->d_name, "..") == 0;
-    if (is_current_dir || is_parent_dir) {
-      continue;
-    }
-
-    // Verify the entry is a valid thread ID.
-    pid_t tid;
-    const bool is_valid_thread_id = absl::SimpleAtoi(entry->d_name, &tid);
-    if (!is_valid_thread_id) {
-      continue;
-    }
-
+  for (const pid_t tid : *tids) {
     // Read the stats for the thread.
     const std::optional<ProcStat> thread_stats = ReadProcStat(pid, tid);
 
@@ -195,9 +156,6 @@ void Top::UpdateThreadReadings(pid_t pid, ProcessReadings &process) {
   for (const pid_t tid : threads_to_remove) {
     process.thread_readings.erase(tid);
   }
-
-  // Close the directory.
-  closedir(dir);
 }
 
 void Top::UpdateReadings() {
@@ -211,23 +169,10 @@ void Top::UpdateReadings() {
     MaybeAddThreadIds(reading.first, &pids);
   }
   if (track_all_) {
-    DIR *const dir = opendir("/proc");
-    if (dir == nullptr) {
-      ABSL_PLOG(FATAL) << "Failed to open /proc";
+    for (const pid_t pid : ListProcesses()) {
+      pids.insert(pid);
+      MaybeAddThreadIds(pid, &pids);
     }
-    while (true) {
-      struct dirent *const dir_entry = readdir(dir);
-      if (dir_entry == nullptr) {
-        break;
-      }
-      pid_t pid;
-      if (dir_entry->d_type == DT_DIR &&
-          absl::SimpleAtoi(dir_entry->d_name, &pid)) {
-        pids.insert(pid);
-        MaybeAddThreadIds(pid, &pids);
-      }
-    }
-    closedir(dir);
   }
 
   for (const pid_t pid : pids) {

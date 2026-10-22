@@ -34,7 +34,12 @@
 namespace aos::util::testing {
 
 void SetThreadName(const std::string &name) {
+#if defined(__APPLE__)
+  // macOS can only name the calling thread.
+  pthread_setname_np(name.c_str());
+#else
   pthread_setname_np(pthread_self(), name.c_str());
+#endif
 }
 
 void WaitForCpuConsumption(pid_t pid) {
@@ -170,6 +175,13 @@ TEST_F(TopTest, QuerySingleProcessWithThreads) {
   // Sanity check memory usage.
   ASSERT_LT(1000000, info.message().physical_memory());
   ASSERT_GT(1000000000, info.message().physical_memory());
+
+#if defined(__APPLE__)
+  // macOS has no way to read another process's threads by id, so there is no
+  // per-thread information.
+  ASSERT_FALSE(info.message().has_threads());
+  return;
+#endif
 
   // Validate that we have some per-thread information.
   ASSERT_TRUE(info.message().has_threads());

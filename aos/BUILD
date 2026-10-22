@@ -170,6 +170,9 @@ cc_binary(
     srcs = [
         "dump_rtprio.cc",
     ],
+    # Dumps CPU affinity and scheduling state out of /proc and
+    # sched_getaffinity(), which macOS doesn't have.
+    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         "//aos:init",
         "//aos/events:shm_event_loop",

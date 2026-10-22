@@ -482,12 +482,21 @@ flatbuffer_ts_library(
 
 cc_library(
     name = "proc_stat",
-    srcs = ["proc_stat.cc"],
+    srcs = ["proc_stat.cc"] + select({
+        "@platforms//os:linux": ["proc_stat_linux.cc"],
+        "@platforms//os:macos": ["proc_stat_darwin.cc"],
+    }),
     hdrs = ["proc_stat.h"],
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     visibility = ["//visibility:public"],
     deps = [
+        "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/numeric:int128",
         "@com_google_absl//absl/strings",
     ],
 )
@@ -496,7 +505,6 @@ cc_test(
     name = "proc_stat_test",
     size = "small",
     srcs = ["proc_stat_test.cc"],
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":proc_stat",
         "//aos/testing:googletest",
@@ -507,7 +515,6 @@ cc_library(
     name = "top",
     srcs = ["top.cc"],
     hdrs = ["top.h"],
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":proc_stat",
         ":process_info_fbs",
