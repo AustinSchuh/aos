@@ -23,21 +23,38 @@ long SystemPageSize() { return sysconf(_SC_PAGESIZE); }
 
 namespace {
 
+// macOS has no /dev/shm, so paths under it are POSIX shared memory objects
+// instead of files.  Those live in a flat namespace with names of at most 31
+// characters, so each one is named after a hash of its path.
+bool IsPosixShmPath(std::string_view path) {
+  return path.starts_with("/dev/shm/");
+}
+
+std::string PosixShmName(std::string_view path) {
+  // Format a unique name: "/aos_<hash>"
+  uint64_t hash_val = std::hash<std::string_view>{}(path);
+  char name_buf[32];
+  std::snprintf(name_buf, sizeof(name_buf), "/aos_%016llx",
+                static_cast<unsigned long long>(hash_val));
+  return std::string(name_buf);
+}
+
 void *MapShm(std::string_view path, size_t size,
              std::filesystem::perms permissions, bool writable) {
-  bool use_posix_shm = path.starts_with("/dev/shm/");
+  const bool use_posix_shm = IsPosixShmPath(path);
+  const long page_size = SystemPageSize();
 
   int fd = -1;
   bool created = false;
   std::string path_str(path);
 
+  // ftruncate() rounds a POSIX shared memory object up to whole pages, so
+  // that is the size to expect.
+  const size_t expected_size =
+      use_posix_shm ? (size + page_size - 1) / page_size * page_size : size;
+
   if (use_posix_shm) {
-    // Format a unique name: "/aos_<hash>"
-    uint64_t hash_val = std::hash<std::string_view>{}(path);
-    char name_buf[32];
-    std::snprintf(name_buf, sizeof(name_buf), "/aos_%016llx",
-                  static_cast<unsigned long long>(hash_val));
-    std::string posix_shm_name(name_buf);
+    const std::string posix_shm_name = PosixShmName(path);
 
     if (writable) {
       // The same protocol as shm_mapping_linux.cc: create it exclusively, and
@@ -101,7 +118,7 @@ void *MapShm(std::string_view path, size_t size,
       ABSL_PCHECK(fstat(fd, &st) == 0);
     }
   }
-  ABSL_CHECK_EQ(static_cast<size_t>(st.st_size), size)
+  ABSL_CHECK_EQ(static_cast<size_t>(st.st_size), expected_size)
       << ": Size of " << path_str
       << " doesn't match expected size of backing queue file.";
 
@@ -110,7 +127,6 @@ void *MapShm(std::string_view path, size_t size,
   ABSL_PCHECK(data != MAP_FAILED);
   ABSL_PCHECK(close(fd) == 0);
 
-  const long page_size = SystemPageSize();
   if (writable) {
     PageFaultDataWrite(static_cast<char *>(data), size, page_size);
   } else {
