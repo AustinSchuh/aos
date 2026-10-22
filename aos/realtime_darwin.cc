@@ -536,6 +536,14 @@ std::string GetThreadName() {
 
 pid_t GetProcessId() { return getpid(); }
 pid_t GetThreadId() {
+  // On Linux, the main thread's id is the process id, and things like starter
+  // rely on that to match the pid in a timing report to a process.  macOS
+  // thread ids are numbered separately, so make the main thread's match the
+  // same way.  Process ids stop at 99999, far below any thread id after boot,
+  // so it doesn't collide with another thread's.
+  if (pthread_main_np()) {
+    return getpid();
+  }
   uint64_t tid;
   pthread_threadid_np(NULL, &tid);
   return static_cast<pid_t>(tid);
