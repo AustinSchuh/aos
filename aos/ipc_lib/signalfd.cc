@@ -111,8 +111,8 @@ SignalFd::~SignalFd() {
   ABSL_PCHECK(close(fd_) == 0);
 }
 
-signalfd_siginfo SignalFd::Read() {
-  signalfd_siginfo result;
+SignalInfo SignalFd::Read() {
+  SignalInfo result;
 
   const int ret =
       read(fd_, static_cast<void *>(&result), sizeof(signalfd_siginfo));

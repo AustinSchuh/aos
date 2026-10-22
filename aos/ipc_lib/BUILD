@@ -158,13 +158,18 @@ cc_binary(
 
 cc_library(
     name = "signalfd",
-    srcs = [
-        "signalfd.cc",
-    ],
+    srcs = select({
+        "@platforms//os:linux": ["signalfd.cc"],
+        "@platforms//os:macos": ["signalfd_darwin.cc"],
+    }),
     hdrs = [
         "signalfd.h",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         "//aos:sanitizers",
@@ -178,7 +183,6 @@ cc_test(
     srcs = [
         "signalfd_test.cc",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":signalfd",
         "//aos/testing:googletest",
