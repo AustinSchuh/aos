@@ -32,12 +32,6 @@ cc_library(
     name = "subprocess",
     srcs = ["subprocess.cc"],
     hdrs = ["subprocess.h"],
-    # SignalFd (and <sys/signalfd.h>, included by subprocess.h) is Linux-only.
-    # //aos/ipc_lib:signalfd already carries this constraint, so this target was
-    # effectively Linux-only already; stating it here makes the failure a clear
-    # constraint on subprocess instead of an incompatibility surfacing from a
-    # transitive dep.
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         ":starter_fbs",
@@ -63,7 +57,6 @@ cc_library(
         # The current BCR entry only supports libudev.
         "//conditions:default": ["SYSTEMD_AVAILABLE=0"],
     }),
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":starter_fbs",
         ":starter_rpc_fbs",
@@ -103,8 +96,6 @@ cc_test(
     # has a timeout on waiting for that completion, which can make the test flaky.
     flaky = True,
     shard_count = 19,
-    # The roborio compiler doesn't support <filesystem>.
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":subprocess",
         "//aos/events:shm_event_loop",
@@ -121,8 +112,6 @@ cc_test(
     data = [
         "//aos/testing/ping_pong:pingpong_config",
     ],
-    # The roborio compiler doesn't support <filesystem>.
-    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":subprocess",
         "//aos/events:shm_event_loop",
@@ -150,7 +139,8 @@ cc_test(
     target_compatible_with = select(
         {
             "//tools/platforms/hardware:roborio": ["@platforms//:incompatible"],
-            "//conditions:default": ["@platforms//os:linux"],
+            "@platforms//os:windows": ["@platforms//:incompatible"],
+            "//conditions:default": [],
         },
     ),
     deps = [
@@ -170,7 +160,6 @@ cc_test(
 cc_binary(
     name = "starterd",
     srcs = ["starterd.cc"],
-    target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
         ":starterd_lib",

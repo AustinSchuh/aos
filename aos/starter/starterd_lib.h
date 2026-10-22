@@ -1,8 +1,6 @@
 #ifndef AOS_STARTER_STARTERD_LIB_H_
 #define AOS_STARTER_STARTERD_LIB_H_
 
-#include <sys/signalfd.h>
-
 #include <chrono>
 #include <csignal>
 #include <memory>
@@ -17,6 +15,7 @@
 #include "aos/events/shm_event_loop.h"
 #include "aos/ftrace.h"
 #include "aos/ipc_lib/memory_mapped_queue.h"
+#include "aos/ipc_lib/signalfd.h"
 #include "aos/macros.h"
 #include "aos/starter/starter_generated.h"
 #include "aos/starter/starter_rpc_generated.h"
@@ -55,7 +54,7 @@ class Starter {
       SIGHUP,  SIGINT,  SIGQUIT, SIGILL, SIGABRT, SIGFPE,
       SIGSEGV, SIGPIPE, SIGTERM, SIGBUS, SIGXCPU};
 
-  void OnSignal(signalfd_siginfo signal);
+  void OnSignal(ipc_lib::SignalInfo signal);
   void HandleStarterRpc(const StarterRpc &command);
 
   // Handles any potential state change in the child applications.

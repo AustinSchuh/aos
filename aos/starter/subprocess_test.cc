@@ -421,12 +421,15 @@ TEST_F(SubprocessTest, TerminateDoesNotAutorestart) {
 // Test that if the binary changes out from under us that we note it in the
 // FileState.
 TEST_F(SubprocessTest, ChangeBinaryContents) {
-  // Create a local copy of the sleep binary so that we can delete it.
+  // Create a local executable which runs sleep, so that we can delete it.  It
+  // is a script rather than a copy of the sleep binary because macOS kills a
+  // copy of one of its own binaries when it runs.
   const std::filesystem::path full_executable_path =
       absl::StrCat(aos::testing::TestTmpDir(), "/", "sleep_binary");
   aos::util::WriteStringToFileOrDie(
       full_executable_path.native(),
-      aos::util::ReadFileToStringOrDie(ResolvePath("sleep").native()),
+      absl::StrCat("#!/bin/sh\nexec ", ResolvePath("sleep").native(),
+                   " \"$@\"\n"),
       std::filesystem::perms::owner_all);
 
   const std::filesystem::path executable_name =
@@ -654,9 +657,11 @@ TEST_F(RemoveCGroupTest, RetrySucceedsAfterFileRemoved) {
   EXPECT_FALSE(std::filesystem::exists(test_path));
 }
 
+#if defined(__linux__)
 // Tests that GetCGroupProcessesInfo correctly reads and returns information
 // about processes from a cgroup's tasks file, including process names and
-// states from /proc, and handles non-existent PIDs gracefully.
+// states from /proc, and handles non-existent PIDs gracefully.  Only Linux has
+// cgroups, or a /proc to read the names and states from.
 TEST_F(RemoveCGroupTest, GetCGroupProcessesInfoWithTasksFile) {
   std::filesystem::path mock_cgroup = test_dir_ / "mock_cgroup";
   std::filesystem::create_directory(mock_cgroup);
@@ -687,6 +692,7 @@ TEST_F(RemoveCGroupTest, GetCGroupProcessesInfoWithTasksFile) {
   // output for it).
   EXPECT_THAT(output, ::testing::HasSubstr("PID 99999"));
 }
+#endif
 
 // Tests that GetCGroupProcessesInfo handles an empty tasks file gracefully by
 // returning an empty string.

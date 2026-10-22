@@ -2,7 +2,6 @@
 #define AOS_STARTER_SUBPROCESS_H_
 
 #include <stdint.h>
-#include <sys/signalfd.h>
 #include <sys/types.h>
 
 #include <algorithm>
@@ -52,19 +51,21 @@ std::filesystem::path ResolvePath(std::string_view command);
 class SignalListener {
  public:
   SignalListener(aos::ShmEventLoop *loop,
-                 std::function<void(signalfd_siginfo)> callback);
-  SignalListener(aos::Aio *aio, std::function<void(signalfd_siginfo)> callback);
+                 std::function<void(ipc_lib::SignalInfo)> callback);
+  SignalListener(aos::Aio *aio,
+                 std::function<void(ipc_lib::SignalInfo)> callback);
   SignalListener(aos::ShmEventLoop *loop,
-                 std::function<void(signalfd_siginfo)> callback,
+                 std::function<void(ipc_lib::SignalInfo)> callback,
                  std::initializer_list<unsigned int> signals);
-  SignalListener(aos::Aio *aio, std::function<void(signalfd_siginfo)> callback,
+  SignalListener(aos::Aio *aio,
+                 std::function<void(ipc_lib::SignalInfo)> callback,
                  std::initializer_list<unsigned int> signals);
 
   ~SignalListener();
 
  private:
   aos::Aio *aio_;
-  std::function<void(signalfd_siginfo)> callback_;
+  std::function<void(ipc_lib::SignalInfo)> callback_;
   aos::ipc_lib::SignalFd signalfd_;
 
   DISALLOW_COPY_AND_ASSIGN(SignalListener);
@@ -148,6 +149,9 @@ class CGroupManager {
 // If should_create_cgroups is kDoCreate, the manager will create cgroups and
 // also create a new cgroup for the current process to enable memory
 // controllers. If kDoNotCreate, the manager will only manage existing cgroups.
+//
+// macOS has no cgroups.  There, the manager's cgroups do nothing, and setting a
+// memory limit logs a warning instead.
 std::unique_ptr<CGroupManager> MakeCGroupManager(
     MemoryCGroup::Create should_create_cgroups =
         MemoryCGroup::Create::kDoCreate);

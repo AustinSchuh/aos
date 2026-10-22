@@ -5,10 +5,13 @@
 #include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include <compare>
 #include <fstream>
@@ -43,13 +46,15 @@ class ScopedCompleteSignalBlocker {
   ScopedCompleteSignalBlocker() {
     sigset_t mask;
     sigfillset(&mask);
-    // Remember the current mask.
-    ABSL_PCHECK(sigprocmask(SIG_SETMASK, &mask, &old_mask_) == 0);
+    // Remember the current mask.  pthread_sigmask() rather than sigprocmask(),
+    // because on macOS sigprocmask() from any thread but the main one changes
+    // the main thread's mask too.
+    ABSL_CHECK_EQ(0, pthread_sigmask(SIG_SETMASK, &mask, &old_mask_));
   }
 
   ~ScopedCompleteSignalBlocker() {
     // Restore the remembered mask.
-    ABSL_PCHECK(sigprocmask(SIG_SETMASK, &old_mask_, nullptr) == 0);
+    ABSL_CHECK_EQ(0, pthread_sigmask(SIG_SETMASK, &old_mask_, nullptr));
   }
 
  private:
@@ -112,6 +117,7 @@ std::filesystem::path ResolvePath(std::string_view command) {
   }
 }
 
+#if defined(__linux__)
 namespace {
 // RAII class to become root and restore back to the original user and group
 // afterwards.
@@ -258,6 +264,7 @@ class CGroupManagerV1 : public CGroupManager {
  private:
   MemoryCGroup::Create should_create_cgroups_;
 };
+#endif  // defined(__linux__)
 
 bool RemoveCGroupV2Hierarchy(const std::string &cgroup_path, bool remove_self) {
   namespace fs = std::filesystem;
@@ -296,6 +303,7 @@ bool RemoveCGroupV2Children(const std::string &cgroup_path) {
   return RemoveCGroupV2Hierarchy(cgroup_path, false);
 }
 
+#if defined(__linux__)
 class MemoryCGroupV2 : public MemoryCGroup {
  public:
   MemoryCGroupV2(std::string_view name,
@@ -550,6 +558,41 @@ std::unique_ptr<CGroupManager> MakeCGroupManager(
     return std::make_unique<CGroupManagerV2>(cgroup, should_create_cgroups);
   }
 };
+#else  // defined(__linux__)
+
+namespace {
+// Stands in for a cgroup on an OS without them.  Everything but a memory limit
+// can be done without one, so only a memory limit is worth a warning.
+class UnsupportedMemoryCGroup : public MemoryCGroup {
+ public:
+  explicit UnsupportedMemoryCGroup(std::string_view name) : name_(name) {}
+
+  void AddTid(pid_t /*pid*/) override {}
+
+  void SetMemoryLimit(uint64_t limit_value) override {
+    ABSL_LOG(WARNING) << "Not limiting " << name_ << " to " << limit_value
+                      << " bytes of memory, this OS has no cgroups";
+  }
+
+ private:
+  std::string name_;
+};
+
+class UnsupportedCGroupManager : public CGroupManager {
+ public:
+  std::unique_ptr<MemoryCGroup> MakeCGroup(
+      std::string_view name, std::string_view /*user_name*/) override {
+    return std::make_unique<UnsupportedMemoryCGroup>(name);
+  }
+};
+}  // namespace
+
+std::unique_ptr<CGroupManager> MakeCGroupManager(
+    MemoryCGroup::Create /*should_create_cgroups*/) {
+  return std::make_unique<UnsupportedCGroupManager>();
+}
+
+#endif  // defined(__linux__)
 
 std::string GetCGroupProcessesInfo(const std::filesystem::path &cgroup_path) {
   const std::filesystem::path tasks_file = cgroup_path / "tasks";
@@ -660,30 +703,30 @@ void RemoveCGroupWithRetry(const std::filesystem::path &cgroup_path) {
   ABSL_LOG(FATAL) << "Giving up on removing cgroup " << cgroup_path;
 }
 
-SignalListener::SignalListener(aos::ShmEventLoop *loop,
-                               std::function<void(signalfd_siginfo)> callback)
+SignalListener::SignalListener(
+    aos::ShmEventLoop *loop, std::function<void(ipc_lib::SignalInfo)> callback)
     : SignalListener(loop->aio(), std::move(callback)) {}
 
-SignalListener::SignalListener(aos::Aio *aio,
-                               std::function<void(signalfd_siginfo)> callback)
+SignalListener::SignalListener(
+    aos::Aio *aio, std::function<void(ipc_lib::SignalInfo)> callback)
     : SignalListener(aio, callback,
                      {SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGFPE, SIGSEGV,
                       SIGPIPE, SIGTERM, SIGBUS, SIGXCPU, SIGCHLD}) {}
 
-SignalListener::SignalListener(aos::ShmEventLoop *loop,
-                               std::function<void(signalfd_siginfo)> callback,
-                               std::initializer_list<unsigned int> signals)
+SignalListener::SignalListener(
+    aos::ShmEventLoop *loop, std::function<void(ipc_lib::SignalInfo)> callback,
+    std::initializer_list<unsigned int> signals)
     : SignalListener(loop->aio(), std::move(callback), std::move(signals)) {}
 
-SignalListener::SignalListener(aos::Aio *aio,
-                               std::function<void(signalfd_siginfo)> callback,
-                               std::initializer_list<unsigned int> signals)
+SignalListener::SignalListener(
+    aos::Aio *aio, std::function<void(ipc_lib::SignalInfo)> callback,
+    std::initializer_list<unsigned int> signals)
     : aio_(aio), callback_(std::move(callback)), signalfd_(signals) {
   aio_->OnReadable(signalfd_.fd(), [this] {
-    signalfd_siginfo info = signalfd_.Read();
+    ipc_lib::SignalInfo info = signalfd_.Read();
 
     if (info.ssi_signo == 0) {
-      ABSL_LOG(WARNING) << "Could not read " << sizeof(signalfd_siginfo)
+      ABSL_LOG(WARNING) << "Could not read " << sizeof(ipc_lib::SignalInfo)
                         << " bytes";
       return;
     }
@@ -1058,12 +1101,16 @@ std::optional<Application::Event> Application::DoStart() {
   sigemptyset(&empty_mask);
   sigprocmask(SIG_SETMASK, &empty_mask, nullptr);
 
+#if defined(__linux__)
   // Cleanup children if starter dies in a way that is not handled gracefully.
+  // macOS has no equivalent, so there children outlive a starter which is
+  // killed without getting to stop them.
   if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1) {
     status_pipes_.write->Write(
         static_cast<uint32_t>(aos::starter::LastStopReason::SET_PRCTL_ERR));
     ABSL_PLOG(FATAL) << "Could not set PR_SET_PDEATHSIG to SIGKILL";
   }
+#endif
 
   if (group_) {
     ABSL_CHECK(!user_name_.empty());

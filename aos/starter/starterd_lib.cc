@@ -84,7 +84,7 @@ Starter::Starter(const aos::Configuration *event_loop_config,
       cgroup_manager_(std::move(cgroup_manager)),
       shm_base_(absl::GetFlag(FLAGS_shm_base)),
       listener_(&event_loop_,
-                [this](signalfd_siginfo signal) { OnSignal(signal); }),
+                [this](ipc_lib::SignalInfo signal) { OnSignal(signal); }),
       top_(&event_loop_, aos::util::Top::TrackThreadsMode::kDisabled,
            aos::util::Top::TrackPerThreadInfoMode::kEnabled) {
   event_loop_.SkipAosLog();
@@ -260,7 +260,7 @@ void Starter::Cleanup() {
   }
 }
 
-void Starter::OnSignal(signalfd_siginfo info) {
+void Starter::OnSignal(ipc_lib::SignalInfo info) {
   if (info.ssi_signo == SIGCHLD) {
     // SIGCHLD messages can be collapsed if multiple are received, so all
     // applications must check their status.

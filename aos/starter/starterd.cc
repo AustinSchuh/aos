@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <ostream>
 #include <string>
@@ -72,7 +73,7 @@ int main(int argc, char **argv) {
   if (!absl::GetFlag(FLAGS_user).empty()) {
     uid_t uid;
     uid_t gid;
-    std::vector<__gid_t> groups;
+    std::vector<gid_t> groups;
     {
       struct passwd *user_data = getpwnam(absl::GetFlag(FLAGS_user).c_str());
       if (user_data != nullptr) {
@@ -80,15 +81,27 @@ int main(int argc, char **argv) {
         uid = user_data->pw_uid;
         gid = user_data->pw_gid;
 
-        // Get the group size.  This is an error since the user should always be
-        // a member of more groups than 0.  Something went wrong if that isn't
-        // true.
-        int ngroups = 0;
-        ABSL_CHECK(getgrouplist(user_data->pw_name, gid, NULL, &ngroups) == -1);
-        groups.resize(ngroups);
-
-        ABSL_PCHECK(getgrouplist(user_data->pw_name, gid, groups.data(),
-                                 &ngroups) == static_cast<int>(groups.size()));
+        // Grow the list until all the groups fit.  getgrouplist() returns -1
+        // if they didn't.  Linux then says how many there are, and macOS
+        // doesn't.
+        int ngroups = 16;
+        while (true) {
+          groups.resize(ngroups);
+          int found = ngroups;
+#if defined(__APPLE__)
+          // macOS takes the groups as ints.
+          static_assert(sizeof(gid_t) == sizeof(int));
+          int *const group_list = reinterpret_cast<int *>(groups.data());
+#else
+          gid_t *const group_list = groups.data();
+#endif
+          if (getgrouplist(user_data->pw_name, gid, group_list, &found) != -1) {
+            groups.resize(found);
+            ngroups = found;
+            break;
+          }
+          ngroups = std::max(found, ngroups * 2);
+        }
         for (int i = 0; i < ngroups; i++) {
           struct group *gr = getgrgid(groups[i]);
           ABSL_PCHECK(gr != nullptr);
@@ -107,7 +120,25 @@ int main(int argc, char **argv) {
     // Change the real and effective IDs to the user we're running as. The
     // effective IDs mean files we access (like shared memory) will happen as
     // that user. The real IDs allow child processes with an different effective
-    // ID to still participate in signal sending/receiving.
+    // ID to still participate in signal sending/receiving.  The saved IDs stay
+    // root, so that children can switch to the user they are configured to run
+    // as.
+#if defined(__APPLE__)
+    // macOS has no setresuid().  Changing only the real ID sets the saved ID to
+    // the effective one, which is still root, and seteuid() changes only the
+    // effective ID.
+    constexpr gid_t kUnchangedGid = static_cast<gid_t>(-1);
+    constexpr uid_t kUnchangedUid = static_cast<uid_t>(-1);
+    if (setregid(gid, kUnchangedGid) != 0 || setegid(gid) != 0) {
+      ABSL_PLOG(FATAL) << "Failed to change GID to "
+                       << absl::GetFlag(FLAGS_user) << ", group " << gid;
+    }
+
+    if (setreuid(uid, kUnchangedUid) != 0 || seteuid(uid) != 0) {
+      ABSL_PLOG(FATAL) << "Failed to change UID to "
+                       << absl::GetFlag(FLAGS_user);
+    }
+#else
     constexpr int kUnchanged = -1;
     if (setresgid(/* ruid */ gid, /* euid */ gid,
                   /* suid */ kUnchanged) != 0) {
@@ -120,6 +151,7 @@ int main(int argc, char **argv) {
       ABSL_PLOG(FATAL) << "Failed to change UID to "
                        << absl::GetFlag(FLAGS_user);
     }
+#endif
   }
 
   aos::FlatbufferDetachedBuffer<aos::Configuration> config =
