@@ -121,9 +121,11 @@ void ArmDeadline(int fd, aos::monotonic_clock::time_point deadline) {
   // NOTE_MACHTIME | NOTE_ABSOLUTE keeps the nanosecond deadline AOS scheduled
   // with, where uv_timer_t would round it to a millisecond.  EV_ONESHOT
   // because AOS re-arms every repeating timer itself.
+  // NOTE_CRITICAL keeps macOS from coalescing it, the same as aio_darwin.cc.
   struct kevent ev;
   EV_SET(&ev, kDeadlineIdent, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT,
-         NOTE_MACHTIME | NOTE_ABSOLUTE, ToMachTicks(deadline), nullptr);
+         NOTE_MACHTIME | NOTE_ABSOLUTE | NOTE_CRITICAL, ToMachTicks(deadline),
+         nullptr);
   ABSL_PCHECK(kevent(fd, &ev, 1, nullptr, 0, nullptr) == 0)
       << ": Failed to arm EVFILT_TIMER";
 }
