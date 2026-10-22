@@ -64,6 +64,53 @@ bool IsValidAddress(void *addr, size_t size) {
 
 void RobustListCleanerWake(aos_futex *futex) { sys_futex_wake(futex, 1); }
 
+namespace {
+
+// Whether addr is in memory mapped with MAP_SHARED, which other processes can
+// map too.
+//
+// The os_sync calls have to be told.  With the SHARED flags, a waiter is found
+// by the VM object holding the page, which is what lets a wake in one process
+// find a waiter in another.  But for private memory, that object changes after
+// fork(): the next write in the parent copies the page into a new object, so a
+// wake after that doesn't find a thread which started waiting before it.
+// Without the SHARED flags, a waiter is found by its process and address, which
+// fork() doesn't change.  Linux's futexes find a waiter on private memory by
+// address too, so they have neither problem.
+//
+// MAP_SHARED is the only thing which makes a mapping's children share it rather
+// than copy it, so that is what tells them apart.
+bool IsSharedMemory(const void *addr) {
+  vm_address_t address = reinterpret_cast<vm_address_t>(addr);
+  const vm_address_t target_addr = address;
+  vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info;
+  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name;
+  const kern_return_t kr = vm_region_64(
+      mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+      reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
+  // The futex is in memory we can read and write, so it is in a region.  If it
+  // somehow isn't, SHARED is right for any memory but private memory across a
+  // fork().
+  if (kr != KERN_SUCCESS || target_addr < address) {
+    return true;
+  }
+  return info.inheritance == VM_INHERIT_SHARE;
+}
+
+os_sync_wait_on_address_flags_t WaitFlags(const aos_futex *addr) {
+  return IsSharedMemory(addr) ? OS_SYNC_WAIT_ON_ADDRESS_SHARED
+                              : OS_SYNC_WAIT_ON_ADDRESS_NONE;
+}
+
+os_sync_wake_by_address_flags_t WakeFlags(const aos_futex *addr) {
+  return IsSharedMemory(addr) ? OS_SYNC_WAKE_BY_ADDRESS_SHARED
+                              : OS_SYNC_WAKE_BY_ADDRESS_NONE;
+}
+
+}  // namespace
+
 // macOS mutexes are always the futex word, so its backend is exactly the
 // portable one.
 int mutex_do_get(aos_mutex *m, bool signals_fail, uint32_t tid) {
@@ -98,11 +145,11 @@ int wait_on_address(aos_futex *addr1, int val1,
       return -ETIMEDOUT;
     }
     ret = os_sync_wait_on_address_with_timeout(
-        addr1, val1, sizeof(*addr1), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+        addr1, val1, sizeof(*addr1), WaitFlags(addr1),
         OS_CLOCK_MACH_ABSOLUTE_TIME, static_cast<uint64_t>(timeout_ns));
   } else {
-    ret = os_sync_wait_on_address(addr1, val1, sizeof(*addr1),
-                                  OS_SYNC_WAIT_ON_ADDRESS_SHARED);
+    ret =
+        os_sync_wait_on_address(addr1, val1, sizeof(*addr1), WaitFlags(addr1));
   }
 
   // Per <os/os_sync_wait_on_address.h>, any non-negative return indicates
@@ -138,11 +185,9 @@ int wait_on_address(aos_futex *addr1, int val1,
 int sys_futex_wake(aos_futex *addr1, int val1) {
   int ret;
   if (val1 == 1) {
-    ret = os_sync_wake_by_address_any(addr1, sizeof(*addr1),
-                                      OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+    ret = os_sync_wake_by_address_any(addr1, sizeof(*addr1), WakeFlags(addr1));
   } else {
-    ret = os_sync_wake_by_address_all(addr1, sizeof(*addr1),
-                                      OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+    ret = os_sync_wake_by_address_all(addr1, sizeof(*addr1), WakeFlags(addr1));
   }
   if (ret == 0) {
     return 1;
@@ -159,8 +204,8 @@ int sys_futex_unlock_pi(aos_futex *addr1) {
   // Also clear the lock value because mutex_unlock expects us to do it if it
   // called us.
   std::atomic_ref<uint32_t>(*addr1).store(0, std::memory_order_release);
-  const int ret = os_sync_wake_by_address_any(addr1, sizeof(*addr1),
-                                              OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+  const int ret =
+      os_sync_wake_by_address_any(addr1, sizeof(*addr1), WakeFlags(addr1));
   if (ret == 0 || errno == ENOENT) {
     // Success, or there were simply no waiters to wake (which is normal when
     // the last unlock races with an interrupted waiter). Match Linux
