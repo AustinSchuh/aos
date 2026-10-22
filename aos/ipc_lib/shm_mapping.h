@@ -79,6 +79,14 @@ class ReadOnlyShmMapping {
   const void *data_ = nullptr;
 };
 
+// Deletes the shared memory a WritableShmMapping created at `path`, if there
+// is any, so the next WritableShmMapping there starts out zeroed.  Processes
+// which already have it mapped keep the old memory until they unmap it.
+// Windows can't delete it while any process has it mapped, and logs a warning
+// instead.  On macOS, paths under /dev/shm/ are POSIX shared memory objects,
+// which can't be listed, so this is the only way to delete those.
+void UnlinkShm(std::string_view path);
+
 }  // namespace aos::ipc_lib
 
 #endif  // AOS_IPC_LIB_SHM_MAPPING_H_

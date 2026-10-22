@@ -158,4 +158,21 @@ ReadOnlyShmMapping::~ReadOnlyShmMapping() {
   ABSL_PCHECK(munmap(const_cast<void *>(data_), size_) == 0);
 }
 
+void UnlinkShm(std::string_view path) {
+  if (IsPosixShmPath(path)) {
+    const std::string posix_shm_name = PosixShmName(path);
+    if (shm_unlink(posix_shm_name.c_str()) != 0 && errno != ENOENT) {
+      ABSL_PLOG(WARNING) << "Failed to remove " << path << " ("
+                         << posix_shm_name << ")";
+    }
+    return;
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  if (ec) {
+    ABSL_LOG(WARNING) << "Failed to remove " << path << ": " << ec.message();
+  }
+}
+
 }  // namespace aos::ipc_lib

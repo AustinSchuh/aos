@@ -163,4 +163,12 @@ ReadOnlyShmMapping::~ReadOnlyShmMapping() {
   ABSL_PCHECK(UnmapViewOfFile(const_cast<void *>(data_)));
 }
 
+void UnlinkShm(std::string_view path) {
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  if (ec) {
+    ABSL_LOG(WARNING) << "Failed to remove " << path << ": " << ec.message();
+  }
+}
+
 }  // namespace aos::ipc_lib

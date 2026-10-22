@@ -27,6 +27,15 @@ std::string ShmPath(std::string_view shm_base, const Channel *channel) {
   return ShmFolder(shm_base, channel) + channel->type()->str() + ".v9";
 }
 
+void UnlinkQueues(std::string_view shm_base, const Configuration *config) {
+  if (!config->has_channels()) {
+    return;
+  }
+  for (const Channel *channel : *config->channels()) {
+    UnlinkShm(ShmPath(shm_base, channel));
+  }
+}
+
 LocklessQueueConfiguration MakeQueueConfiguration(
     const Configuration *configuration, const Channel *channel) {
   LocklessQueueConfiguration config;

@@ -164,6 +164,7 @@ cc_binary(
     deps = [
         ":starterd_lib",
         "//aos:init",
+        "//aos/ipc_lib:memory_mapped_queue",
     ],
 )
 

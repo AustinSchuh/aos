@@ -19,6 +19,10 @@ std::string ShmFolder(std::string_view shm_base, const Channel *channel);
 
 std::string ShmPath(std::string_view shm_base, const Channel *channel);
 
+// Deletes the queue of every channel in config under shm_base.  See
+// UnlinkShm() for what that means for processes still using them.
+void UnlinkQueues(std::string_view shm_base, const Configuration *config);
+
 LocklessQueueConfiguration MakeQueueConfiguration(
     const Configuration *configuration, const Channel *channel);
 

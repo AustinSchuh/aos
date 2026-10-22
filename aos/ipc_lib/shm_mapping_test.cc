@@ -130,6 +130,31 @@ TEST_F(ShmMappingTest, BasicReadWrite) {
   EXPECT_EQ(read_ptr[4], 'o');
 }
 
+// UnlinkShm() throws the contents away, so the next mapping starts out zeroed.
+TEST_F(ShmMappingTest, UnlinkShm) {
+  const std::string shm_path = test_dir_ + "/test_queue";
+  const size_t size = 4096;
+  {
+    WritableShmMapping mapping(shm_path, size,
+                               static_cast<std::filesystem::perms>(0777));
+    static_cast<char *>(mapping.data())[0] = 'H';
+  }
+  {
+    WritableShmMapping mapping(shm_path, size,
+                               static_cast<std::filesystem::perms>(0777));
+    EXPECT_EQ(static_cast<char *>(mapping.data())[0], 'H');
+  }
+  UnlinkShm(shm_path);
+  {
+    WritableShmMapping mapping(shm_path, size,
+                               static_cast<std::filesystem::perms>(0777));
+    EXPECT_EQ(static_cast<char *>(mapping.data())[0], '\0');
+  }
+  // There's nothing left to delete, which isn't an error.
+  UnlinkShm(shm_path);
+  UnlinkShm(shm_path);
+}
+
 TEST_F(ShmMappingDeathTest, ReadOnlyIsActuallyReadOnly) {
   const std::string shm_path = test_dir_ + "/test_queue_ro";
   const size_t size = 4096;

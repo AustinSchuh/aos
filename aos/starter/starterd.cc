@@ -16,6 +16,7 @@
 #include "aos/events/event_loop.h"
 #include "aos/flatbuffers.h"
 #include "aos/init.h"
+#include "aos/ipc_lib/memory_mapped_queue.h"
 #include "aos/starter/starterd_lib.h"
 #include "aos/util/file.h"
 
@@ -29,7 +30,8 @@ ABSL_FLAG(std::string, version_string, "",
 ABSL_DECLARE_FLAG(std::string, shm_base);
 ABSL_DECLARE_FLAG(uint32_t, permissions);
 ABSL_FLAG(bool, purge_shm_base, false,
-          "If true, delete everything in --shm_base before starting.");
+          "If true, delete everything in --shm_base, and the queue of every "
+          "channel in --config, before starting.");
 ABSL_FLAG(std::string, shm_group, "",
           "If set, create --shm_base owned by this group, setgid, with "
           "--permissions, before starting anything or dropping privileges.  "
@@ -62,8 +64,17 @@ void SetUpSharedShmBase(const std::string &group_name) {
 int main(int argc, char **argv) {
   aos::InitGoogle(&argc, &argv);
 
+  aos::FlatbufferDetachedBuffer<aos::Configuration> config =
+      aos::configuration::ReadConfig(absl::GetFlag(FLAGS_config));
+
+  const aos::Configuration *config_msg = &config.message();
+
   if (absl::GetFlag(FLAGS_purge_shm_base)) {
     aos::util::UnlinkRecursive(absl::GetFlag(FLAGS_shm_base));
+    // On macOS, queues under /dev/shm/ aren't files, so deleting the
+    // directory doesn't find them.  Delete them by name instead.  That misses
+    // channels which aren't in this config, which stay until a reboot.
+    aos::ipc_lib::UnlinkQueues(absl::GetFlag(FLAGS_shm_base), config_msg);
   }
 
   if (!absl::GetFlag(FLAGS_shm_group).empty()) {
@@ -153,11 +164,6 @@ int main(int argc, char **argv) {
     }
 #endif
   }
-
-  aos::FlatbufferDetachedBuffer<aos::Configuration> config =
-      aos::configuration::ReadConfig(absl::GetFlag(FLAGS_config));
-
-  const aos::Configuration *config_msg = &config.message();
 
   aos::starter::Starter starter(config_msg, aos::starter::MakeCGroupManager());
   if (!absl::GetFlag(FLAGS_version_string).empty()) {

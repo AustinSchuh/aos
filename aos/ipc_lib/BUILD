@@ -532,6 +532,21 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "memory_mapped_queue_test",
+    srcs = ["memory_mapped_queue_test.cc"],
+    deps = [
+        ":lockless_queue",
+        ":memory_mapped_queue",
+        "//aos:configuration",
+        "//aos:json_to_flatbuffer",
+        "//aos/testing:googletest",
+        "//aos/testing:tmpdir",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
 cc_library(
     name = "data_alignment",
     hdrs = [
