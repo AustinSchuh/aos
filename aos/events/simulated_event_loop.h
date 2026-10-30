@@ -295,11 +295,19 @@ class NodeEventLoopFactory {
   // single node setup.
   const Node *node() const { return node_; }
 
-  // Sets realtime clock to realtime_now for a given monotonic clock.
+  // Sets realtime clock to realtime_now for a given monotonic clock. If
+  // realtime_now is set to an invalid value, then the offset is
+  // assumed to be zero.
   void SetRealtimeOffset(monotonic_clock::time_point monotonic_now,
                          realtime_clock::time_point realtime_now) {
-    realtime_offset_ =
-        realtime_now.time_since_epoch() - monotonic_now.time_since_epoch();
+    realtime_offset_ = (realtime_now == realtime_clock::min_time)
+                           ? std::chrono::seconds(0)
+                           : (realtime_now.time_since_epoch() -
+                              monotonic_now.time_since_epoch());
+  }
+
+  inline std::chrono::nanoseconds realtime_offset() const {
+    return realtime_offset_;
   }
 
   inline std::chrono::nanoseconds realtime_offset() { return realtime_offset_; }
@@ -530,7 +538,7 @@ inline monotonic_clock::time_point NodeEventLoopFactory::monotonic_now() const {
 
 inline realtime_clock::time_point NodeEventLoopFactory::realtime_now() const {
   return realtime_clock::time_point(monotonic_now().time_since_epoch() +
-                                    realtime_offset_);
+                                    realtime_offset());
 }
 
 inline distributed_clock::time_point NodeEventLoopFactory::distributed_now()
