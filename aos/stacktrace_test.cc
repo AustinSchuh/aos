@@ -62,7 +62,8 @@ TEST(StacktraceDeathTest, StackTraceOnCrash) {
 .*
 ?\*\*\* Check failure stack trace: \*\*\*
     @ .*  absl::.*::log_internal::LogMessage::SendToLog\(\)
-    @ .*  aos::testing::StacktraceDeathTest_StackTraceOnCrash_Test::TestBody\(\)::.*
+    @ .*  absl::.*::log_internal::LogMessage::Flush\(\)
+    @ .*  aos::testing::StacktraceDeathTest_StackTraceOnCrash_Test::TestBody\(\)::.*invoke\(\)
     @ .*  aos::testing::function1\(\)
     @ .*  aos::testing::function2\(\)
     @ .*  aos::testing::function3\(\)
@@ -74,9 +75,7 @@ TEST(StacktraceDeathTest, StackTraceOnCrash) {
 }
 
 // Tests that we get a useful stacktrace on a segfault.
-// TODO(philipp.schrader): Enable when we get stack unwinding in signal handlers
-// working.
-TEST(StacktraceDeathTest, DISABLED_StackTraceOnSegfault) {
+TEST(StacktraceDeathTest, StackTraceOnSegfault) {
   g_function = [] { ABSL_CHECK_EQ(raise(SIGSEGV), 0); };
 
   // NOTE(james): Depending on the platform this runs on, we sometimes get
@@ -100,10 +99,12 @@ TEST(StacktraceDeathTest, DISABLED_StackTraceOnSegfault) {
 )"));
 }
 
+// Malloc hooks don't work with asan/msan. So we cannot trigger a crash in those
+// configurations.
+#if !__has_feature(address_sanitizer) && !__has_feature(memory_sanitizer)
+
 // Tests that we get a useful stacktrace on a malloc.
-// TODO(philipp.schrader): Enable when we get stack unwinding in signal handlers
-// working.
-TEST(StacktraceDeathTest, DISABLED_StackTraceOnMalloc) {
+TEST(StacktraceDeathTest, StackTraceOnMalloc) {
   g_function = [] {
     ScopedRealtime rt;
     volatile int *a = new int[3];
@@ -114,7 +115,7 @@ TEST(StacktraceDeathTest, DISABLED_StackTraceOnMalloc) {
   EXPECT_DEATH(
       { function4(); },
       ::testing::MatchesRegex(
-          R"(\[realtime\.cc : [[:digit:]]+\] RAW: Malloced [[:digit:]]+ bytes
+          R"(\[realtime_linux\.cc : [[:digit:]]+\] RAW: Malloced [[:digit:]]+ bytes: [a-zA-Z._ ]*
 \*\*\* SIGABRT received at time=[[:digit:]]+ on cpu [[:digit:]]+ \*\*\*
 .*
 ?PC: @ .*  .*
@@ -129,5 +130,7 @@ TEST(StacktraceDeathTest, DISABLED_StackTraceOnMalloc) {
 .*
 )"));
 }
+
+#endif
 
 }  // namespace aos::testing

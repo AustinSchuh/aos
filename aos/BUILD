@@ -188,6 +188,10 @@ cc_library(
     hdrs = [
         "init.h",
     ],
+    implementation_deps = select({
+        "@platforms//os:linux": [":init_stack_unwinder"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":die",
@@ -329,6 +333,21 @@ cc_test(
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
     ],
+)
+
+cc_library(
+    name = "init_stack_unwinder",
+    srcs = [
+        "init_stack_unwinder.cc",
+    ],
+    hdrs = [
+        "init_stack_unwinder.h",
+    ],
+    implementation_deps = [
+        "//third_party/libunwind",
+        "@com_google_absl//absl/debugging:stacktrace",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 cc_library(
