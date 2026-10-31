@@ -106,6 +106,14 @@ void WriteCoreDumps();
 void LockAllMemory();
 
 void ExpandStackSize();
+
+// Raises this process's RLIMIT_RTPRIO as high as it is allowed to go: the hard
+// limit too if we have the privileges for it, otherwise the soft limit up to
+// the hard limit.  Every realtime priority the system allows us can then later
+// be reached with a bare sched_setscheduler(), without adjusting rlimits on the
+// RT path.  Policy belongs in the hard limit (systemd's LimitRTPRIO=).  A no-op
+// on platforms without RLIMIT_RTPRIO.  Called by InitRT().
+void RaiseRealtimePriorityLimit();
 #endif
 
 // Sets the name of the current thread.
@@ -185,6 +193,9 @@ enum class RealtimePolicy {
 // Takes in an integer argument for the realtime priority value between [1,99],
 // and an optional integer for the scheduling_policy as defined in
 // `include/linux/sched.h` (otherwise defaults to SCHED_FIFO).
+// Does not touch RLIMIT_RTPRIO: priority must already be within the soft
+// limit, which InitRT() (or RaiseRealtimePriorityLimit()) raises as far as the
+// system allows.
 void SetCurrentThreadRealtimePriority(
     int priority, int scheduling_policy = SCHED_FIFO,
     RealtimePolicy realtime_policy = RealtimePolicy::REALTIME_MODE_DENY_MALLOC);

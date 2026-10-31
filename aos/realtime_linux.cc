@@ -193,13 +193,6 @@ void SetCurrentThreadRealtimePriority(int priority, int scheduling_policy,
       ", use --skip_realtime_scheduler to stay non-rt and bypass this "
       "warning.");
 
-  // Raise our soft rlimit if necessary.
-  SetSoftRLimit(
-      RLIMIT_RTPRIO, priority, SetLimitForRoot::kNo,
-      ", use --skip_realtime_scheduler to stay non-rt and bypass this "
-      "warning.",
-      AllowSoftLimitDecrease::kNo);
-
   ABSL_CHECK(scheduling_policy == SCHED_FIFO || scheduling_policy == SCHED_RR)
       << "Specified non-realtime scheduling policy with realtime priority";
   ABSL_CHECK(priority > 0 && priority < 100)
