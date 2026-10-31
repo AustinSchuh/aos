@@ -42,10 +42,17 @@ bool UnlinkShm(std::string_view path);
 // safely with other creators), sizes it to `size`, and maps it read/write.
 // Pre-faults every page so realtime code can touch the memory without faulting,
 // and unmap on destruction.
+//
+// If `hugepage_path` is non-empty, a file that doesn't exist yet is created at
+// `hugepage_path` (intended to be on a hugetlbfs mount) instead, sized to
+// `size` rounded up to that filesystem's page size, and symlinked at `path`;
+// other processes follow the symlink transparently.  Only supported on Linux;
+// other OSes die if it is set.
 class WritableShmMapping {
  public:
   WritableShmMapping(std::string_view path, size_t size,
-                     std::filesystem::perms permissions);
+                     std::filesystem::perms permissions,
+                     std::string_view hugepage_path = {});
   ~WritableShmMapping();
 
   WritableShmMapping(const WritableShmMapping &) = delete;
@@ -58,6 +65,9 @@ class WritableShmMapping {
 
  private:
   const size_t size_;
+  // Bytes actually mmap()ed: size_ rounded up to the backing filesystem's
+  // page size when the file lives on hugetlbfs (Linux), size_ otherwise.
+  size_t mapped_size_ = size_;
   void *data_ = nullptr;
 };
 
@@ -82,6 +92,9 @@ class ReadOnlyShmMapping {
 
  private:
   const size_t size_;
+  // Bytes actually mmap()ed: size_ rounded up to the backing filesystem's
+  // page size when the file lives on hugetlbfs (Linux), size_ otherwise.
+  size_t mapped_size_ = size_;
   const void *data_ = nullptr;
 };
 

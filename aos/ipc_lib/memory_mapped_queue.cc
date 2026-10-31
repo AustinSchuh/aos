@@ -6,12 +6,23 @@
 #include <mutex>
 #include <ostream>
 
+#include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "absl/strings/str_cat.h"
 #include "flatbuffers/string.h"
 
 #include "aos/ipc_lib/index.h"
+
+ABSL_FLAG(std::string, shm_hugepage_base, "",
+          "If non-empty, a directory on a hugetlbfs mount.  Queues whose "
+          "memory size is >= --shm_hugepage_threshold are created there "
+          "(backed by huge pages) and reached from --shm_base through a "
+          "symlink.  Only matters for the process that creates a queue file; "
+          "every other process follows the symlink and adapts.");
+ABSL_FLAG(size_t, shm_hugepage_threshold, 500 * 1024 * 1024,
+          "Queue memory size (bytes) at or above which a newly created queue "
+          "is backed by --shm_hugepage_base.");
 
 namespace aos::ipc_lib {
 
@@ -100,13 +111,53 @@ LocklessQueueConfiguration MakeQueueConfiguration(
   return config;
 }
 
+size_t HugePagesNeededForNode(const Configuration *config, const Node *node,
+                              size_t threshold, size_t huge_page_size) {
+  size_t pages = 0;
+  if (!config->has_channels()) {
+    return pages;
+  }
+  for (const aos::Channel *channel : *config->channels()) {
+    if (!configuration::ChannelIsReadableOnNode(channel, node)) {
+      continue;
+    }
+    const size_t size =
+        LocklessQueueMemorySize(MakeQueueConfiguration(config, channel));
+    if (size < threshold) {
+      continue;
+    }
+    pages += (size + huge_page_size - 1) / huge_page_size;
+  }
+  return pages;
+}
+
+namespace {
+
+// Returns the path on the hugetlbfs mount at which the queue file for channel
+// should be created, or an empty string when the queue should live directly
+// at the tmpfs path: large queues with a configured --shm_hugepage_base are
+// created on the hugetlbfs mount with a symlink left at the tmpfs path (see
+// WritableShmMapping); opening follows the symlink transparently either way.
+std::string HugePagePath(const Channel *channel, size_t size) {
+  const std::string hugepage_base = absl::GetFlag(FLAGS_shm_hugepage_base);
+  if (hugepage_base.empty() ||
+      size < absl::GetFlag(FLAGS_shm_hugepage_threshold)) {
+    return "";
+  }
+  return ShmPath(hugepage_base, channel);
+}
+
+}  // namespace
+
 MemoryMappedQueue::MemoryMappedQueue(std::string_view shm_base,
                                      std::filesystem::perms permissions,
                                      const Configuration *config,
                                      const Channel *channel)
     : config_(MakeQueueConfiguration(config, channel)),
-      writable_mapping_(ShmPath(shm_base, channel),
-                        ipc_lib::LocklessQueueMemorySize(config_), permissions),
+      writable_mapping_(
+          ShmPath(shm_base, channel), ipc_lib::LocklessQueueMemorySize(config_),
+          permissions,
+          HugePagePath(channel, ipc_lib::LocklessQueueMemorySize(config_))),
       readonly_mapping_(ShmPath(shm_base, channel),
                         ipc_lib::LocklessQueueMemorySize(config_),
                         permissions) {
