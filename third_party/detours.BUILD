@@ -28,17 +28,17 @@ cc_library(
     hdrs = [
         "src/detours.h",
     ],
-    includes = ["src"],
-    visibility = ["//visibility:public"],
     defines = select({
         ":windows_arm64": ["_ARM64_"],
         ":windows_x86_64": ["_AMD64_"],
         "//conditions:default": [],
     }),
+    includes = ["src"],
     linkopts = select({
         "@platforms//os:windows": [
             "-DEFAULTLIB:dbghelp.lib",
         ],
         "//conditions:default": [],
     }),
+    visibility = ["//visibility:public"],
 )
