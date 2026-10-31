@@ -51,6 +51,7 @@ FLATBUFFERS_PATCHES = [
     "21-python-object-api-types-other-packages.patch",
     "22-add-rust-lockfile.patch",
     "23-flatc-keep-bfbs-comments.patch",
+    "24-cpp-floattostring-nan.patch",
 ]
 
 def _flatbuffers_impl(module_ctx):
