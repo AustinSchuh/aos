@@ -65,8 +65,7 @@ std::unique_ptr<ipc_lib::QueueMemory> ShmEventLoop::MakeQueueMemory(
   return std::make_unique<SharedMemoryMappedQueue>(
       ipc_lib::GetOrCreateMemoryMappedQueue(
           shm_base_,
-          static_cast<std::filesystem::perms>(
-              absl::GetFlag(FLAGS_permissions)),
+          static_cast<std::filesystem::perms>(absl::GetFlag(FLAGS_permissions)),
           configuration(), channel));
 }
 

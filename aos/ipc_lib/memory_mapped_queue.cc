@@ -36,6 +36,12 @@ class MemoryMappedQueueCache {
     auto &entry = cache_[path];
     auto existing = entry.lock();
     if (existing) {
+      // Every user shares this instance's config, so a second configuration
+      // with a different queue layout would otherwise silently get this one.
+      ABSL_CHECK(existing->config() == MakeQueueConfiguration(config, channel))
+          << ": " << path
+          << " is already mapped in this process with a different queue "
+             "configuration";
       return existing;
     }
     auto queue = std::make_shared<MemoryMappedQueue>(shm_base, permissions,
