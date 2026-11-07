@@ -129,11 +129,15 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
     if (enum_def->declaration_file() != nullptr) {
       decl_file = enum_def->declaration_file()->str();
     }
-    return {.ts_type = short_name, .declaration_file = decl_file, .field_comment = ""};
+    return {.ts_type = short_name,
+            .declaration_file = decl_file,
+            .field_comment = ""};
   }
 
   if (IsScalar(base_type)) {
-    return {.ts_type = ScalarTsType(base_type), .declaration_file = "", .field_comment = ""};
+    return {.ts_type = ScalarTsType(base_type),
+            .declaration_file = "",
+            .field_comment = ""};
   }
 
   if (base_type == reflection::BaseType::Obj) {
@@ -143,7 +147,9 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
     if (obj->declaration_file() != nullptr) {
       decl_file = obj->declaration_file()->str();
     }
-    return {.ts_type = short_name, .declaration_file = decl_file, .field_comment = ""};
+    return {.ts_type = short_name,
+            .declaration_file = decl_file,
+            .field_comment = ""};
   }
 
   if (base_type == reflection::BaseType::Union) {
@@ -156,8 +162,7 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
     const reflection::BaseType element_type = type->element();
     // For vectors, `type->index()` is the enum index when the element is an
     // enum, and -1 otherwise.
-    const bool element_is_enum =
-        IsScalar(element_type) && type->index() >= 0;
+    const bool element_is_enum = IsScalar(element_type) && type->index() >= 0;
 
     // [ubyte] (raw or enum-backed) is serialized as Uint8Array because
     // FlatBuffers packs a contiguous byte array.  When the element type is an
@@ -165,8 +170,7 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
     // self-documenting in the generated .ts file.
     if (element_type == reflection::BaseType::UByte) {
       if (element_is_enum) {
-        const reflection::Enum *enum_def =
-            schema->enums()->Get(type->index());
+        const reflection::Enum *enum_def = schema->enums()->Get(type->index());
         const std::string enum_name =
             ShortName(enum_def->name()->string_view());
         // No declaration_file is returned: the generated field is typed as
@@ -175,21 +179,24 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
         return {.ts_type = "Uint8Array",
                 .declaration_file = "",
                 .field_comment = "// Serialized as Uint8Array because the " +
-                                 enum_name + " enum's underlying type is `ubyte`."};
+                                 enum_name +
+                                 " enum's underlying type is `ubyte`."};
       }
-      return {.ts_type = "Uint8Array", .declaration_file = "", .field_comment = ""};
+      return {
+          .ts_type = "Uint8Array", .declaration_file = "", .field_comment = ""};
     }
 
     // Vectors of non-ubyte enums map to a regular TS array of the enum type.
     if (element_is_enum) {
       const reflection::Enum *enum_def = schema->enums()->Get(type->index());
-      const std::string enum_name =
-          ShortName(enum_def->name()->string_view());
+      const std::string enum_name = ShortName(enum_def->name()->string_view());
       std::string decl_file;
       if (enum_def->declaration_file() != nullptr) {
         decl_file = enum_def->declaration_file()->str();
       }
-      return {.ts_type = enum_name + "[]", .declaration_file = decl_file, .field_comment = ""};
+      return {.ts_type = enum_name + "[]",
+              .declaration_file = decl_file,
+              .field_comment = ""};
     }
 
     if (IsScalar(element_type)) {
@@ -199,7 +206,8 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
     }
 
     if (element_type == reflection::BaseType::String) {
-      return {.ts_type = "string[]", .declaration_file = "", .field_comment = ""};
+      return {
+          .ts_type = "string[]", .declaration_file = "", .field_comment = ""};
     }
 
     if (element_type == reflection::BaseType::Obj) {
@@ -209,10 +217,13 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
       if (obj->declaration_file() != nullptr) {
         decl_file = obj->declaration_file()->str();
       }
-      return {.ts_type = short_name + "[]", .declaration_file = decl_file, .field_comment = ""};
+      return {.ts_type = short_name + "[]",
+              .declaration_file = decl_file,
+              .field_comment = ""};
     }
 
-    return {.ts_type = "unknown[]", .declaration_file = "", .field_comment = ""};
+    return {
+        .ts_type = "unknown[]", .declaration_file = "", .field_comment = ""};
   }
 
   if (base_type == reflection::BaseType::UType) {
@@ -221,8 +232,6 @@ ResolvedType ResolveFieldType(const reflection::Schema *schema,
 
   return {.ts_type = "unknown", .declaration_file = "", .field_comment = ""};
 }
-
-
 
 // Determines the "base" file -- the .fbs file we're generating code for.
 std::string_view DetermineBaseFile(const reflection::Schema *schema,
@@ -281,37 +290,23 @@ std::map<std::string, std::string> ParseImportMappings(
   return result;
 }
 
-// Checks whether a declaration_file path matches a given fbs_path key,
-// accounting for possible prefixes like "//".
+// Returns true if path ends with suffix at a path component boundary, so
+// "//foo/data.fbs" ends with "data.fbs" but not with "a.fbs".
+bool EndsWithPathComponents(std::string_view path, std::string_view suffix) {
+  if (suffix.empty() || path.size() < suffix.size() ||
+      path.substr(path.size() - suffix.size()) != suffix) {
+    return false;
+  }
+  return path.size() == suffix.size() ||
+         path[path.size() - suffix.size() - 1] == '/';
+}
+
+// Checks whether a declaration_file path matches a given fbs_path key, allowing
+// either one to carry extra leading directories (e.g. flatc's "//" prefix).
 bool DeclarationFileMatches(std::string_view declaration_file,
                             std::string_view fbs_path) {
-  if (declaration_file == fbs_path) {
-    return true;
-  }
-  // Handle the case where declaration_file has a "//" prefix.
-  if (declaration_file.size() > 2 &&
-      declaration_file.substr(0, 2) == "//" &&
-      declaration_file.substr(2) == fbs_path) {
-    return true;
-  }
-  // Handle the case where fbs_path has a "//" prefix.
-  if (fbs_path.size() > 2 && fbs_path.substr(0, 2) == "//" &&
-      fbs_path.substr(2) == declaration_file) {
-    return true;
-  }
-  // Handle matching just the suffix (declaration_file ends with fbs_path).
-  if (declaration_file.size() > fbs_path.size() &&
-      declaration_file.substr(declaration_file.size() - fbs_path.size()) ==
-          fbs_path) {
-    return true;
-  }
-  // Handle the reverse (fbs_path ends with declaration_file).
-  if (fbs_path.size() > declaration_file.size() &&
-      fbs_path.substr(fbs_path.size() - declaration_file.size()) ==
-          declaration_file) {
-    return true;
-  }
-  return false;
+  return EndsWithPathComponents(declaration_file, fbs_path) ||
+         EndsWithPathComponents(fbs_path, declaration_file);
 }
 
 // Finds the import path for a declaration file, or returns empty if it's a
@@ -344,8 +339,7 @@ std::string GenerateTypeScript(const reflection::Schema *schema,
                                const std::vector<std::string> &imports) {
   const std::map<std::string, std::string> import_mappings =
       ParseImportMappings(imports);
-  const std::string_view base_file =
-      DetermineBaseFile(schema, base_file_name);
+  const std::string_view base_file = DetermineBaseFile(schema, base_file_name);
 
   std::ostringstream out;
   out << "// Auto-generated Foxglove-compatible TypeScript types.\n";

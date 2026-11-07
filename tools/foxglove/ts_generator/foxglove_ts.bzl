@@ -20,16 +20,16 @@ FoxgloveTsInfo = provider(
     doc = "Information about Foxglove TypeScript files generated for the " +
           "schemas owned by a single static_flatbuffer target.",
     fields = {
-        "ts_files": "list[File]: .ts files generated for this target's own " +
-                    "schemas (one per source .fbs).",
-        "transitive_ts_files": "depset[File]: this target's .ts files plus all " +
-                               "transitive generated .ts files.",
         "transitive_fbs_to_ts": "depset[struct]: (fbs_name, ts_import_path) " +
                                 "pairs for this target and all transitive deps. " +
                                 "Consumed by the aspect to emit --import flags " +
                                 "covering the full closure, because .fbs files " +
                                 "may reference types from transitively-included " +
                                 "schemas, not just their direct deps.",
+        "transitive_ts_files": "depset[File]: this target's .ts files plus all " +
+                               "transitive generated .ts files.",
+        "ts_files": "list[File]: .ts files generated for this target's own " +
+                    "schemas (one per source .fbs).",
     },
 )
 

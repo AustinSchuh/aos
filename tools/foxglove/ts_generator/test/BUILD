@@ -68,14 +68,14 @@ sh_test(
         "$(rootpaths :test_foxglove_ts)",
     ],
     data = [
+        "golden/com_github_foxglove_schemas__Pose_foxglove.ts",
+        "golden/com_github_foxglove_schemas__Quaternion_foxglove.ts",
+        "golden/com_github_foxglove_schemas__Vector3_foxglove.ts",
         "golden/tools_foxglove_ts_generator_test__external_dep_foxglove.ts",
         "golden/tools_foxglove_ts_generator_test__imported_foxglove.ts",
         "golden/tools_foxglove_ts_generator_test__multi_a_foxglove.ts",
         "golden/tools_foxglove_ts_generator_test__multi_b_foxglove.ts",
         "golden/tools_foxglove_ts_generator_test__test_foxglove.ts",
-        "golden/com_github_foxglove_schemas__Pose_foxglove.ts",
-        "golden/com_github_foxglove_schemas__Quaternion_foxglove.ts",
-        "golden/com_github_foxglove_schemas__Vector3_foxglove.ts",
         ":test_foxglove_ts",
     ],
 )
