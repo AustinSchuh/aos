@@ -1509,7 +1509,6 @@ TEST_F(MemoryMappedQueueTest, SecondMappingWritesDoNotFault) {
   ipc_lib::MemoryMappedQueue creator(shm_dir_, kPermissions, config_,
                                      big_channel_);
 
-  absl::SetFlag(&FLAGS_shm_hugepage_base, "");
   ipc_lib::MemoryMappedQueue reader(shm_dir_, kPermissions, config_,
                                     big_channel_);
 
