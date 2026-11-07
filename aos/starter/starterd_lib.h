@@ -31,10 +31,10 @@ const aos::Channel *StatusChannelForNode(const aos::Configuration *config,
 const aos::Channel *StarterRpcChannelForNode(const aos::Configuration *config,
                                              const aos::Node *node);
 
-// If --shm_hugepage_base is set, reserves enough huge pages
+// If the configuration sets shm_hugepage_base, reserves enough huge pages
 // (/proc/sys/vm/nr_hugepages) to back every queue readable on node whose size
-// is >= --shm_hugepage_threshold.  Must run as root, before the --user switch.
-// Dies if --shm_hugepage_base isn't on a hugetlbfs mount or the reservation
+// is >= shm_hugepage_threshold.  Must run as root, before the --user switch.
+// Dies if shm_hugepage_base isn't on a hugetlbfs mount or the reservation
 // can't be fully satisfied (after writing the original nr_hugepages back), so
 // starterd fails to start instead of running without huge pages.
 void ReserveHugePages(const aos::Configuration *config, const aos::Node *node);

@@ -6,23 +6,12 @@
 #include <mutex>
 #include <ostream>
 
-#include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "absl/strings/str_cat.h"
 #include "flatbuffers/string.h"
 
 #include "aos/ipc_lib/index.h"
-
-ABSL_FLAG(std::string, shm_hugepage_base, "",
-          "If non-empty, a directory on a hugetlbfs mount.  Queues whose "
-          "memory size is >= --shm_hugepage_threshold are created there "
-          "(backed by huge pages) and reached from --shm_base through a "
-          "symlink.  Only matters for the process that creates a queue file; "
-          "every other process follows the symlink and adapts.");
-ABSL_FLAG(size_t, shm_hugepage_threshold, 500 * 1024 * 1024,
-          "Queue memory size (bytes) at or above which a newly created queue "
-          "is backed by --shm_hugepage_base.");
 
 namespace aos::ipc_lib {
 
@@ -134,17 +123,17 @@ size_t HugePagesNeededForNode(const Configuration *config, const Node *node,
 namespace {
 
 // Returns the path on the hugetlbfs mount at which the queue file for channel
-// should be created, or an empty string when the queue should live directly
-// at the tmpfs path: large queues with a configured --shm_hugepage_base are
-// created on the hugetlbfs mount with a symlink left at the tmpfs path (see
-// WritableShmMapping); opening follows the symlink transparently either way.
-std::string HugePagePath(const Channel *channel, size_t size) {
-  const std::string hugepage_base = absl::GetFlag(FLAGS_shm_hugepage_base);
-  if (hugepage_base.empty() ||
-      size < absl::GetFlag(FLAGS_shm_hugepage_threshold)) {
+// lives, or an empty string when the queue lives directly at the tmpfs path:
+// with shm_hugepage_base configured, queues of at least shm_hugepage_threshold
+// bytes live on the hugetlbfs mount with a symlink at the tmpfs path (see
+// WritableShmMapping).
+std::string HugePagePath(const Configuration *config, const Channel *channel,
+                         size_t size) {
+  if (!config->has_shm_hugepage_base() ||
+      size < config->shm_hugepage_threshold()) {
     return "";
   }
-  return ShmPath(hugepage_base, channel);
+  return ShmPath(config->shm_hugepage_base()->string_view(), channel);
 }
 
 }  // namespace
@@ -157,10 +146,14 @@ MemoryMappedQueue::MemoryMappedQueue(std::string_view shm_base,
       writable_mapping_(
           ShmPath(shm_base, channel), ipc_lib::LocklessQueueMemorySize(config_),
           permissions,
-          HugePagePath(channel, ipc_lib::LocklessQueueMemorySize(config_))),
+          HugePagePath(config, channel,
+                       ipc_lib::LocklessQueueMemorySize(config_))),
       readonly_mapping_(ShmPath(shm_base, channel),
-                        ipc_lib::LocklessQueueMemorySize(config_),
-                        permissions) {
+                        ipc_lib::LocklessQueueMemorySize(config_), permissions,
+                        /*hugepages=*/
+                        !HugePagePath(config, channel,
+                                      ipc_lib::LocklessQueueMemorySize(config_))
+                             .empty()) {
   ipc_lib::InitializeLocklessQueueMemory(memory(), config_);
 }
 

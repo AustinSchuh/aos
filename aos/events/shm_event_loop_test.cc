@@ -47,8 +47,6 @@
 #include "aos/testing/tmpdir.h"
 #include "aos/util/file.h"
 
-ABSL_DECLARE_FLAG(std::string, shm_hugepage_base);
-ABSL_DECLARE_FLAG(size_t, shm_hugepage_threshold);
 ABSL_DECLARE_FLAG(std::string, aio_backend);
 
 namespace aos::testing {
@@ -1205,16 +1203,52 @@ TEST_P(ShmEventLoopTest, TwoThreadedEventLoopsShareCachedQueues) {
 
 #ifdef __linux__
 // hugetlbfs is Linux-only.
-// Two channels whose queue memory sizes straddle the threshold we install,
-// both sourced on (and so readable on) node1.  A tmpfs dir stands in for
-// hugetlbfs; MemoryMappedQueue logs a warning and treats the file as a normal
-// file, which is exactly what makes this testable.
+// Two channels whose queue memory sizes straddle the configured
+// shm_hugepage_threshold, both sourced on (and so readable on) node1.  A tmpfs
+// dir stands in for the hugetlbfs mount, which AllowHugePagesOffHugetlbfs-
+// ForTesting() permits; that is what makes this testable without one.
 class MemoryMappedQueueTest : public ::testing::Test {
  protected:
   MemoryMappedQueueTest()
-      : fbs_config_(aos::JsonToFlatbuffer<Configuration>(absl::StrFormat(
-            R"json({
-  "channel_storage_duration": 1000000000,
+      : shm_dir_(absl::StrCat(TestTmpDir(), "/mmq_shm")),
+        huge_dir_(absl::StrCat(TestTmpDir(), "/mmq_huge")),
+        big_memory_size_(QueueMemorySize(MakeConfig("", 0), "/big")),
+        small_memory_size_(QueueMemorySize(MakeConfig("", 0), "/small")),
+        // Above the small queue, at or below the big one.
+        threshold_((small_memory_size_ + big_memory_size_) / 2),
+        fbs_config_(MakeConfig(huge_dir_, threshold_)),
+        config_(&fbs_config_.message()),
+        node1_(configuration::GetNode(config_, "node1")),
+        big_channel_(configuration::GetChannel(config_, "/big", ".aos.test", "",
+                                               node1_)),
+        small_channel_(configuration::GetChannel(config_, "/small", ".aos.test",
+                                                 "", node1_)) {
+    mkdir(shm_dir_.c_str(), 0777);
+    mkdir(huge_dir_.c_str(), 0777);
+    ipc_lib::AllowHugePagesOffHugetlbfsForTesting(true);
+  }
+
+  ~MemoryMappedQueueTest() override {
+    ipc_lib::AllowHugePagesOffHugetlbfsForTesting(false);
+    aos::util::UnlinkRecursive(shm_dir_);
+    aos::util::UnlinkRecursive(huge_dir_);
+  }
+
+  // Returns the configuration, with shm_hugepage_base and
+  // shm_hugepage_threshold set unless huge_dir is empty.
+  static FlatbufferDetachedBuffer<Configuration> MakeConfig(
+      std::string_view huge_dir, size_t threshold) {
+    std::string hugepage_fields;
+    if (!huge_dir.empty()) {
+      hugepage_fields = absl::StrFormat(
+          R"json(  "shm_hugepage_base": "%s",
+  "shm_hugepage_threshold": %d,
+)json",
+          huge_dir, threshold);
+    }
+    return aos::JsonToFlatbuffer<Configuration>(absl::StrFormat(
+        R"json({
+%s  "channel_storage_duration": 1000000000,
   "channels": [
     {
       "name": "/big",
@@ -1235,32 +1269,17 @@ class MemoryMappedQueueTest : public ::testing::Test {
     { "name": "node1" }
   ]
 })json",
-            kBigSize, kFrequency, kSmallSize, kFrequency))),
-        config_(&fbs_config_.message()),
-        node1_(configuration::GetNode(config_, "node1")),
-        big_channel_(configuration::GetChannel(config_, "/big", ".aos.test", "",
-                                               node1_)),
-        small_channel_(configuration::GetChannel(config_, "/small", ".aos.test",
-                                                 "", node1_)),
-        big_memory_size_(ipc_lib::LocklessQueueMemorySize(
-            ipc_lib::MakeQueueConfiguration(config_, big_channel_))),
-        small_memory_size_(ipc_lib::LocklessQueueMemorySize(
-            ipc_lib::MakeQueueConfiguration(config_, small_channel_))),
-        shm_dir_(absl::StrCat(TestTmpDir(), "/mmq_shm")),
-        huge_dir_(absl::StrCat(TestTmpDir(), "/mmq_huge")) {
-    mkdir(shm_dir_.c_str(), 0777);
-    mkdir(huge_dir_.c_str(), 0777);
-    absl::SetFlag(&FLAGS_shm_hugepage_base, huge_dir_);
-    // Above the small queue, at or below the big one.
-    absl::SetFlag(&FLAGS_shm_hugepage_threshold,
-                  (small_memory_size_ + big_memory_size_) / 2);
+        hugepage_fields, kBigSize, kFrequency, kSmallSize, kFrequency));
   }
 
-  ~MemoryMappedQueueTest() override {
-    absl::SetFlag(&FLAGS_shm_hugepage_base, "");
-    absl::SetFlag(&FLAGS_shm_hugepage_threshold, 500 * 1024 * 1024);
-    aos::util::UnlinkRecursive(shm_dir_);
-    aos::util::UnlinkRecursive(huge_dir_);
+  static size_t QueueMemorySize(
+      const FlatbufferDetachedBuffer<Configuration> &config,
+      std::string_view name) {
+    const Channel *channel = configuration::GetChannel(
+        &config.message(), name, ".aos.test", "",
+        configuration::GetNode(&config.message(), "node1"));
+    return ipc_lib::LocklessQueueMemorySize(
+        ipc_lib::MakeQueueConfiguration(&config.message(), channel));
   }
 
   static long MinorFaults() {
@@ -1275,18 +1294,21 @@ class MemoryMappedQueueTest : public ::testing::Test {
   static constexpr size_t kSmallSize = 100;
   static constexpr size_t kFrequency = 100;
 
+  const std::string shm_dir_;
+  const std::string huge_dir_;
+  const size_t big_memory_size_;
+  const size_t small_memory_size_;
+  const size_t threshold_;
   FlatbufferDetachedBuffer<Configuration> fbs_config_;
   const Configuration *config_;
   const aos::Node *node1_;
   const aos::Channel *big_channel_;
   const aos::Channel *small_channel_;
-  const size_t big_memory_size_;
-  const size_t small_memory_size_;
-  const std::string shm_dir_;
-  const std::string huge_dir_;
 };
 
-// A queue above the threshold is created under --shm_hugepage_base and the
+using MemoryMappedQueueDeathTest = MemoryMappedQueueTest;
+
+// A queue above the threshold is created under shm_hugepage_base and the
 // shm_base path becomes a symlink to it.
 TEST_F(MemoryMappedQueueTest, LargeQueueCreatedUnderHugepageBase) {
   ipc_lib::MemoryMappedQueue queue(shm_dir_, kPermissions, config_,
@@ -1310,13 +1332,12 @@ TEST_F(MemoryMappedQueueTest, LargeQueueCreatedUnderHugepageBase) {
   EXPECT_EQ(static_cast<size_t>(st.st_size), big_memory_size_);
 }
 
-// A second MemoryMappedQueue with --shm_hugepage_base empty opens the same
-// channel through the symlink and shares the memory.
+// A second MemoryMappedQueue opens the same channel through the symlink and
+// shares the memory.
 TEST_F(MemoryMappedQueueTest, SecondQueueFollowsSymlink) {
   ipc_lib::MemoryMappedQueue creator(shm_dir_, kPermissions, config_,
                                      big_channel_);
 
-  absl::SetFlag(&FLAGS_shm_hugepage_base, "");
   ipc_lib::MemoryMappedQueue reader(shm_dir_, kPermissions, config_,
                                     big_channel_);
 
@@ -1337,9 +1358,10 @@ TEST_F(MemoryMappedQueueTest, SmallQueueStaysOnShmBase) {
   EXPECT_EQ(stat(ipc_lib::ShmPath(huge_dir_, small_channel_).c_str(), &st), -1);
 }
 
-// A regular file already at the shm path wins over the hugepage base: the
-// queue opens it and no symlink is left behind.
-TEST_F(MemoryMappedQueueTest, ExistingRegularFileWins) {
+// A regular file already at the shm path of a queue that should be backed by
+// huge pages is refused, rather than run on, and no orphan is left on the
+// hugetlbfs mount.
+TEST_F(MemoryMappedQueueDeathTest, ExistingRegularFileDies) {
   const std::string path = ipc_lib::ShmPath(shm_dir_, big_channel_);
   util::MkdirP(path, kPermissions);
   int fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL,
@@ -1348,18 +1370,30 @@ TEST_F(MemoryMappedQueueTest, ExistingRegularFileWins) {
   ASSERT_EQ(ftruncate(fd, big_memory_size_), 0);
   ASSERT_EQ(close(fd), 0);
 
-  ipc_lib::MemoryMappedQueue queue(shm_dir_, kPermissions, config_,
-                                   big_channel_);
+  EXPECT_DEATH(
+      {
+        ipc_lib::MemoryMappedQueue queue(shm_dir_, kPermissions, config_,
+                                         big_channel_);
+      },
+      "should be a symlink to");
 
   struct stat st;
   ASSERT_EQ(lstat(path.c_str(), &st), 0);
   EXPECT_TRUE(S_ISREG(st.st_mode)) << path << " was replaced by a symlink";
-  // The hugetlbfs file we created before losing the race must be unlinked,
-  // not orphaned.
   const std::string hugepages_path = ipc_lib::ShmPath(huge_dir_, big_channel_);
   EXPECT_EQ(lstat(hugepages_path.c_str(), &st), -1)
       << "orphan left at " << hugepages_path;
-  queue.GetMutableSharedMemory()[big_memory_size_ - 8] = 7;
+}
+
+// A shm_hugepage_base that isn't on hugetlbfs is refused.
+TEST_F(MemoryMappedQueueDeathTest, NotOnHugetlbfsDies) {
+  ipc_lib::AllowHugePagesOffHugetlbfsForTesting(false);
+  EXPECT_DEATH(
+      {
+        ipc_lib::MemoryMappedQueue queue(shm_dir_, kPermissions, config_,
+                                         big_channel_);
+      },
+      "is not on hugetlbfs");
 }
 
 // HugePagesNeededForNode counts only queues at or above the threshold.
@@ -1381,7 +1415,7 @@ TEST_F(MemoryMappedQueueTest, HugePagesNeededForNodeCountsLargeQueues) {
 
 // Many MemoryMappedQueues, constructed directly (not through the cache) so
 // each does its own open/ftruncate/symlink the way separate processes would,
-// race to create the same large queue under --shm_hugepage_base.  Exactly one
+// race to create the same large queue under shm_hugepage_base.  Exactly one
 // hugepage file and one symlink must result and every queue must share the
 // same memory.
 TEST_F(MemoryMappedQueueTest, ParallelCreationOfLargeQueueSharesMemory) {

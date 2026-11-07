@@ -50,9 +50,6 @@ ABSL_FLAG(uint32_t, queue_initialization_threads, 0,
           "Number of threads to spin up to initialize the queue.  0 means "
           "use the main thread.");
 ABSL_DECLARE_FLAG(bool, enable_ftrace);
-// Defined in memory_mapped_queue.cc.
-ABSL_DECLARE_FLAG(std::string, shm_hugepage_base);
-ABSL_DECLARE_FLAG(size_t, shm_hugepage_threshold);
 ABSL_FLAG(double, starterd_shutdown_timeout, 1.5,
           "Time, in seconds, to wait for everything to shut down when starterd "
           "is cleaning up. When running with large numbers of processes, you "
@@ -95,25 +92,25 @@ const aos::Channel *StarterRpcChannelForNode(const aos::Configuration *config,
 }
 
 void ReserveHugePages(const aos::Configuration *config, const aos::Node *node) {
-  const std::string &base = absl::GetFlag(FLAGS_shm_hugepage_base);
-  if (base.empty()) {
+  if (!config->has_shm_hugepage_base()) {
     return;
   }
+  const std::string base = config->shm_hugepage_base()->str();
 
   struct statfs sfs;
   ABSL_PCHECK(statfs(base.c_str(), &sfs) == 0)
-      << ": --shm_hugepage_base " << base << " is not accessible";
-  ABSL_CHECK_EQ(sfs.f_type, static_cast<long>(HUGETLBFS_MAGIC))
-      << ": --shm_hugepage_base " << base << " is not on a hugetlbfs mount";
+      << ": shm_hugepage_base " << base << " is not accessible";
+  ABSL_CHECK(sfs.f_type == static_cast<decltype(sfs.f_type)>(HUGETLBFS_MAGIC))
+      << ": shm_hugepage_base " << base << " is not on a hugetlbfs mount";
   const size_t huge_page_size = sfs.f_bsize;
 
   const size_t needed = aos::ipc_lib::HugePagesNeededForNode(
-      config, node, absl::GetFlag(FLAGS_shm_hugepage_threshold),
-      huge_page_size);
+      config, node, config->shm_hugepage_threshold(), huge_page_size);
 
   ABSL_CHECK(EnsureHugePages(needed))
-      << ": Failed to reserve " << needed << " huge pages for queues >= "
-      << absl::GetFlag(FLAGS_shm_hugepage_threshold) << " bytes under " << base;
+      << ": Failed to reserve " << needed
+      << " huge pages for queues >= " << config->shm_hugepage_threshold()
+      << " bytes under " << base;
   ABSL_LOG(INFO) << "Reserved " << needed << " huge pages ("
                  << (needed * huge_page_size >> 20)
                  << " MiB) for large shm queues; nr_hugepages="

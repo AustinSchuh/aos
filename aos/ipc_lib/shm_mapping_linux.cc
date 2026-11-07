@@ -25,6 +25,12 @@ long SystemPageSize() { return sysconf(_SC_PAGESIZE); }
 
 namespace {
 
+std::atomic<bool> allow_hugepages_off_hugetlbfs{false};
+
+bool IsHugetlbfs(const struct statfs &fs) {
+  return fs.f_type == static_cast<decltype(fs.f_type)>(HUGETLBFS_MAGIC);
+}
+
 constexpr size_t RoundUp(size_t value, size_t multiple) {
   return (value + multiple - 1) / multiple * multiple;
 }
@@ -53,8 +59,8 @@ void WaitForQueueFileSize(int fd, const std::string &path,
 
 // Opens the queue file at hugepage_path, creating it (O_EXCL, sized to size
 // rounded up to the huge page size) if it doesn't exist yet, and symlinks it
-// at path.  Returns an fd whose file already has its final size, or -1 if
-// path is occupied by something else the caller should open instead.
+// at path.  Returns an fd whose file already has its final size.  Dies if
+// path is occupied by anything other than that symlink.
 int OpenHugePageQueueFile(const std::string &path,
                           const std::string &hugepage_path,
                           std::filesystem::perms permissions, size_t size) {
@@ -72,12 +78,11 @@ int OpenHugePageQueueFile(const std::string &path,
   struct statfs fs;
   ABSL_PCHECK(fstatfs(fd, &fs) == 0);
   size_t create_size = size;
-  if (fs.f_type == static_cast<decltype(fs.f_type)>(HUGETLBFS_MAGIC)) {
+  if (IsHugetlbfs(fs)) {
     create_size = RoundUp(size, static_cast<size_t>(fs.f_bsize));
   } else {
-    ABSL_LOG(WARNING) << hugepage_path
-                      << " is not on hugetlbfs; creating queue as a normal "
-                         "file";
+    ABSL_CHECK(allow_hugepages_off_hugetlbfs.load())
+        << ": " << hugepage_path << " is not on hugetlbfs";
   }
   if (created_hugepage_file) {
     // ftruncate before the symlink below so no reader can ever see a
@@ -95,10 +100,10 @@ int OpenHugePageQueueFile(const std::string &path,
   }
   // Something already occupies path.  If it's a symlink to the hugetlbfs
   // file (the normal stack-restart case), keep it and return the fd: it
-  // already has its final size, so the caller must not wait on it again.  Any
-  // other occupant wins: if we created the hugetlbfs file just now nothing
-  // references it, so remove it rather than leave an orphan on the hugetlbfs
-  // mount, then close fd and let the caller open path itself.
+  // already has its final size.  Anything else means this queue isn't backed
+  // by huge pages, which we refuse to run with.  If we created the hugetlbfs
+  // file just now nothing references it, so remove it rather than leave an
+  // orphan on the hugetlbfs mount.
   struct stat lst;
   if (lstat(path.c_str(), &lst) == 0 && S_ISLNK(lst.st_mode)) {
     char target[PATH_MAX];
@@ -112,8 +117,10 @@ int OpenHugePageQueueFile(const std::string &path,
     ABSL_PCHECK(unlink(hugepage_path.c_str()) == 0)
         << ": Failed to remove orphaned " << hugepage_path;
   }
-  ABSL_PCHECK(close(fd) == 0);
-  return -1;
+  ABSL_LOG(FATAL) << path << " should be a symlink to " << hugepage_path
+                  << ", but something else is already there.  Clear out "
+                     "--shm_base (e.g. starterd --purge_shm_base) to recreate "
+                     "it.";
 }
 
 struct MappedRegion {
@@ -123,9 +130,11 @@ struct MappedRegion {
   size_t mapped_size;
 };
 
+// If hugepages is set, the file must be on hugetlbfs.  hugepage_path is where
+// a writer creates it when it doesn't exist yet; readers never create it.
 MappedRegion MapShm(std::string_view path, size_t size,
                     std::filesystem::perms permissions, bool writable,
-                    std::string_view hugepage_path) {
+                    bool hugepages, std::string_view hugepage_path) {
   std::string path_str(path);
   util::MkdirP(path_str, permissions);
 
@@ -134,12 +143,11 @@ MappedRegion MapShm(std::string_view path, size_t size,
   if (writable && !hugepage_path.empty()) {
     // Large queues can be backed by huge pages: the file is created on a
     // hugetlbfs mount at hugepage_path with a symlink left at path; everyone
-    // else follows the symlink transparently.  The returned fd (if any)
-    // already has its final size.
+    // else follows the symlink transparently.  The returned fd already has
+    // its final size.
     fd = OpenHugePageQueueFile(path_str, std::string(hugepage_path),
                                permissions, size);
-  }
-  if (fd == -1) {
+  } else {
     if (writable) {
       // Two cases: either the file doesn't exist yet and we create it, or it
       // already exists.  Try to create it exclusively first; if that races
@@ -167,8 +175,11 @@ MappedRegion MapShm(std::string_view path, size_t size,
   // the page-fault loops below must step by that page size.
   struct statfs fs;
   ABSL_PCHECK(fstatfs(fd, &fs) == 0);
-  const bool on_hugetlbfs =
-      (fs.f_type == static_cast<decltype(fs.f_type)>(HUGETLBFS_MAGIC));
+  const bool on_hugetlbfs = IsHugetlbfs(fs);
+  ABSL_CHECK(!hugepages || on_hugetlbfs || allow_hugepages_off_hugetlbfs.load())
+      << ": " << path_str
+      << " should be backed by hugetlbfs, but isn't.  Clear out --shm_base "
+         "(e.g. starterd --purge_shm_base) to recreate it.";
   const size_t mapped_size =
       on_hugetlbfs ? RoundUp(size, static_cast<size_t>(fs.f_bsize)) : size;
   const long page_size =
@@ -217,12 +228,17 @@ MappedRegion MapShm(std::string_view path, size_t size,
 
 }  // namespace
 
+void AllowHugePagesOffHugetlbfsForTesting(bool allow) {
+  allow_hugepages_off_hugetlbfs.store(allow);
+}
+
 WritableShmMapping::WritableShmMapping(std::string_view path, size_t size,
                                        std::filesystem::perms permissions,
                                        std::string_view hugepage_path)
     : size_(size) {
   const MappedRegion region =
-      MapShm(path, size, permissions, /*writable=*/true, hugepage_path);
+      MapShm(path, size, permissions, /*writable=*/true,
+             /*hugepages=*/!hugepage_path.empty(), hugepage_path);
   data_ = region.data;
   mapped_size_ = region.mapped_size;
 }
@@ -232,10 +248,11 @@ WritableShmMapping::~WritableShmMapping() {
 }
 
 ReadOnlyShmMapping::ReadOnlyShmMapping(std::string_view path, size_t size,
-                                       std::filesystem::perms permissions)
+                                       std::filesystem::perms permissions,
+                                       bool hugepages)
     : size_(size) {
-  const MappedRegion region =
-      MapShm(path, size, permissions, /*writable=*/false, {});
+  const MappedRegion region = MapShm(path, size, permissions,
+                                     /*writable=*/false, hugepages, {});
   data_ = region.data;
   mapped_size_ = region.mapped_size;
 }
