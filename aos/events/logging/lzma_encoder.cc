@@ -9,7 +9,7 @@ ABSL_FLAG(int32_t, lzma_threads, 1, "Number of threads to use for encoding");
 ABSL_FLAG(
     int32_t, lzma_decoder_queue_size, 8,
     "Number of 256 KiB buffers each threaded LZMA decoder decompresses ahead "
-    "of its reader. Raise it when individual messages are larger than the "
+    "of its reader.  Raise it when individual messages are larger than the "
     "read-ahead, so the reader doesn't wait on decompression for each one.");
 
 namespace aos::logger {
@@ -353,10 +353,6 @@ ThreadedLzmaDecoder::ThreadedLzmaDecoder(
               break;
             }
           }
-
-          // Notify main thread in case it was waiting for us to queue more
-          // data.
-          queue_filled_.notify_one();
         }
       }) {}
 
