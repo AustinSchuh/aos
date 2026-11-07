@@ -62,7 +62,8 @@ int UnwindTheStack(void **result, int *sizes, int max_depth, int skip_count,
 #if __has_feature(memory_sanitizer)
         // It seems that the libunwind we get from the toolchain either isn't
         // compiled with msan or there's a real issue there.
-        // TODO(philipp.schrader): Investigate, fix, and remove the unpoison call here.
+        // TODO(philipp.schrader): Investigate, fix, and remove the unpoison
+        // call here.
         __msan_unpoison(&ip, sizeof(ip));
 #endif
         result[result_count] = reinterpret_cast<void *>(ip);

@@ -5,6 +5,7 @@
 #include "gtest/gtest.h"
 
 #include "aos/realtime.h"
+#include "aos/sanitizers.h"
 
 namespace aos::testing {
 
@@ -76,6 +77,10 @@ TEST(StacktraceDeathTest, StackTraceOnCrash) {
 
 // Tests that we get a useful stacktrace on a segfault.
 TEST(StacktraceDeathTest, StackTraceOnSegfault) {
+#ifndef AOS_LIBUNWIND_STACK_TRACES
+  GTEST_SKIP() << "absl's default unwinder can't get out of the signal "
+                  "handler; build with --//aos:libunwind_stack_traces";
+#endif
   g_function = [] { ABSL_CHECK_EQ(raise(SIGSEGV), 0); };
 
   // NOTE(james): Depending on the platform this runs on, we sometimes get
@@ -101,10 +106,14 @@ TEST(StacktraceDeathTest, StackTraceOnSegfault) {
 
 // Malloc hooks don't work with asan/msan. So we cannot trigger a crash in those
 // configurations.
-#if !__has_feature(address_sanitizer) && !__has_feature(memory_sanitizer)
+#if !defined(AOS_SANITIZE_ADDRESS) && !defined(AOS_SANITIZE_MEMORY)
 
 // Tests that we get a useful stacktrace on a malloc.
 TEST(StacktraceDeathTest, StackTraceOnMalloc) {
+#ifndef AOS_LIBUNWIND_STACK_TRACES
+  GTEST_SKIP() << "absl's default unwinder can't get out of the signal "
+                  "handler; build with --//aos:libunwind_stack_traces";
+#endif
   g_function = [] {
     ScopedRealtime rt;
     volatile int *a = new int[3];

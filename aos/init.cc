@@ -28,7 +28,7 @@
 #include "absl/log/globals.h"
 #include "absl/log/initialize.h"
 
-#ifdef __linux__
+#ifdef AOS_LIBUNWIND_STACK_TRACES
 #include "aos/init_stack_unwinder.h"
 #endif
 #include "aos/ipc_lib/aos_sync.h"
@@ -105,7 +105,7 @@ void InitGoogleLocked(int *argc, char ***argv, const InitOptions &options) {
     absl::InitializeLog();
   }
 
-#ifdef __linux__
+#ifdef AOS_LIBUNWIND_STACK_TRACES
   // Switch to our own unwinder.  absl's default one has trouble getting out
   // of signal handlers.
   InitStackUnwinder();

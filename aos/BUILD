@@ -1,6 +1,7 @@
 load("@aos//aos/flatbuffers:cc.bzl", "flatbuffer_cc_library")
 load("@aos//aos/flatbuffers:python.bzl", "flatbuffer_py_library")
 load("@aos//aos/flatbuffers:ts.bzl", "flatbuffer_ts_library")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -189,7 +190,13 @@ cc_library(
         "init.h",
     ],
     implementation_deps = select({
-        "@platforms//os:linux": [":init_stack_unwinder"],
+        ":libunwind_stack_traces_arm64": [":init_stack_unwinder"],
+        ":libunwind_stack_traces_k8": [":init_stack_unwinder"],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        ":libunwind_stack_traces_arm64": ["AOS_LIBUNWIND_STACK_TRACES"],
+        ":libunwind_stack_traces_k8": ["AOS_LIBUNWIND_STACK_TRACES"],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],
@@ -326,13 +333,47 @@ cc_test(
         "stacktrace_test.cc",
     ],
     copts = ["-Wno-error=attributes"],
+    local_defines = select({
+        ":libunwind_stack_traces_arm64": ["AOS_LIBUNWIND_STACK_TRACES"],
+        ":libunwind_stack_traces_k8": ["AOS_LIBUNWIND_STACK_TRACES"],
+        "//conditions:default": [],
+    }),
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":realtime",
+        ":sanitizers",
         "//aos/testing:googletest",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
     ],
+)
+
+# Has InitGoogle() install a libunwind-based stack unwinder.  Off by default:
+# libunwind comes from the dev-only @llvm_* toolchain repositories, so modules
+# that depend on AOS (wpilib, for one) can't build it.  AOS's .bazelrc turns it
+# on.
+bool_flag(
+    name = "libunwind_stack_traces",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "libunwind_stack_traces_k8",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    flag_values = {":libunwind_stack_traces": "True"},
+)
+
+config_setting(
+    name = "libunwind_stack_traces_arm64",
+    constraint_values = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:linux",
+    ],
+    flag_values = {":libunwind_stack_traces": "True"},
 )
 
 cc_library(

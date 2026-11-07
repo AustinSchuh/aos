@@ -28,6 +28,9 @@ build --noincompatible_disable_nocopts
 # Use the malloc we want.
 build --custom_malloc=//tools/cpp:malloc
 
+# Unwind stack traces with libunwind (see //aos:libunwind_stack_traces).
+build --//aos:libunwind_stack_traces
+
 # Shortcuts for selecting the target platform.
 build:k8 --platforms=//tools/platforms:linux_x86
 build:k8_no_gpu --platforms=//tools/platforms:linux_x86_no_gpu
