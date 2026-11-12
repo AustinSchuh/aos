@@ -147,13 +147,15 @@ int main(int argc, char **argv) {
           "tegra_acceleration=%d mjpeg_decode=%d",
           static_cast<int>(cinfo.tegra_acceleration),
           static_cast<int>(cinfo.mjpeg_decode));
-      if (cinfo.jpegTegraMgr != nullptr) {
-        ABSL_LOG(INFO) << "jpegTegraMgr: buff[0]="
-                       << static_cast<void *>(cinfo.jpegTegraMgr->buff[0])
-                       << " pitch[0]=" << cinfo.jpegTegraMgr->pitch[0]
-                       << " mcu_type=" << cinfo.jpegTegraMgr->mcu_type;
+      // libjpeg-9f keeps the Tegra manager behind a void pointer.
+      const jpeg_mgr *mgr = static_cast<const jpeg_mgr *>(cinfo.jpegMgr);
+      if (mgr != nullptr) {
+        ABSL_LOG(INFO) << "jpegMgr: buff[0]="
+                       << static_cast<void *>(mgr->buff[0])
+                       << " pitch[0]=" << mgr->pitch[0]
+                       << " mcu_type=" << mgr->mcu_type;
       } else {
-        ABSL_LOG(INFO) << "jpegTegraMgr: null";
+        ABSL_LOG(INFO) << "jpegMgr: null";
       }
     }
 

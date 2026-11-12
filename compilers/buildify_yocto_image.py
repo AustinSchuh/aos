@@ -5,18 +5,42 @@ import sys
 import unicodedata
 import datetime
 import os
+import re
 import subprocess
+import tempfile
 from absl import app
 from absl import flags
 
 from rootfs_utils import scoped_tmpdir_tegraflash_rootfs, Filesystem, check_required_deps, check_buildifier, scoped_mount, generate_build_file, write_registry_overlay
 
-REQUIRED_DEPS = ["xfsprogs"]
+FLAGS = flags.FLAGS
+flags.DEFINE_string(
+    'yocto_downloads', None,
+    'Yocto DL_DIR, if it is not build/downloads under the yocto checkout.')
+
+REQUIRED_DEPS = ["xfsprogs", "zstd"]
+
+CUDA = "cuda-13.2"
+
+
+def installed_version(partition, package):
+    """Returns the upstream version of a package installed in the image.
+
+    Yocto appends its own revision (-r0) to the version it packaged.
+    """
+    with open(os.path.join(partition, "var/lib/dpkg/status")) as f:
+        for stanza in f.read().split("\n\n"):
+            fields = dict(
+                line.split(": ", 1) for line in stanza.splitlines()
+                if ": " in line and not line.startswith(" "))
+            if fields.get("Package") == package:
+                return re.sub(r"-r[0-9]+$", "", fields["Version"])
+    raise ValueError(f"{package} is not installed in the image")
 
 
 def do_package(yocto_root, partition):
     tarball = datetime.date.today().strftime(
-        f"{os.getcwd()}/%Y-%m-%d-walnascar-arm64-nvidia-rootfs.tar")
+        f"{os.getcwd()}/%Y-%m-%d-wrynose-arm64-nvidia-rootfs.tar")
     print(tarball, file=sys.stderr)
 
     subprocess.run([
@@ -33,14 +57,16 @@ def do_package(yocto_root, partition):
         "--exclude=./usr/src",
         "--exclude=./usr/lib/mesa-diverted",
         "--exclude=./usr/bin/X11",
-        "--exclude=./usr/lib/systemd/system/system-systemd*cryptsetup.slice",
+        "--exclude=./usr/lib/systemd/system/system-systemd*.slice",
         "--exclude=./dev",
-        "--exclude=./usr/local/cuda-12.6/bin/fatbinary",
-        "--exclude=./usr/local/cuda-12.6/bin/ptxas",
-        "--exclude=./usr/local/cuda-12.6/include/thrust",
-        "--exclude=./usr/local/cuda-12.6/include/nv",
-        "--exclude=./usr/local/cuda-12.6/include/cuda",
-        "--exclude=./usr/local/cuda-12.6/include/cub",
+        f"--exclude=./usr/local/{CUDA}/bin/fatbinary",
+        f"--exclude=./usr/local/{CUDA}/bin/ptxas",
+        f"--exclude=./usr/local/{CUDA}/bin/nvlink",
+        f"--exclude=./usr/local/{CUDA}/bin/bin2c",
+        f"--exclude=./usr/local/{CUDA}/include/thrust",
+        f"--exclude=./usr/local/{CUDA}/include/nv",
+        f"--exclude=./usr/local/{CUDA}/include/cuda",
+        f"--exclude=./usr/local/{CUDA}/include/cub",
         "--exclude=./usr/include/cub",
         "--exclude=./usr/include/nv",
         "--exclude=./usr/include/thrust",
@@ -53,36 +79,46 @@ def do_package(yocto_root, partition):
                    cwd=partition,
                    check=True)
 
-    # Pull ptxas and fatbinary from yocto.
-    # Note, we need to use the downloaded but unmodified ones, otherwise yocto
-    # modifies the binary and bakes paths in.
-    #
-    # To find the right binaries, run in build/tmp in yocto:
-    #  (for line in $(find | grep ptxas$); do echo $line; file $line; ldd $line; done)
-    cuda_bin = os.path.join(
-        yocto_root,
-        "build/tmp/work/x86_64-linux/cuda-nvcc-headers-native/12.6.68-1/cuda-nvcc-headers-12.6.68-1/usr/local/cuda-12.6/bin"
-    )
+    # Pull the host (x86_64) CUDA tools from yocto.  The ones in the image are
+    # aarch64, and the ones yocto installs into its native sysroot have paths
+    # baked into them, so extract them from the .deb yocto downloaded, at the
+    # version the image has.
+    nvcc = "cuda-nvcc-" + CUDA.removeprefix("cuda-").replace(".", "-")
+    cuda_deb = os.path.join(
+        FLAGS.yocto_downloads or os.path.join(yocto_root, "build/downloads"),
+        f"{nvcc}_{installed_version(partition, 'cuda-nvcc')}_amd64.deb")
+    with tempfile.TemporaryDirectory() as cuda_dir:
+        subprocess.run(["dpkg-deb", "-x", cuda_deb, cuda_dir], check=True)
+        cuda_bin = os.path.join(cuda_dir, f"usr/local/{CUDA}/bin")
 
-    subprocess.run([
-        "sudo",
-        "tar",
-        "--sort=name",
-        "--mtime=0",
-        "--owner=0",
-        "--group=0",
-        "--numeric-owner",
-        f'--transform=s|{cuda_bin[1:]}/ptxas|usr/local/cuda-12.6/bin/ptxas|',
-        f'--transform=s|{cuda_bin[1:]}/fatbinary|usr/local/cuda-12.6/bin/aarch64-unknown-linux-gnu-fatbinary|',
-        "--append",
-        "-f",
-        tarball,
-        os.path.join(cuda_bin, "ptxas"),
-        os.path.join(cuda_bin, "fatbinary"),
-    ],
-                   check=True)
+        subprocess.run([
+            "sudo",
+            "tar",
+            "--sort=name",
+            "--mtime=0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            f'--transform=s|{cuda_bin[1:]}/fatbinary|usr/local/{CUDA}/bin/aarch64-unknown-linux-gnu-fatbinary|',
+            f'--transform=s|{cuda_bin[1:]}/|usr/local/{CUDA}/bin/|',
+            "--append",
+            "-f",
+            tarball,
+            os.path.join(cuda_bin, "ptxas"),
+            os.path.join(cuda_bin, "fatbinary"),
+            os.path.join(cuda_bin, "nvlink"),
+            os.path.join(cuda_bin, "bin2c"),
+        ],
+                       check=True)
 
-    subprocess.run(["sha256sum", tarball], check=True)
+    # Most of the sysroot is CUDA and TensorRT libraries which only compress
+    # well with a long window.  128 MiB is the largest window zstd decodes
+    # without being told to, which is all Bazel 8 will do in WORKSPACE mode.
+    subprocess.run(
+        ["zstd", "--rm", "-f", "-T0", "--ultra", "-21", "--long=27", tarball],
+        check=True)
+
+    subprocess.run(["sha256sum", tarball + ".zst"], check=True)
 
 
 def main(argv):
@@ -98,9 +134,8 @@ def main(argv):
         return 1
 
     full_image = os.path.join(
-        argv[1],
-        "build/demo-image-base-p3768-0000-p3767-0003.rootfs.tegraflash.tar.zst"
-    )
+        argv[1], "build/tmp/deploy/images/p3768-0000-p3767-0003",
+        "demo-image-base-p3768-0000-p3767-0003.rootfs.tegraflash-tar.zst")
 
     if not check_buildifier():
         print(
@@ -155,7 +190,7 @@ def main(argv):
 
             # TODO(austin): We will need to make new module versions each time we make a new sysroot.
             write_registry_overlay(
-                "../registry/modules/arm64_debian_sysroot/2025.10.25",
+                "../registry/modules/arm64_debian_sysroot/2026.11.12",
                 generate_build_file(filesystem, packages_to_eval,
                                     "orin_debian_rootfs.BUILD.template"))
 

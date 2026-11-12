@@ -110,7 +110,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = select({
         "//tools:arm64_macos": [":unavailable"],
-        "//tools:cpu_arm64": ["@arm64_debian_sysroot//:cudart-12.6"],
+        "//tools:cpu_arm64": ["@arm64_debian_sysroot//:cudart"],
         "//tools:cpu_k8": ["@amd64_debian_sysroot//:cudart"],
         "//conditions:default": [":unavailable"],
     }),

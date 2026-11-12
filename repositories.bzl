@@ -147,9 +147,9 @@ alias(
     # run buildify_yocto_image.py /path/to/git/checkout/meta-frc4646
     http_archive(
         name = "arm64_debian_sysroot",
-        build_file = "//:registry/modules/arm64_debian_sysroot/2025.10.25/overlay/BUILD.bazel",
-        sha256 = "60982dba37854900206e61fa572c6510197c531db0f5f1b60ce0623803e5cb9a",
-        url = "https://realtimeroboticsgroup.org/build-dependencies/2025-10-25-walnascar-arm64-nvidia-rootfs.tar.zst",
+        build_file = "//:registry/modules/arm64_debian_sysroot/2026.11.12/overlay/BUILD.bazel",
+        sha256 = "9ddfa208aa25d1a4cc377ff69507b97989def5b41ee6de7ecb9edc7771e3c682",
+        url = "https://realtimeroboticsgroup.org/build-dependencies/2026-11-12-wrynose-arm64-nvidia-rootfs.tar.zst",
     )
 
     # Kept in sync with the liburing bazel_dep in MODULE.bazel.  bzlmod gets
@@ -643,6 +643,8 @@ def frc_repositories():
     http_archive(
         name = "symengine",
         build_file = "@aos//debian:symengine.BUILD",
+        patch_args = ["-p1"],
+        patches = ["@aos//third_party:symengine/0001-Don-t-include-ciso646.patch"],
         sha256 = "1b5c3b0bc6a9f187635f93585649f24a18e9c7f2167cebcd885edeaaf211d956",
         strip_prefix = "symengine-0.12.0",
         url = "https://github.com/symengine/symengine/releases/download/v0.12.0/symengine-0.12.0.tar.gz",

@@ -22,7 +22,7 @@ set -euo pipefail
 
 TOOL_NAME="$(basename "$0")"
 EXECROOT="$PWD"
-CUDA_BIN_REL="${AOS_CUDA_BIN_REL:-/usr/local/cuda-12.6/bin}"
+CUDA_BIN_REL="${AOS_CUDA_BIN_REL:-/usr/local/cuda-13.2/bin}"
 # fatbinary in the aarch64 sysroot is named per-target.
 case "$TOOL_NAME" in
   fatbinary) TOOL_BIN="aarch64-unknown-linux-gnu-fatbinary" ;;

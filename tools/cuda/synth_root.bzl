@@ -124,7 +124,7 @@ synth_cuda_root = rule(
         "bin2c": attr.output(mandatory = True),
         "cuda_root_subdir": attr.string(
             mandatory = True,
-            doc = "Path under src_files's repo that holds the CUDA root, e.g. `usr/local/cuda-12.6`.",
+            doc = "Path under src_files's repo that holds the CUDA root, e.g. `usr/local/cuda-13.2`.",
         ),
         "fatbinary": attr.output(mandatory = True),
         "libdevice": attr.output(mandatory = True),

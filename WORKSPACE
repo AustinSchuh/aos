@@ -320,7 +320,7 @@ llvm_toolchain(
         "linux-aarch64": "aarch64-oe4t-linux",
     },
     stdlib = {
-        "linux-aarch64": "dynamic-stdc++-14.3.0",
+        "linux-aarch64": "dynamic-stdc++-15.3.0",
         "linux-x86_64": "dynamic-stdc++-12",
     },
     sysroot = {

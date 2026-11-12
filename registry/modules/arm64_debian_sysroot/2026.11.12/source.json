@@ -1,0 +1,7 @@
+{
+    "url": "https://realtimeroboticsgroup.org/build-dependencies/2026-11-12-wrynose-arm64-nvidia-rootfs.tar.zst",
+    "integrity": "sha256-nd+iCKol0aTMN3/2lQe5eYne9bQe5t5+y57cd3HjxoI=",
+    "overlay": {
+        "BUILD.bazel": "sha256-3ftzvCW0CjzsvGazexF+2LnDWOFnHT9BRfiJTKUO2bY="
+    }
+}

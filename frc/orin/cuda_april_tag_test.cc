@@ -301,7 +301,6 @@ class CudaAprilTagDetector {
       DUMP(maxThreadsPerBlock);
       DUMP(maxThreadsPerMultiProcessor);
       DUMP(memoryBusWidth);
-      DUMP(memoryClockRate);
       DUMP(multiProcessorCount);
       DUMP(maxBlocksPerMultiProcessor);
       DUMP(name);

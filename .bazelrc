@@ -238,8 +238,8 @@ common --@rules_cuda//cuda:runtime=//third_party:cudart
 build --@rules_cuda//cuda:archs=sm_75;sm_86
 build:arm64 --@rules_cuda//cuda:archs=sm_87
 
-# Clang 21 only marks CUDA up to 12.5 as fully supported; the Orin sysroot
-# ships 12.6, so silence the "partially supported" warning to match what the
+# Clang only marks CUDA up to 12.x as fully supported; the Orin sysroot
+# ships 13.2, so silence the "partially supported" warning to match what the
 # old toolchains_llvm "cuda" feature did.
 build --@rules_cuda//cuda:copts=-Wno-unknown-cuda-version
 

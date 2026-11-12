@@ -398,7 +398,7 @@ http_archive(
     urls = ["https://github.com/microsoft/Detours/archive/d644ce94e8c7f7f5a31591577c78134ea3ac1fae.tar.gz"],
 )
 
-bazel_dep(name = "arm64_debian_sysroot", version = "2025.10.25", dev_dependency = True)
+bazel_dep(name = "arm64_debian_sysroot", version = "2026.11.12", dev_dependency = True)
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1", dev_dependency = True)
 bazel_dep(name = "buildozer", version = "8.2.1", dev_dependency = True)
 
@@ -579,6 +579,13 @@ dependencies = use_extension("//aos:extension.bzl", "dependencies")
 use_repo(dependencies, "aos_flatbuffers", "com_github_foxglove_schemas")
 
 bazel_dep(name = "symengine", version = "0.12.0", dev_dependency = True)
+single_version_override(
+    module_name = "symengine",
+    patch_strip = 1,
+    patches = ["//third_party:symengine/0001-Don-t-include-ciso646.patch"],
+    version = "0.12.0",
+)
+
 bazel_dep(name = "gmp", version = "6.3.0.bcr.2", dev_dependency = True)
 
 bazel_dep(name = "aspect_rules_cypress", version = "0.8.0")
@@ -697,7 +704,7 @@ llvm.toolchain(
     },
     stdlib = {
         "darwin-aarch64": "builtin-libc++",
-        "linux-aarch64": "dynamic-stdc++-14.3.0",
+        "linux-aarch64": "dynamic-stdc++-15.3.0",
         "linux-x86_64": "dynamic-stdc++-12",
     },
 )

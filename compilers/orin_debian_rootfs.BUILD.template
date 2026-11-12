@@ -1,24 +1,24 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
-# Pieces of the CUDA 12.6 toolkit shipped inside the Yocto sysroot. Exposed
+# Pieces of the CUDA 13.2 toolkit shipped inside the Yocto sysroot. Exposed
 # so //tools/cuda can wire them into a rules_cuda toolchain.
 exports_files(
     [
-        "usr/local/cuda-12.6/bin/aarch64-unknown-linux-gnu-fatbinary",
-        "usr/local/cuda-12.6/bin/bin2c",
-        "usr/local/cuda-12.6/bin/nvlink",
-        "usr/local/cuda-12.6/bin/ptxas",
-        "usr/local/cuda-12.6/nvvm/libdevice/libdevice.10.bc",
+        "usr/local/cuda-13.2/bin/aarch64-unknown-linux-gnu-fatbinary",
+        "usr/local/cuda-13.2/bin/bin2c",
+        "usr/local/cuda-13.2/bin/nvlink",
+        "usr/local/cuda-13.2/bin/ptxas",
+        "usr/local/cuda-13.2/nvvm/libdevice/libdevice.10.bc",
     ],
     visibility = ["//visibility:public"],
 )
 
-# Everything under the CUDA 12.6 toolkit root, so //tools/cuda can build
+# Everything under the CUDA 13.2 toolkit root, so //tools/cuda can build
 # a synthetic CUDA root that mirrors include/, nvvm/, and lib/ while
 # replacing the x86_64 host tools in bin/ with wrappers.
 filegroup(
-    name = "cuda_12_6_root",
-    srcs = glob(["usr/local/cuda-12.6/**"]),
+    name = "cuda_root",
+    srcs = glob(["usr/local/cuda-13.2/**"]),
     visibility = ["//visibility:public"],
 )
 
@@ -70,27 +70,25 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# NVIDIA's TEGRA_ACCELERATE build of libjpeg-8b, which drives the NVJPG
+# NVIDIA's TEGRA_ACCELERATE build of libjpeg-9f, which drives the NVJPG
 # engine.  Consumers must compile with -DTEGRA_ACCELERATE to get the
-# matching struct layout.
+# matching struct layout.  (L4T R36 and earlier shipped this as libnvjpeg.so
+# with libjpeg-8b headers; in R39 libnvjpeg.so is CUDA's unrelated nvJPEG.)
 cc_library(
     name = "nvjpeg",
     srcs = [
-        "usr/lib/libnvjpeg.so",
+        "usr/lib/libnvmm_jpeg.so",
     ],
     hdrs = glob(
-        include = ["usr/include/libjpeg-8b/*.h"],
+        include = ["usr/include/libjpeg-9f/*.h"],
     ),
-    includes = ["usr/include/libjpeg-8b/"],
+    includes = ["usr/include/libjpeg-9f/"],
     visibility = ["//visibility:public"],
 )
 
-cc_library(
+alias(
     name = "cudart",
-    srcs = [
-        "usr/lib/libcuda.so.1.1",
-        "usr/local/cuda-11.8/lib/libcudart.so.11.0",
-    ],
+    actual = ":cudart-13.2",
     visibility = ["//visibility:public"],
 )
 
@@ -98,8 +96,8 @@ cc_library(
     name = "tensorrt",
     visibility = ["//visibility:public"],
     deps = [
-        ":tensorrt-core-dev-headers",
-        ":usr_lib_libnvinfer.so.10.3.0-lib",
+        ":libnvinfer-dev-headers",
+        ":usr_lib_libnvinfer.so.10.16.2-lib",
     ],
 )
 

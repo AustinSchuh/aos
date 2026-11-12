@@ -76,7 +76,7 @@ toolchain(
 )
 
 # ---------------------------------------------------------------------------
-# aarch64: Yocto sysroot ships CUDA 12.6 under /usr/local/cuda-12.6.
+# aarch64: Yocto sysroot ships CUDA 13.2 under /usr/local/cuda-13.2.
 # ---------------------------------------------------------------------------
 
 # Synthetic CUDA root used by the aarch64 toolchain. `cuda_tool_wrapper.sh`
@@ -90,13 +90,13 @@ toolchain(
 synth_cuda_root(
     name = "aarch64_synth_root",
     bin2c = "synth_root/aarch64/bin/bin2c",
-    cuda_root_subdir = "usr/local/cuda-12.6",
+    cuda_root_subdir = "usr/local/cuda-13.2",
     fatbinary = "synth_root/aarch64/bin/fatbinary",
     libdevice = "synth_root/aarch64/nvvm/libdevice/libdevice.10.bc",
     nvlink = "synth_root/aarch64/bin/nvlink",
     out_subdir = "synth_root/aarch64",
     ptxas = "synth_root/aarch64/bin/ptxas",
-    src_files = "@arm64_debian_sysroot//:cuda_12_6_root",
+    src_files = "@arm64_debian_sysroot//:cuda_root",
     # Darwin needs the vfkit/Rosetta dispatcher in front of every host
     # tool. On Linux the synth root just hosts a single rename
     # symlink for fatbinary; bin/ptxas, bin/nvlink, and bin/bin2c
@@ -215,13 +215,13 @@ cuda_toolkit_info(
     # `--cuda-path=` from libdevice's grandparent dir, and clang's CUDA
     # driver looks for bin/ptxas + bin/fatbinary alongside it. The
     # synth root symlinks include/ and nvvm/ back to the real sysroot
-    # so headers and libdevice still come from CUDA 12.6.
+    # so headers and libdevice still come from CUDA 13.2.
     libdevice = "synth_root/aarch64/nvvm/libdevice/libdevice.10.bc",
     link_stub = "@rules_cuda//cuda/dummy:link.stub",
     nvlink = "synth_root/aarch64/bin/nvlink",
     path = "",
     ptxas = "synth_root/aarch64/bin/ptxas",
-    version = "12.6",
+    version = "13.2",
 )
 
 cuda_toolchain_config_clang(

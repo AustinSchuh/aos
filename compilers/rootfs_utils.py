@@ -91,7 +91,13 @@ def scoped_tmpdir_tegraflash_rootfs(image):
         ],
                        check=True)
 
-        yield os.path.join(extracted_tegraflash, 'demo-image-base.ext4')
+        # meta-frc4646 names the root filesystem after its type: .xfs when the
+        # build creates the xfs image itself, .ext4 from to_xfs.py and earlier.
+        for name in ('demo-image-base.xfs', 'demo-image-base.ext4'):
+            rootfs = os.path.join(extracted_tegraflash, name)
+            if os.path.exists(rootfs):
+                break
+        yield rootfs
 
 
 @contextlib.contextmanager
@@ -481,6 +487,8 @@ class PkgConfig:
                 pass
             elif line.startswith('Conflicts:'):
                 pass
+            elif line.startswith(('License:', 'Maintainer:', 'Copyright:')):
+                pass
             elif re.match('^[-a-zA-Z_0-9]* *=.*$', line):
                 split_line = re.split(' *= *', line)
                 self.variables[split_line[0]] = self.expand(split_line[1])
@@ -810,6 +818,47 @@ def write_registry_overlay(module_dir, contents):
     source_json.write_text(json.dumps(source, indent=4) + "\n")
 
 
+def _dependency_loops(deps):
+    """Returns the sets of packages in deps which depend on each other in a loop.
+
+    deps maps each package name to the names it depends on.  This is Tarjan's
+    strongly connected components algorithm, keeping only the components with
+    more than one package.
+    """
+    index = {}
+    lowlink = {}
+    stack = []
+    on_stack = set()
+    loops = []
+
+    def visit(name):
+        index[name] = len(index)
+        lowlink[name] = index[name]
+        stack.append(name)
+        on_stack.add(name)
+        for d in deps.get(name, []):
+            if d not in index:
+                visit(d)
+                lowlink[name] = min(lowlink[name], lowlink[d])
+            elif d in on_stack:
+                lowlink[name] = min(lowlink[name], index[d])
+        if lowlink[name] == index[name]:
+            component = set()
+            while True:
+                d = stack.pop()
+                on_stack.remove(d)
+                component.add(d)
+                if d == name:
+                    break
+            if len(component) > 1:
+                loops.append(component)
+
+    for name in sorted(deps):
+        if name not in index:
+            visit(name)
+    return loops
+
+
 def generate_build_file(filesystem, packages_to_eval, template_filename):
     # Now, we want to figure out what the dependencies of each of the packages are.
     # Generate the dependency tree starting from an initial list of packages.
@@ -822,6 +871,11 @@ def generate_build_file(filesystem, packages_to_eval, template_filename):
 
     rules = []
     objs_to_eval = []
+
+    # Headers, files and dependencies of each package, by name.
+    package_hdrs = {}
+    package_files = {}
+    package_deps = {}
 
     # Set of packages already generated in case our graph hits a package
     # multiple times.
@@ -855,22 +909,45 @@ def generate_build_file(filesystem, packages_to_eval, template_filename):
         if objects:
             objs_to_eval += objects
 
-        hdrs.sort()
-        deps.sort()
+        name = next_package.name.name
+        package_hdrs[name] = hdrs
+        package_files[name] = next_package.files + list(
+            next_package.symlinks.keys())
+        package_deps[name] = deps
+
+    # Packages can depend on each other in a loop (libgbm1 and
+    # libnvidia-egl-gbm1, for instance), which Bazel doesn't allow.  Give each
+    # package in a loop the headers and files of the whole loop, and the
+    # dependencies the loop has on packages outside it.
+    for loop in _dependency_loops(package_deps):
+        logging.warning('Merging packages which depend on each other: %s',
+                        sorted(loop))
+        hdrs = sorted(set(h for name in loop for h in package_hdrs[name]))
+        files = sorted(set(f for name in loop for f in package_files[name]))
+        deps = sorted(
+            set(d for name in loop for d in package_deps[name]
+                if d not in loop))
+        for name in loop:
+            package_hdrs[name] = hdrs
+            package_files[name] = files
+            package_deps[name] = deps
+
+    for name in package_deps:
+        hdrs = sorted(package_hdrs[name])
+        deps = sorted(package_deps[name])
         hdrs = [f'        "{h[1:]}",\n' for h in hdrs]
         hdrs_files = ''.join(hdrs)
         deps_joined = ''.join([f'        ":{d}-headers",\n' for d in deps])
 
         filegroup_srcs = ''.join(
-            [f'        "{f[1:]}",\n' for f in next_package.files] +
-            [f'        "{f[1:]}",\n' for f in next_package.symlinks.keys()] +
+            [f'        "{f[1:]}",\n' for f in package_files[name]] +
             [f'        ":{d}-filegroup",\n' for d in deps])
 
         rules.append(
-            f'filegroup(\n    name = "{next_package.name.name}-filegroup",\n    srcs = [\n{filegroup_srcs}    ],\n    visibility = ["//visibility:public"],\n)'
+            f'filegroup(\n    name = "{name}-filegroup",\n    srcs = [\n{filegroup_srcs}    ],\n    visibility = ["//visibility:public"],\n)'
         )
         rules.append(
-            f'cc_library(\n    name = "{next_package.name.name}-headers",\n    hdrs = [\n{hdrs_files}    ],\n    visibility = ["//visibility:public"],\n    deps = [\n{deps_joined}    ],\n)'
+            f'cc_library(\n    name = "{name}-headers",\n    hdrs = [\n{hdrs_files}    ],\n    visibility = ["//visibility:public"],\n    deps = [\n{deps_joined}    ],\n)'
         )
 
     obj_set = set()
