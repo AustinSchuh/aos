@@ -417,6 +417,11 @@ struct Aio::Impl {
   virtual bool Poll(bool block) = 0;
   virtual void Quit() = 0;
 
+  // See Aio::PrepareToWait() and Aio::WaitFd().  The defaults die, for
+  // backends that can't be driven by another event loop (IOCP).
+  virtual Aio::ExternalWait PrepareToWait();
+  virtual FileDescriptor WaitFd();
+
   virtual void AsyncRead(FileDescriptor fd, std::span<char> buffer,
                          AsyncRequest *request) = 0;
   virtual void AsyncWrite(FileDescriptor fd, std::span<const char> buffer,

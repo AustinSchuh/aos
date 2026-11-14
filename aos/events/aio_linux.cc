@@ -705,6 +705,9 @@ class IoUringImpl : public Aio::Impl {
   void Quit() override;
   void Wakeup();
 
+  Aio::ExternalWait PrepareToWait() override;
+  FileDescriptor WaitFd() override;
+
   void AsyncRead(FileDescriptor fd, std::span<char> buffer,
                  AsyncRequest *request) override;
   void AsyncWrite(FileDescriptor fd, std::span<const char> buffer,
@@ -2037,6 +2040,86 @@ bool IoUringImpl::Poll(bool block) {
   return ReapCompletions();
 }
 
+Aio::ExternalWait IoUringImpl::PrepareToWait() {
+  // Same reentrancy rule as Poll(): from a callback, the answer would be stale
+  // before the callback returned.
+  ABSL_CHECK(!in_poll_ && !before_wait_functions_.running())
+      << "Aio::PrepareToWait() called from inside a completion callback or a "
+         "before-wait function; call it from the outer loop, between Poll()s";
+  ABSL_CHECK(!single_issuer_)
+      << ": Call Aio::WaitFd() before Aio::PrepareToWait(): it moves the ring "
+         "to the tier an outer loop can wait on";
+  // As at the top of Poll(): a fork rebuilds the ring.
+  CheckForFork();
+  EnsureBound();
+
+  if (!before_wait_functions_.empty()) {
+    before_wait_functions_.Run();
+    CheckForFork();
+    EnsureBound();
+  }
+
+  Aio::ExternalWait wait;
+  // Completions already reaped but not yet delivered, or a timer that is due:
+  // Poll(false) has a callback to run without the kernel.
+  if (!pending_dispatch_.empty() ||
+      (!timers_.empty() && timers_.FrontDue(aos::monotonic_clock::now()))) {
+    wait.poll_now = true;
+    return wait;
+  }
+
+  // Hand the kernel whatever was staged since the last Poll() (a callback or
+  // the outer loop's own code arming a request), and run any task work
+  // waiting for this thread, which is how finished requests reach the CQ.
+  // min_complete is 0, so this doesn't wait.
+  const int ret = io_uring_submit_and_get_events(&ring);
+  if (ret < 0 && ret != -EINTR && ret != -EAGAIN) {
+    // See Poll(): absorbed, and retried by the next Poll().
+    ABSL_VLOG(1) << "io_uring submit failed: " << aos_strerror(-ret);
+  }
+  if (io_uring_cq_ready(&ring) > 0 || io_uring_sq_ready(&ring) > 0) {
+    wait.poll_now = true;
+    return wait;
+  }
+
+  // Timers are userspace deadlines here (see IoUringTimers); a blocking
+  // Poll() makes the earliest one its wait's timeout, so the outer loop has to
+  // do the same.
+  if (!timers_.empty()) {
+    wait.deadline = timers_.front_deadline();
+  }
+  return wait;
+}
+
+FileDescriptor IoUringImpl::WaitFd() {
+  CheckForFork();
+  // An outer loop waits on the ring's own fd, which polls readable once a
+  // completion is in the CQ.  Under DEFER_TASKRUN finished work never gets
+  // there by itself -- it waits as deferred task work for a GETEVENTS enter --
+  // so the fd stays quiet, and an eventfd registered with the ring is
+  // signaled 20-40 ms late when the work came from another eventfd's wakeup
+  // (Quit(), thread signals), because the kernel defers that signal through
+  // RCU.  So a ring an outer loop drives moves to the COOP_TASKRUN tier:
+  // there, finishing a request wakes this thread wherever it sleeps
+  // (TWA_SIGNAL_NO_IPI: a wakeup, but no IPI if it is running), it runs the
+  // task work on its way back to userspace, and the completion lands in the
+  // CQ.  The cost lands on this loop, not on whoever finishes its requests:
+  // that is one try_to_wake_up() per batch, as under DEFER_TASKRUN.  See
+  // documentation/adr/0008-tokio-on-the-event-loop-thread.md.
+  //
+  // DowngradeFromSingleIssuer() rebuilds the ring and re-arms the persistent
+  // registrations, but can't carry caller-submitted requests across, and dies
+  // if any are in flight: call this before submitting any.
+  if (single_issuer_) {
+    ABSL_CHECK_EQ(raw_requests_in_flight_, 0)
+        << ": Call Aio::WaitFd() before submitting AsyncRead/AsyncWrite: it "
+           "rebuilds the ring, which would drop them";
+    DowngradeFromSingleIssuer();
+  }
+  EnsureBound();
+  return ring.ring_fd;
+}
+
 int IoUringImpl::WaitForCompletionOrTimer() {
   // Loops until a completion actually exists or the earliest timer is due.
   // One wait is not a reliable answer to either question.  When
@@ -2943,6 +3026,9 @@ class EpollImpl : public internal::ReadinessBackend {
   IntrusiveDoublyLinkedList<Aio::TimerState, ActiveTimerTraits> active_timers_;
   void WakeLoop() override;
   FileDescriptor wakeup_fd() const override { return event_fd_.fd(); }
+  // An epoll instance's fd is readable while any of its registrations are
+  // ready: every fd, timerfd and the wakeup eventfd are on it.
+  FileDescriptor WaitFd() override { return epoll_fd_; }
   const char *OwnFdName(FileDescriptor fd) override;
   void CheckOwnFdsOpenAfterFork() override;
   ssize_t DoRawIo(internal::FdRegistration *reg, Direction direction,

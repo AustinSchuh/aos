@@ -64,6 +64,7 @@ class ReadinessBackend : public Aio::Impl {
   bool should_run() const final;
   void Quit() final;
   bool Poll(bool block) final;
+  Aio::ExternalWait PrepareToWait() final;
 
   void AsyncRead(FileDescriptor fd, std::span<char> buffer,
                  AsyncRequest *request) final;

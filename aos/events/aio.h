@@ -238,6 +238,70 @@ class Aio {
   // queued and returns without blocking.
   bool should_run() const;
 
+  // --- Driving the loop from another event loop ---
+  //
+  // Run() and Poll(true) wait in this Aio's own kernel wait.  A program whose
+  // outer loop is something else -- a tokio runtime, say (see
+  // documentation/adr/0008-tokio-on-the-event-loop-thread.md) -- drives it
+  // with Poll(false) instead, and waits in its own loop for what
+  // PrepareToWait() and WaitFd() describe:
+  //
+  //   while (true) {
+  //     while (aio.Poll(false)) {
+  //     }
+  //     const Aio::ExternalWait wait = aio.PrepareToWait();
+  //     if (wait.poll_now) {
+  //       continue;
+  //     }
+  //     // Wait until WaitFd() is readable or wait.deadline has passed,
+  //     // whichever comes first, doing the outer loop's own work meanwhile.
+  //   }
+  //
+  // Everything else is unchanged: the same thread must make every call, and
+  // callbacks run inside Poll(false).  Run() and Poll(true) shouldn't be
+  // mixed with this on one loop.
+  //
+  // Call WaitFd() first, before submitting any AsyncRead/AsyncWrite: on
+  //   io_uring it moves the ring from the SINGLE_ISSUER | DEFER_TASKRUN tier
+  //   to COOP_TASKRUN, whose fd an outer loop can wait on (see WaitFd()), and
+  //   the rebuild can't carry raw requests across.
+  //
+  // io_uring and epoll on Linux, and kqueue on macOS.  Both calls die on
+  // Windows: an I/O completion port can't be waited on by another loop, so
+  // driving one from outside will take a thread that waits on the port and
+  // wakes the outer loop.
+  struct ExternalWait {
+    // Poll(false) has work now: don't wait.
+    bool poll_now = false;
+    // Wake by this time for Poll(false), even if WaitFd() hasn't become
+    // readable.  max_time if nothing is due.
+    aos::monotonic_clock::time_point deadline = aos::monotonic_clock::max_time;
+  };
+
+  // Call right before the outer loop waits, from outside Poll().  Runs the
+  // before-wait functions (see BeforeWait()), hands the kernel anything
+  // staged since the last Poll(), and reports whether to wait and until
+  // when.  The answer holds until the caller does anything else with this
+  // Aio: a callback or the outer loop's own code that touches it (arms a
+  // timer, submits a request) has to be followed by another Poll(false) and
+  // PrepareToWait() before waiting.
+  ExternalWait PrepareToWait();
+
+  // An fd that becomes readable when Poll(false) has work to do.  Wait for
+  // readability only; never read it -- Poll() does whatever consuming it
+  // takes.  Readiness is level-triggered.
+  //
+  // On io_uring the first call moves the ring to the COOP_TASKRUN tier:
+  // under DEFER_TASKRUN the ring's fd doesn't poll readable for finished
+  // work, which waits for a GETEVENTS enter instead, and an eventfd
+  // registered with the ring is signaled 20-40 ms late when the work came
+  // from another eventfd's wakeup (Quit(), thread signals).  It dies if any
+  // AsyncRead/AsyncWrite is in flight.
+  //
+  // The fd changes when the backend rebuilds its kernel state after a fork():
+  // ask again then.
+  FileDescriptor WaitFd();
+
   // Schedules an asynchronous read on a file descriptor.
   //
   // How many raw requests may be in flight on one fd at once is
