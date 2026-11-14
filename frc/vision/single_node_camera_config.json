@@ -544,6 +544,12 @@
       "nodes": ["orin"]
     },
     {
+      "name": "robot_server",
+      "user": "root",
+      "args": ["--user=pi"],
+      "nodes": ["orin"]
+    },
+    {
       "name": "vision_constants_sender",
       "nodes": ["orin"],
       "autorestart": false

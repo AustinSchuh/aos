@@ -122,6 +122,7 @@ robot_downloader(
         "//frc/vision/networking:vision_constants_sender",
         "//aos/events:aos_timing_report_streamer",
         "//aos/network:web_proxy_main",
+        "//aos/network/robot_server",
         "//aos/starter:irq_affinity",
         "//aos/events/logging:log_cat",
         "//aos/util:filesystem_monitor",
