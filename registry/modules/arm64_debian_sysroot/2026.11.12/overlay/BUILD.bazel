@@ -86,6 +86,46 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+# NvSciBuf and NvSciSync: NVIDIA's buffer and fence sharing between engines,
+# which NvMedia uses for its output surfaces and completion fences.
+cc_library(
+    name = "nvscibuf",
+    srcs = [
+        "usr/lib/libnvscibuf.so.1",
+    ],
+    hdrs = [
+        "usr/include/nvscibuf.h",
+        "usr/include/nvscierror.h",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "nvscisync",
+    srcs = [
+        "usr/lib/libnvscisync.so.1",
+    ],
+    hdrs = [
+        "usr/include/nvscisync.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":nvscibuf"],
+)
+
+# NvMedia's image JPEG decoder (IJPD), which takes the NVJPG engine to
+# decode on as an argument.  The image ships the library but not its header.
+cc_library(
+    name = "nvmedia_ijpd",
+    srcs = [
+        "usr/lib/libnvmedia_ijpd_sci.so",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":nvscibuf",
+        ":nvscisync",
+    ],
+)
+
 alias(
     name = "cudart",
     actual = ":cudart-13.2",
