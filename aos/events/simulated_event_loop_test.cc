@@ -1,5 +1,7 @@
 #include "aos/events/simulated_event_loop.h"
 
+#include <unistd.h>
+
 #include <chrono>
 #include <functional>
 #include <future>
@@ -495,6 +497,57 @@ TEST(SimulatedEventLoopTest, RunForTimerHandler) {
   EXPECT_EQ(::aos::monotonic_clock::epoch() + chrono::seconds(1),
             event_loop->monotonic_now());
   EXPECT_EQ(counter, 10);
+}
+
+// At an infinite replay rate, the scheduler hands its Aio back between slices
+// of events, so an fd registered on scheduler_aio() is serviced while the
+// simulation is still running, not only once it ends.
+TEST(SimulatedEventLoopTest, InfiniteRateYieldsToSchedulerAio) {
+  SimulatedEventLoopTestFactory factory;
+  SimulatedEventLoopFactory simulated_event_loop_factory(
+      factory.configuration());
+  ::std::unique_ptr<EventLoop> event_loop =
+      simulated_event_loop_factory.MakeEventLoop("loop");
+  event_loop->SkipTimingReport();
+  event_loop->SkipAosLog();
+
+  // 200 events of 0.2 ms of wall time each: the run takes ~40 ms, far longer
+  // than a slice.
+  int events = 0;
+  TimerHandler *timer = nullptr;
+  timer = event_loop->AddTimer([&]() {
+    const monotonic_clock::time_point until =
+        monotonic_clock::now() + std::chrono::microseconds(200);
+    while (monotonic_clock::now() < until) {
+    }
+    if (++events < 200) {
+      timer->Schedule(event_loop->monotonic_now() + chrono::milliseconds(1));
+    }
+  });
+  event_loop->OnRun([&] {
+    timer->Schedule(event_loop->monotonic_now() + chrono::milliseconds(1));
+  });
+
+  int fds[2];
+  ABSL_PCHECK(pipe(fds) == 0);
+  ABSL_PCHECK(write(fds[1], "x", 1) == 1);
+  int events_when_serviced = -1;
+  Aio *aio = simulated_event_loop_factory.scheduler_aio();
+  aio->OnReadable(fds[0], [&]() {
+    char c;
+    ABSL_PCHECK(read(fds[0], &c, 1) == 1);
+    events_when_serviced = events;
+  });
+
+  simulated_event_loop_factory.Run();
+  aio->DeleteFd(fds[0]);
+  close(fds[0]);
+  close(fds[1]);
+
+  EXPECT_EQ(events, 200);
+  EXPECT_GE(events_when_serviced, 0) << "The pipe was never serviced";
+  EXPECT_LT(events_when_serviced, 200)
+      << "The pipe was only serviced once the simulation had ended";
 }
 
 // Tests that watchers have latency in simulation.
