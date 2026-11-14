@@ -86,11 +86,14 @@ pub trait Init: Parser {
     ///
     /// Parses the command line flags and runs the initialization logic.
     fn init() -> Self {
-        let this = Self::parse_with_cpp_flags();
         // Rust logs to stderr by default. Make that true for C++ as that will be easier than
         // managing one or multiple files across FFI. We can pipe the stderr to a file to get
-        // a log file if we want.
-        CxxFlag::set_option("logtostderr", "true").expect("Error setting C++ flag: logtostderr");
+        // a log file if we want.  This is absl's stderrthreshold, as aos::InitGoogle() sets it;
+        // glog's logtostderr flag went away with the move to absl logging.  Set before parsing,
+        // so a --stderrthreshold on the command line still wins.
+        CxxFlag::set_option("stderrthreshold", "0")
+            .expect("Error setting C++ flag: stderrthreshold");
+        let this = Self::parse_with_cpp_flags();
         internal::init();
         // Non-test initialization below
         env_logger::init();
