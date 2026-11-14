@@ -1,7 +1,9 @@
 #include "aos/events/simulated_event_loop.h"
 
+#include <poll.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -497,6 +499,120 @@ TEST(SimulatedEventLoopTest, RunForTimerHandler) {
   EXPECT_EQ(::aos::monotonic_clock::epoch() + chrono::seconds(1),
             event_loop->monotonic_now());
   EXPECT_EQ(counter, 10);
+}
+
+// Drives the simulation the way an outer event loop does (see
+// Aio::PrepareToWait()), instead of calling Run(): StartExternalRun(), then
+// Poll(false) and wait in poll(2) on the scheduler's Aio until the run ends,
+// then FinishExternalRun().
+Status RunExternally(SimulatedEventLoopFactory *factory) {
+  Aio *aio = factory->scheduler_aio();
+  const FileDescriptor wait_fd = aio->WaitFd();
+  AOS_RETURN_IF_ERROR(factory->StartExternalRun());
+  while (factory->is_running()) {
+    while (aio->Poll(false) && factory->is_running()) {
+    }
+    if (!factory->is_running()) break;
+    const Aio::ExternalWait wait = aio->PrepareToWait();
+    if (wait.poll_now) continue;
+    const monotonic_clock::time_point now = monotonic_clock::now();
+    const int timeout_ms =
+        wait.deadline == monotonic_clock::max_time
+            ? 1000
+            : static_cast<int>(std::min<int64_t>(
+                  1000, std::chrono::ceil<std::chrono::milliseconds>(
+                            std::max(wait.deadline - now,
+                                     monotonic_clock::duration::zero()))
+                            .count()));
+    struct pollfd pfd;
+    pfd.fd = wait_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    ABSL_PCHECK(poll(&pfd, 1, timeout_ms) >= 0 || errno == EINTR);
+  }
+  return factory->FinishExternalRun();
+}
+
+// An externally driven run does what Run() does: the same events at the same
+// simulated times, ending when they run out.
+TEST(SimulatedEventLoopTest, ExternalRunMatchesRun) {
+  SimulatedEventLoopTestFactory factory;
+  SimulatedEventLoopFactory simulated_event_loop_factory(
+      factory.configuration());
+  ::std::unique_ptr<EventLoop> event_loop =
+      simulated_event_loop_factory.MakeEventLoop("loop");
+  // Its periodic reports would keep the simulation from running out of
+  // events, so it would never end.
+  event_loop->SkipTimingReport();
+  event_loop->SkipAosLog();
+
+  int counter = 0;
+  TimerHandler *timer = nullptr;
+  timer = event_loop->AddTimer([&]() {
+    ++counter;
+    if (counter < 10) {
+      timer->Schedule(event_loop->monotonic_now() + chrono::milliseconds(100));
+    }
+  });
+  event_loop->OnRun([&] {
+    timer->Schedule(event_loop->monotonic_now() + chrono::milliseconds(100));
+  });
+
+  EXPECT_TRUE(RunExternally(&simulated_event_loop_factory).has_value());
+  EXPECT_EQ(counter, 10);
+  EXPECT_EQ(::aos::monotonic_clock::epoch() + chrono::seconds(1),
+            event_loop->monotonic_now());
+
+  // And a later Run() still works: an external run doesn't leave the
+  // scheduler's Aio quit.
+  timer->Schedule(event_loop->monotonic_now() + chrono::milliseconds(100));
+  counter = 9;
+  simulated_event_loop_factory.Run();
+  EXPECT_EQ(counter, 10);
+}
+
+// EndSlice() from an event's callback returns to the Aio right after that
+// event, before simulated time moves on: what the event woke can run at its
+// time.
+TEST(SimulatedEventLoopTest, EndSliceStopsAfterTheCurrentEvent) {
+  SimulatedEventLoopTestFactory factory;
+  SimulatedEventLoopFactory simulated_event_loop_factory(
+      factory.configuration());
+  ::std::unique_ptr<EventLoop> event_loop =
+      simulated_event_loop_factory.MakeEventLoop("loop");
+  event_loop->SkipTimingReport();
+  event_loop->SkipAosLog();
+
+  bool first = false;
+  bool second = false;
+  TimerHandler *first_timer = event_loop->AddTimer([&]() {
+    first = true;
+    simulated_event_loop_factory.EndSlice();
+  });
+  TimerHandler *second_timer = event_loop->AddTimer([&]() { second = true; });
+  event_loop->OnRun([&] {
+    first_timer->Schedule(event_loop->monotonic_now() +
+                          chrono::milliseconds(1));
+    second_timer->Schedule(event_loop->monotonic_now() +
+                           chrono::milliseconds(2));
+  });
+
+  Aio *aio = simulated_event_loop_factory.scheduler_aio();
+  aio->WaitFd();
+  ASSERT_TRUE(simulated_event_loop_factory.StartExternalRun().has_value());
+  for (int i = 0; i < 100 && !first; ++i) {
+    aio->Poll(false);
+  }
+  ASSERT_TRUE(first);
+  EXPECT_FALSE(second) << "The slice went on past EndSlice()";
+  EXPECT_EQ(::aos::monotonic_clock::epoch() + chrono::milliseconds(1),
+            event_loop->monotonic_now());
+
+  for (int i = 0; i < 100 && simulated_event_loop_factory.is_running(); ++i) {
+    aio->Poll(false);
+  }
+  ASSERT_TRUE(simulated_event_loop_factory.FinishExternalRun().has_value());
+  EXPECT_TRUE(second);
 }
 
 // At an infinite replay rate, the scheduler hands its Aio back between slices

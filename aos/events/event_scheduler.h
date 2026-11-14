@@ -313,11 +313,32 @@ class EventScheduler {
 // reading failures).
 class EventSchedulerScheduler {
  public:
+  EventSchedulerScheduler();
+  ~EventSchedulerScheduler();
+
   // Adds an event scheduler to the list.
   void AddEventScheduler(EventScheduler *scheduler);
 
   // Runs until there are no more events or Exit is called.
   [[nodiscard]] Status Run();
+
+  // Run(), for a caller that drives aio() itself rather than blocking in
+  // it -- another event loop, such as tokio (see
+  // documentation/adr/0008-tokio-on-the-event-loop-thread.md).
+  // StartExternalRun() does what Run() does before it starts waiting: runs
+  // the startup and OnRun handlers, and arms the timer that runs events.  The
+  // caller then drives aio() (see Aio::PrepareToWait()) while is_running(),
+  // and calls FinishExternalRun() once it isn't, which does what Run() does
+  // after, and returns what Run() would have.
+  [[nodiscard]] Status StartExternalRun();
+  [[nodiscard]] Status FinishExternalRun();
+  bool is_running() const { return is_running_; }
+
+  // Ends the slice of events being run after the one running now, and returns
+  // to aio() (with the timer rearmed to carry on at once), so that whatever
+  // that event woke runs before simulated time moves on.  For a driver that
+  // hosts tasks the simulation's callbacks wake; see StartExternalRun().
+  void EndSlice() { end_slice_ = true; }
 
   // Stops running.
   void Exit() { is_running_ = false; }
@@ -379,11 +400,29 @@ class EventSchedulerScheduler {
   Result<std::tuple<distributed_clock::time_point, EventScheduler *>>
   OldestEvent();
 
-  // Handles running loop_body repeatedly until complete. loop_body should
-  // return the next time at which it wants to be called, and set is_running_ to
-  // false once we should stop.
-  template <typename F>
-  [[nodiscard]] Status RunMaybeRealtimeLoop(F loop_body);
+  // Runs the oldest event, or a reboot, or stops at the end: Run()'s loop
+  // body.
+  [[nodiscard]] Status RunOneEvent();
+
+  // Runs loop_body repeatedly until it sets is_running_ to false, paced to
+  // the replay rate, by blocking in aio_.
+  [[nodiscard]] Status RunMaybeRealtimeLoop(std::function<Status()> loop_body);
+
+  // The state of one paced run: its timer, and where it is.  Defined in the
+  // .cc.
+  struct RealtimeLoop;
+
+  // Starts a paced run of loop_body on aio_'s timer, without driving aio_.
+  // external means someone else drives it, so it doesn't Quit() aio_ when
+  // done.
+  [[nodiscard]] Result<std::unique_ptr<RealtimeLoop>> StartRealtimeLoop(
+      std::function<Status()> loop_body, bool external);
+
+  // The run StartExternalRun() started, until FinishExternalRun().
+  std::unique_ptr<RealtimeLoop> external_loop_;
+
+  // Set by EndSlice(), cleared at the start of each slice.
+  bool end_slice_ = false;
 
   // True if we are running.
   bool is_running_ = false;
