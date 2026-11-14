@@ -1,6 +1,7 @@
 #include "aos/events/aio_test_lib.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -8426,5 +8427,240 @@ TEST_P(AioTest, ForkAfterCancelDeliveredIsFineTest) {
       },
       ::testing::ExitedWithCode(42), "");
 }
+
+// --- Driving the loop from another event loop (Aio::PrepareToWait()) ---
+
+#if !defined(_WIN32)
+namespace {
+
+// Drives aio the way an outer event loop does (see Aio::PrepareToWait()):
+// drain with Poll(false), ask PrepareToWait(), and if it says to wait, wait
+// in poll(2) on WaitFd() until it is readable or the deadline passes.  Stops
+// when done() is true, or after limit.  Returns whether done() became true,
+// and counts the poll(2) waits in *waits.
+bool DriveExternally(Aio *aio, const std::function<bool()> &done,
+                     std::chrono::milliseconds limit, int *waits = nullptr) {
+  const aos::monotonic_clock::time_point give_up =
+      aos::monotonic_clock::now() + limit;
+  // Idempotent; the tests that submit raw requests ask before submitting.
+  const FileDescriptor wait_fd = aio->WaitFd();
+  while (true) {
+    while (aio->Poll(false)) {
+      if (done()) return true;
+    }
+    if (done()) return true;
+    const Aio::ExternalWait wait = aio->PrepareToWait();
+    if (wait.poll_now) continue;
+    const aos::monotonic_clock::time_point now = aos::monotonic_clock::now();
+    if (now >= give_up) return false;
+    const aos::monotonic_clock::time_point until =
+        std::min(wait.deadline, give_up);
+    // Rounded up, so a wait never ends before the deadline it is for.
+    const int timeout_ms = static_cast<int>(
+        std::chrono::ceil<std::chrono::milliseconds>(until - now).count());
+    struct pollfd pfd;
+    pfd.fd = wait_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    ABSL_PCHECK(poll(&pfd, 1, std::max(timeout_ms, 0)) >= 0 || errno == EINTR);
+    if (waits != nullptr) ++*waits;
+  }
+}
+
+}  // namespace
+
+// The case the whole interface hinges on: a read finishes while the outer
+// loop is waiting, with no timer to wake it.  Only WaitFd() becoming readable
+// can get the read delivered.  On io_uring with DEFER_TASKRUN the completion
+// sits as deferred task work until a GETEVENTS enter, so this checks that the
+// ring's fd polls readable for that.
+TEST_P(AioTest, ExternalDriverWakesForACompletedRead) {
+  if (!Backend().drives_its_own_loop) GTEST_SKIP() << "borrowed loop";
+  TestAio aio;
+  Pipe pipe;
+  char read_buf[16] = {0};
+  AsyncRequest read_req;
+  read_req.callback = [](Completion completion, void *) {
+    EXPECT_TRUE(aos::IsOk(completion.status));
+  };
+
+  aio.Poll(false);
+  aio.get()->WaitFd();
+  aio.AsyncRead(pipe.read_fd(), read_buf, &read_req);
+
+  std::thread writer([&pipe]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ABSL_PCHECK(write(pipe.write_fd(), "hi", 2) == 2);
+  });
+  int waits = 0;
+  const aos::monotonic_clock::time_point start = aos::monotonic_clock::now();
+  EXPECT_TRUE(DriveExternally(
+      aio.get(), [&]() { return read_req.done; },
+      std::chrono::milliseconds(2000), &waits))
+      << "WaitFd() never became readable for the completed read";
+  writer.join();
+  EXPECT_STREQ(read_buf, "hi");
+  // It waited for the write rather than spinning, and woke promptly.
+  EXPECT_LT(waits, 10);
+  EXPECT_LT(aos::monotonic_clock::now() - start,
+            std::chrono::milliseconds(1000));
+}
+
+// A legacy readiness registration made ready from another thread wakes the
+// outer loop too: on io_uring it goes through the embedded epoll's poll.
+TEST_P(AioTest, ExternalDriverWakesForALegacyFd) {
+  if (!Backend().drives_its_own_loop) GTEST_SKIP() << "borrowed loop";
+  TestAio aio;
+  Pipe pipe;
+  bool readable = false;
+  aio.OnReadable(pipe.read_fd(), [&]() {
+    char c;
+    ABSL_PCHECK(read(pipe.read_fd(), &c, 1) == 1);
+    readable = true;
+  });
+  aio.Poll(false);
+
+  std::thread writer([&pipe]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ABSL_PCHECK(write(pipe.write_fd(), "x", 1) == 1);
+  });
+  int waits = 0;
+  const aos::monotonic_clock::time_point start = aos::monotonic_clock::now();
+  EXPECT_TRUE(DriveExternally(
+      aio.get(), [&]() { return readable; }, std::chrono::milliseconds(2000),
+      &waits));
+  writer.join();
+  EXPECT_LT(waits, 10);
+  EXPECT_LT(aos::monotonic_clock::now() - start,
+            std::chrono::milliseconds(1000));
+  aio.DeleteFd(pipe.read_fd());
+}
+
+// A timer fires on time: on io_uring through the deadline PrepareToWait()
+// reports, elsewhere through the timer's registration on WaitFd().
+TEST_P(AioTest, ExternalDriverFiresTimersOnTime) {
+  if (!Backend().drives_its_own_loop) GTEST_SKIP() << "borrowed loop";
+  TestAio aio;
+  Aio::Timer timer(aio.get());
+  aio.Poll(false);
+  aio.get()->WaitFd();
+
+  aos::monotonic_clock::time_point fired = aos::monotonic_clock::min_time;
+  const aos::monotonic_clock::time_point deadline =
+      aos::monotonic_clock::now() + std::chrono::milliseconds(30);
+  timer.Schedule(
+      deadline,
+      [](Completion completion, void *ctx) {
+        if (aos::IsOk(completion.status)) {
+          *static_cast<aos::monotonic_clock::time_point *>(ctx) =
+              aos::monotonic_clock::now();
+        }
+      },
+      &fired);
+
+  if (!Backend().timers_are_descriptors && Backend().is_io_uring) {
+    // The loop staged the timer in userspace; the outer loop has to be told.
+    const Aio::ExternalWait wait = aio.get()->PrepareToWait();
+    EXPECT_FALSE(wait.poll_now);
+    EXPECT_EQ(wait.deadline, deadline);
+  }
+
+  int waits = 0;
+  EXPECT_TRUE(DriveExternally(
+      aio.get(), [&]() { return fired != aos::monotonic_clock::min_time; },
+      std::chrono::milliseconds(2000), &waits));
+  EXPECT_GE(fired, deadline);
+  EXPECT_LT(fired - deadline, std::chrono::milliseconds(200));
+  EXPECT_LT(waits, 10);
+}
+
+// Quit() from another thread is a wakeup like any other.
+TEST_P(AioTest, ExternalDriverWakesForQuit) {
+  if (!Backend().drives_its_own_loop) GTEST_SKIP() << "borrowed loop";
+  TestAio aio;
+  aio.Poll(false);
+  std::thread quitter([&aio]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    aio.Quit();
+  });
+  int waits = 0;
+  // Nothing else is registered, so the only thing that can end the wait
+  // before the limit is Quit()'s wakeup.  Its Poll() reports nothing, so
+  // stop at the first wait that ends early.
+  const aos::monotonic_clock::time_point start = aos::monotonic_clock::now();
+  DriveExternally(
+      aio.get(), [&]() { return !aio.should_run() && waits > 0; },
+      std::chrono::milliseconds(2000), &waits);
+  quitter.join();
+  EXPECT_FALSE(aio.should_run());
+  EXPECT_LT(aos::monotonic_clock::now() - start,
+            std::chrono::milliseconds(1000));
+}
+
+// Work the outer loop staged after the last Poll() -- here a write and a read
+// on a pipe, which are ready at once -- is handed to the kernel by
+// PrepareToWait(), so it doesn't sit staged while the outer loop waits.
+TEST_P(AioTest, ExternalDriverSubmitsStagedWork) {
+  if (!Backend().drives_its_own_loop) GTEST_SKIP() << "borrowed loop";
+  TestAio aio;
+  Pipe pipe;
+  aio.Poll(false);
+  aio.get()->WaitFd();
+
+  char write_buf[] = "ab";
+  char read_buf[8] = {0};
+  AsyncRequest write_req;
+  write_req.callback = [](Completion, void *) {};
+  AsyncRequest read_req;
+  read_req.callback = [](Completion, void *) {};
+  aio.AsyncWrite(pipe.write_fd(), std::span<const char>(write_buf, 2),
+                 &write_req);
+  aio.AsyncRead(pipe.read_fd(), read_buf, &read_req);
+
+  const aos::monotonic_clock::time_point start = aos::monotonic_clock::now();
+  EXPECT_TRUE(DriveExternally(
+      aio.get(), [&]() { return write_req.done && read_req.done; },
+      std::chrono::milliseconds(2000)));
+  EXPECT_LT(aos::monotonic_clock::now() - start,
+            std::chrono::milliseconds(500));
+  EXPECT_STREQ(read_buf, "ab");
+}
+
+// PrepareToWait() runs the before-wait functions, since it is where the outer
+// loop is about to wait.
+TEST_P(AioTest, ExternalDriverRunsBeforeWaitFunctions) {
+  if (!Backend().drives_its_own_loop) GTEST_SKIP() << "borrowed loop";
+  TestAio aio;
+  aio.Poll(false);
+  aio.get()->WaitFd();
+  int runs = 0;
+  const Aio::BeforeWaitId id = aio.BeforeWait([&runs]() { ++runs; });
+  aio.get()->PrepareToWait();
+  EXPECT_EQ(runs, 1);
+  aio.RemoveBeforeWait(id);
+}
+
+// On io_uring, WaitFd() rebuilds the ring for an outer loop, which can't
+// carry a raw request across, so asking after submitting one dies, saying
+// what to do instead.
+TEST_P(AioIoUringTest, ExternalDriverWaitFdBeforeRawRequests) {
+  // Re-executed rather than forked: a forked child with a raw request in
+  // flight dies of that, in CheckForFork(), before it gets to WaitFd()'s
+  // check.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  TestAio aio;
+  Pipe pipe;
+  char read_buf[4];
+  AsyncRequest read_req;
+  read_req.callback = [](Completion, void *) {};
+  aio.Poll(false);
+  aio.AsyncRead(pipe.read_fd(), read_buf, &read_req);
+  EXPECT_DEATH(aio.get()->WaitFd(), "before submitting AsyncRead");
+  aio.Cancel(&read_req);
+  while (!read_req.done) {
+    aio.Poll(true);
+  }
+}
+#endif  // !defined(_WIN32)
 
 }  // namespace aos::testing

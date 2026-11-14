@@ -1,6 +1,7 @@
 #include "aos/events/aio.h"
 
 #include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
 
 #include "aos/events/aio_internal.h"
 #include "aos/ipc_lib/thread_signal.h"
@@ -33,6 +34,18 @@ bool Aio::Poll(bool block) { return impl_->Poll(block); }
 void Aio::Quit() { impl_->Quit(); }
 
 bool Aio::should_run() const { return impl_->should_run(); }
+
+Aio::ExternalWait Aio::PrepareToWait() { return impl_->PrepareToWait(); }
+
+FileDescriptor Aio::WaitFd() { return impl_->WaitFd(); }
+
+Aio::ExternalWait Aio::Impl::PrepareToWait() {
+  ABSL_LOG(FATAL) << "This Aio backend can't be driven by another event loop";
+}
+
+FileDescriptor Aio::Impl::WaitFd() {
+  ABSL_LOG(FATAL) << "This Aio backend can't be driven by another event loop";
+}
 
 void Aio::AsyncRead(FileDescriptor fd, std::span<char> buffer,
                     AsyncRequest *request) {

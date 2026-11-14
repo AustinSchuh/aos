@@ -152,6 +152,9 @@ class KqueueImpl : public internal::ReadinessBackend {
   void RecreateKernelState() override;
   void WakeLoop() override;
   FileDescriptor wakeup_fd() const override { return wakeup_pipe_->read_fd(); }
+  // A kqueue's fd is readable while any of its events are pending: fds,
+  // EVFILT_TIMER timers, EVFILT_SIGNAL and the wakeup pipe are all on it.
+  FileDescriptor WaitFd() override { return kqueue_fd_; }
   void PrepareRawFd(FileDescriptor fd) override {
     internal::SetNonBlocking(fd);
   }

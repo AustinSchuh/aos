@@ -680,6 +680,31 @@ bool ReadinessBackend::Poll(bool block) {
   return processed;
 }
 
+Aio::ExternalWait ReadinessBackend::PrepareToWait() {
+  ABSL_CHECK(!in_poll_)
+      << "Aio::PrepareToWait() called from inside a completion callback or a "
+         "before-wait function; call it from the outer loop, between Poll()s";
+  CheckForFork();
+  if (!before_wait_functions_.empty()) {
+    // in_poll_ covers the before-wait functions here too, so one that calls
+    // Poll() dies as it would inside Poll().
+    struct InPoll {
+      bool *in_poll;
+      explicit InPoll(bool *p) : in_poll(p) { *in_poll = true; }
+      ~InPoll() { *in_poll = false; }
+    } in_poll_guard(&in_poll_);
+    before_wait_functions_.Run();
+    CheckForFork();
+  }
+  Aio::ExternalWait wait;
+  // Resolved but not yet delivered: a Poll(false) has a callback to run
+  // without asking the kernel.  Everything else -- fds, timers (timerfds and
+  // kqueue timers), the wakeup -- is a registration on the poller WaitFd()
+  // returns, so the deadline stays max_time.
+  wait.poll_now = !ready_.empty();
+  return wait;
+}
+
 bool ReadinessBackend::PollOnce(bool block) {
   if (!before_wait_functions_.empty()) {
     before_wait_functions_.Run();
