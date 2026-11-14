@@ -110,6 +110,19 @@ class SimulatedEventLoopFactory {
   // existing Run*() interfaces were swapped out unexpectedly.
   void Run();
   [[nodiscard]] Status NonFatalRun();
+
+  // NonFatalRun(), for a caller that drives scheduler_aio() itself rather
+  // than blocking in it: another event loop, such as tokio (see
+  // documentation/adr/0008-tokio-on-the-event-loop-thread.md).  Call
+  // StartExternalRun(), drive scheduler_aio() (see Aio::PrepareToWait())
+  // while is_running(), then call FinishExternalRun(), which returns what
+  // NonFatalRun() would have.
+  [[nodiscard]] Status StartExternalRun();
+  [[nodiscard]] Status FinishExternalRun();
+  bool is_running() const { return scheduler_scheduler_.is_running(); }
+  // See EventSchedulerScheduler::EndSlice().
+  void EndSlice() { scheduler_scheduler_.EndSlice(); }
+
   // Executes the event loops for a duration.
   void RunFor(distributed_clock::duration duration);
   [[nodiscard]] Status NonFatalRunFor(distributed_clock::duration duration);
@@ -238,6 +251,9 @@ class SimulatedEventLoopFactory {
   // Creates a new log sink depending on whether --use_simulated_clocks_for_logs
   // is set.
   std::unique_ptr<SimulatedEventLoopLogSink> MaybeCreateSimulatedLogSink();
+
+  // NonFatalRun()'s log sink, for the length of an external run.
+  std::unique_ptr<SimulatedEventLoopLogSink> external_run_log_sink_;
 
   const Configuration *const configuration_;
   EventSchedulerScheduler scheduler_scheduler_;

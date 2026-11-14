@@ -1982,6 +1982,25 @@ Result<void> SimulatedEventLoopFactory::NonFatalRun() {
   return result.and_then([this]() { return GetAndClearExitStatus(); });
 }
 
+Status SimulatedEventLoopFactory::StartExternalRun() {
+  external_run_log_sink_ = MaybeCreateSimulatedLogSink();
+  return scheduler_scheduler_.StartExternalRun();
+}
+
+Status SimulatedEventLoopFactory::FinishExternalRun() {
+  const Result<void> result = scheduler_scheduler_.FinishExternalRun();
+  external_run_log_sink_.reset();
+  for (std::unique_ptr<NodeEventLoopFactory> &node : node_factories_) {
+    if (node) {
+      ABSL_CHECK(!node->is_running());
+      for (SimulatedEventLoop *loop : node->event_loops_) {
+        ABSL_CHECK(!loop->is_running());
+      }
+    }
+  }
+  return result.and_then([this]() { return GetAndClearExitStatus(); });
+}
+
 void SimulatedEventLoopFactory::Exit(Result<void> status) {
   if (!exit_status_.has_value()) {
     exit_status_ = std::move(status);

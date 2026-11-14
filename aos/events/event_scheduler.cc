@@ -368,167 +368,218 @@ Status EventSchedulerScheduler::Run() {
   AOS_RETURN_IF_ERROR(MaybeRunOnStartup());
 
   // Run all the sub-event-schedulers.
-  const Status result = RunMaybeRealtimeLoop([this]() -> Status {
-    std::tuple<distributed_clock::time_point, EventScheduler *> oldest_event;
-    AOS_ASSIGN_OR_RETURN_ERROR(oldest_event, OldestEvent());
-    if (!reboots_.empty() &&
-        std::get<0>(reboots_.front()) <= std::get<0>(oldest_event)) {
-      // Reboot is next.
-      ABSL_CHECK_LE(now_,
-                    std::get<0>(reboots_.front()) + std::chrono::nanoseconds(1))
-          << ": Simulated time went backwards by too much.  Please "
-             "investigate.";
-      now_ = std::get<0>(reboots_.front());
-      AOS_RETURN_IF_ERROR(Reboot());
-      reboots_.erase(reboots_.begin());
-      return Ok();
-    }
-    // No events left, bail.
-    if (std::get<0>(oldest_event) == distributed_clock::max_time) {
-      is_running_ = false;
-      return Ok();
-    }
-
-    // We get to pick our tradeoffs here.  Either we assume that there are no
-    // backward step changes in our time function for each node, or we have to
-    // let time go backwards.  We currently only really see this happen when 2
-    // events are scheduled for "now", time changes, and there is a nanosecond
-    // or two of rounding due to integer math.
-    //
-    // //aos/events/logging:logger_test triggers this.
-    ABSL_CHECK_LE(now_, std::get<0>(oldest_event) + std::chrono::nanoseconds(1))
-        << ": Simulated time went backwards by too much.  Please investigate.";
-    now_ = std::get<0>(oldest_event);
-
-    return std::get<1>(oldest_event)->CallOldestEvent();
-  });
+  const Status result =
+      RunMaybeRealtimeLoop([this]() -> Status { return RunOneEvent(); });
 
   MaybeRunStopped();
   return result;
 }
 
+Status EventSchedulerScheduler::RunOneEvent() {
+  std::tuple<distributed_clock::time_point, EventScheduler *> oldest_event;
+  AOS_ASSIGN_OR_RETURN_ERROR(oldest_event, OldestEvent());
+  if (!reboots_.empty() &&
+      std::get<0>(reboots_.front()) <= std::get<0>(oldest_event)) {
+    // Reboot is next.
+    ABSL_CHECK_LE(now_,
+                  std::get<0>(reboots_.front()) + std::chrono::nanoseconds(1))
+        << ": Simulated time went backwards by too much.  Please "
+           "investigate.";
+    now_ = std::get<0>(reboots_.front());
+    AOS_RETURN_IF_ERROR(Reboot());
+    reboots_.erase(reboots_.begin());
+    return Ok();
+  }
+  // No events left, bail.
+  if (std::get<0>(oldest_event) == distributed_clock::max_time) {
+    is_running_ = false;
+    return Ok();
+  }
+
+  // We get to pick our tradeoffs here.  Either we assume that there are no
+  // backward step changes in our time function for each node, or we have to
+  // let time go backwards.  We currently only really see this happen when 2
+  // events are scheduled for "now", time changes, and there is a nanosecond
+  // or two of rounding due to integer math.
+  //
+  // //aos/events/logging:logger_test triggers this.
+  ABSL_CHECK_LE(now_, std::get<0>(oldest_event) + std::chrono::nanoseconds(1))
+      << ": Simulated time went backwards by too much.  Please investigate.";
+  now_ = std::get<0>(oldest_event);
+
+  return std::get<1>(oldest_event)->CallOldestEvent();
+}
+
+Status EventSchedulerScheduler::StartExternalRun() {
+  ABSL_CHECK(!external_loop_) << ": StartExternalRun() twice";
+  AOS_RETURN_IF_ERROR(MaybeRunOnStartup());
+  AOS_ASSIGN_OR_RETURN_ERROR(
+      external_loop_,
+      StartRealtimeLoop([this]() -> Status { return RunOneEvent(); },
+                        /*external=*/true));
+  return Ok();
+}
+
 // At an infinite replay rate, how long the timer callback runs events before
 // returning to aio_ (rearmed to fire again at once), so that anything else on
-// it -- fds registered through scheduler_aio() -- gets a turn.  Event order is
-// unaffected.
+// it -- fds registered through scheduler_aio(), or an outer loop driving it
+// (StartExternalRun()) -- gets a turn.  Event order is unaffected.
 constexpr std::chrono::milliseconds kInfiniteRateSlice{5};
 
-template <typename F>
-Result<void> EventSchedulerScheduler::RunMaybeRealtimeLoop(F loop_body) {
-  Aio::Timer timer(&aio_);
+struct EventSchedulerScheduler::RealtimeLoop {
+  RealtimeLoop(EventSchedulerScheduler *self, Aio *aio,
+               std::function<Status()> loop_body, bool external)
+      : self(self),
+        timer(aio),
+        loop_body(std::move(loop_body)),
+        external(external) {}
+
+  EventSchedulerScheduler *self;
+  Aio::Timer timer;
+  distributed_clock::time_point last_distributed_clock;
+  monotonic_clock::time_point last_monotonic_clock;
+  Result<void> result{};
+  std::function<Status()> loop_body;
+  // Someone other than RunMaybeRealtimeLoop() drives aio_, and watches
+  // is_running_ rather than a Quit().
+  const bool external;
+
+  // Stops: an external driver sees is_running_; a blocking one needs its
+  // Run() ended.  Not Quit() for an external one, whose latch only a Run()
+  // clears, so a later Run() would start out draining.
+  void Stop() {
+    if (!external) {
+      self->aio_.Quit();
+    }
+  }
+
+  // Timer completions are Ok() by contract (see Aio::Timer::Schedule()), so
+  // CHECK rather than handle.  This timer is not the only thing on aio_:
+  // log_web_proxy_main, in_process_plotter, localizer_replay, and
+  // glib_main_loop_test register their own fds on the same loop via
+  // scheduler_aio(), and an external driver runs its own work around it.
+  static void OnTimer(Completion completion, void *ctx) {
+    ABSL_CHECK(completion.status.has_value());
+    auto c = static_cast<RealtimeLoop *>(ctx);
+    if (!c->self->is_running_) {
+      c->Stop();
+      return;
+    }
+    const monotonic_clock::time_point slice_end =
+        monotonic_clock::now() + kInfiniteRateSlice;
+    c->self->end_slice_ = false;
+    // Call loop_body() at least once; if we are in infinite-speed replay, we
+    // don't actually want/need the context switches from the timer, so just
+    // loop, for up to a slice.  This is deliberately written to support the
+    // user changing replay rates dynamically.
+    do {
+      c->result = c->loop_body();
+      if (!c->result.has_value()) {
+        c->self->is_running_ = false;
+      }
+      if (c->self->is_running_) {
+        // Sleep until the *next* event, not the one we just handled --
+        // otherwise every event fires immediately no matter how far apart
+        // they were scheduled.
+        const Result<
+            std::tuple<distributed_clock::time_point, EventScheduler *>>
+            next_oldest_event = c->self->OldestEvent();
+        if (!next_oldest_event.has_value()) {
+          // Propagate the error.
+          c->result = MakeError(next_oldest_event.error());
+          c->self->is_running_ = false;
+        } else if (distributed_clock::time_point next_event_time =
+                       std::get<0>(next_oldest_event.value());
+                   next_event_time != distributed_clock::max_time) {
+          // Only arm the timer when something will wait on it.  At infinite
+          // rate the do/while below drains events without returning to the
+          // loop, so a timer would never drive progress, and Schedule() is
+          // not free.
+          //
+          // A rate change inside loop_body() still works: this test and the
+          // while condition below read replay_rate_ at the same point, so
+          // switching off infinity here takes this branch and leaves with a
+          // timer armed.
+          if (c->self->replay_rate_ !=
+              std::numeric_limits<double>::infinity()) {
+            // Schedule the next event.
+            const monotonic_clock::time_point next_trigger =
+                c->last_monotonic_clock +
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    (next_event_time - c->last_distributed_clock) /
+                    c->self->replay_rate_);
+            c->timer.Schedule(next_trigger, &RealtimeLoop::OnTimer, c);
+            c->last_monotonic_clock = next_trigger;
+          }
+          c->last_distributed_clock = next_event_time;
+        } else {
+          // We're out of events.  loop_body deals with that: it sets
+          // is_running_ to false and does any other bookkeeping it needs.  At
+          // an infinite rate the loop below runs it again right away.
+          // Otherwise there is no next event to arm the timer for, so arm it
+          // for now, and the next callback runs it.
+          if (c->self->replay_rate_ !=
+              std::numeric_limits<double>::infinity()) {
+            c->timer.Schedule(monotonic_clock::now(), &RealtimeLoop::OnTimer,
+                              c);
+          }
+          continue;
+        }
+      }
+    } while (c->self->replay_rate_ == std::numeric_limits<double>::infinity() &&
+             c->self->is_running_ && !c->self->end_slice_ &&
+             monotonic_clock::now() < slice_end);
+
+    if (!c->self->is_running_) {
+      c->Stop();
+    } else if (c->self->replay_rate_ ==
+               std::numeric_limits<double>::infinity()) {
+      // The slice ran out, or EndSlice() ended it: give the rest of aio_ a
+      // turn, and carry on as soon as it has had one.
+      c->timer.Schedule(monotonic_clock::now(), &RealtimeLoop::OnTimer, c);
+    }
+  }
+};
+
+EventSchedulerScheduler::EventSchedulerScheduler() = default;
+
+EventSchedulerScheduler::~EventSchedulerScheduler() {
+  ABSL_CHECK(!external_loop_)
+      << ": Destroyed during an external run; call FinishExternalRun() first";
+}
+
+Result<std::unique_ptr<EventSchedulerScheduler::RealtimeLoop>>
+EventSchedulerScheduler::StartRealtimeLoop(std::function<Status()> loop_body,
+                                           bool external) {
   ABSL_CHECK_LT(0.0, replay_rate_) << "Replay rate must be positive.";
   std::tuple<distributed_clock::time_point, EventScheduler *> oldest_event;
   AOS_ASSIGN_OR_RETURN_ERROR(oldest_event, OldestEvent());
-  distributed_clock::time_point last_distributed_clock =
-      std::get<0>(oldest_event);
-  monotonic_clock::time_point last_monotonic_clock = monotonic_clock::now();
+  auto loop = std::make_unique<RealtimeLoop>(this, &aio_, std::move(loop_body),
+                                             external);
+  loop->last_distributed_clock = std::get<0>(oldest_event);
+  loop->last_monotonic_clock = monotonic_clock::now();
+  loop->timer.Schedule(loop->last_monotonic_clock, &RealtimeLoop::OnTimer,
+                       loop.get());
+  return loop;
+}
 
-  Result<void> result{};
-
-  struct Context {
-    EventSchedulerScheduler *self;
-    Aio::Timer *timer;
-    distributed_clock::time_point *last_distributed_clock;
-    monotonic_clock::time_point *last_monotonic_clock;
-    Result<void> *result;
-    std::function<Result<void>()> loop_body;
-
-    // Timer completions are Ok() by contract (see Aio::Timer::Schedule()),
-    // so CHECK rather than handle.  This timer is not the only thing on
-    // aio_: log_web_proxy_main, in_process_plotter, localizer_replay, and
-    // glib_main_loop_test register their own fds on the same loop via
-    // scheduler_aio().
-    static void OnTimer(Completion completion, void *ctx) {
-      ABSL_CHECK(completion.status.has_value());
-      auto c = static_cast<Context *>(ctx);
-      if (!c->self->is_running_) {
-        c->self->aio_.Quit();
-        return;
-      }
-      const monotonic_clock::time_point slice_end =
-          monotonic_clock::now() + kInfiniteRateSlice;
-      // Call loop_body() at least once; if we are in infinite-speed replay,
-      // we don't actually want/need the context switches from the timer, so
-      // just loop, for up to a slice.
-      // This is deliberately written to support the user changing replay
-      // rates dynamically.
-      do {
-        *c->result = c->loop_body();
-        if (!c->result->has_value()) {
-          c->self->is_running_ = false;
-        }
-        if (c->self->is_running_) {
-          // Sleep until the *next* event, not the one we just handled --
-          // otherwise every event fires immediately no matter how far apart
-          // they were scheduled.
-          const Result<
-              std::tuple<distributed_clock::time_point, EventScheduler *>>
-              next_oldest_event = c->self->OldestEvent();
-          if (!next_oldest_event.has_value()) {
-            // Propagate the error.
-            *c->result = MakeError(next_oldest_event.error());
-            c->self->is_running_ = false;
-          } else if (distributed_clock::time_point next_event_time =
-                         std::get<0>(next_oldest_event.value());
-                     next_event_time != distributed_clock::max_time) {
-            // Only arm the timer when something will wait on it.  At
-            // infinite rate the do/while below drains every event without
-            // returning to the loop, so a timer would never drive progress,
-            // and Schedule() is not free.
-            //
-            // A rate change inside loop_body() still works: this test and
-            // the while condition below read replay_rate_ at the same point,
-            // so switching off infinity here takes this branch and leaves
-            // with a timer armed.
-            if (c->self->replay_rate_ !=
-                std::numeric_limits<double>::infinity()) {
-              // Schedule the next event.
-              const monotonic_clock::time_point next_trigger =
-                  *c->last_monotonic_clock +
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      (next_event_time - *c->last_distributed_clock) /
-                      c->self->replay_rate_);
-              c->timer->Schedule(next_trigger, &Context::OnTimer, c);
-              *c->last_monotonic_clock = next_trigger;
-            }
-            *c->last_distributed_clock = next_event_time;
-          } else {
-            // We're out of events.  loop_body deals with that: it sets
-            // is_running_ to false and does any other bookkeeping it needs.
-            // At an infinite rate the loop below runs it again right away.
-            // Otherwise there is no next event to arm the timer for, so arm
-            // it for now, and the next callback runs it.
-            if (c->self->replay_rate_ !=
-                std::numeric_limits<double>::infinity()) {
-              c->timer->Schedule(monotonic_clock::now(), &Context::OnTimer, c);
-            }
-            continue;
-          }
-        }
-      } while (c->self->replay_rate_ ==
-                   std::numeric_limits<double>::infinity() &&
-               c->self->is_running_ && monotonic_clock::now() < slice_end);
-
-      if (!c->self->is_running_) {
-        c->self->aio_.Quit();
-      } else if (c->self->replay_rate_ ==
-                 std::numeric_limits<double>::infinity()) {
-        // The slice ran out: give the rest of aio_ a turn, and carry on as
-        // soon as it has had one.
-        c->timer->Schedule(monotonic_clock::now(), &Context::OnTimer, c);
-      }
-    }
-  };
-
-  Context ctx{this,
-              &timer,
-              &last_distributed_clock,
-              &last_monotonic_clock,
-              &result,
-              std::move(loop_body)};
-  timer.Schedule(last_monotonic_clock, &Context::OnTimer, &ctx);
-
+Result<void> EventSchedulerScheduler::RunMaybeRealtimeLoop(
+    std::function<Status()> loop_body) {
+  std::unique_ptr<RealtimeLoop> loop;
+  AOS_ASSIGN_OR_RETURN_ERROR(
+      loop, StartRealtimeLoop(std::move(loop_body), /*external=*/false));
   aio_.Run();
+  return loop->result;
+}
+
+Status EventSchedulerScheduler::FinishExternalRun() {
+  ABSL_CHECK(external_loop_) << ": FinishExternalRun() without a start";
+  ABSL_CHECK(!is_running_)
+      << ": FinishExternalRun() while still running; drive aio() until "
+         "is_running() is false";
+  const Status result = external_loop_->result;
+  external_loop_.reset();
+  MaybeRunStopped();
   return result;
 }
 
