@@ -194,7 +194,7 @@ cc_library(
         "@platforms//os:linux",
     ],
     deps = [
-        ":nvjpeg_decoder_lib",
+        ":nvmedia_jpeg_decoder",
         "//aos:realtime",
         "//aos/containers:inlined_vector",
         "//aos/events:event_loop",
@@ -203,6 +203,41 @@ cc_library(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+# NvjpegDecoder on a real ShmEventLoop, on each NVJPG engine, checked frame by
+# frame against turbojpeg.  Needs the NVJPG engines: copy to the Orin and run
+# by hand.
+cc_test(
+    name = "nvjpeg_decoder_service_test",
+    srcs = ["nvjpeg_decoder_service_test.cc"],
+    data = [
+        "testdata/seq_040.jpg",
+        "testdata/seq_080.jpg",
+        "testdata/seq_120.jpg",
+        "testdata/seq_200.jpg",
+        "//frc/vision:aos_config",
+    ],
+    tags = ["manual"],
+    target_compatible_with = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        ":gray_image_diff",
+        ":nvjpeg_decoder_service",
+        "//aos:configuration",
+        "//aos/events:shm_event_loop",
+        "//aos/network:team_number",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing:tmpdir",
+        "//frc/vision:vision_fbs",
+        "//third_party:libturbojpeg",
+        "@com_google_absl//absl/flags:reflection",
+        "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/strings",
     ],
 )

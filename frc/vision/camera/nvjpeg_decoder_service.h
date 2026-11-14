@@ -5,7 +5,7 @@
 
 #include "aos/containers/inlined_vector.h"
 #include "aos/events/event_loop.h"
-#include "frc/vision/camera/nvjpeg_decoder_lib.h"
+#include "frc/vision/camera/nvmedia_jpeg_decoder.h"
 #include "frc/vision/turbojpeg_decoder_status_static.h"
 #include "frc/vision/vision_generated.h"
 
@@ -13,31 +13,28 @@ namespace frc::vision {
 
 // NVJPG Hardware JPEG Decoder for Jetson Orin.
 //
-// Drop-in alternative to turbojpeg_decoder that decodes through libnvjpeg on
-// the Orin's dedicated NVJPG hardware engine.  Dies loudly at startup (or on
-// any frame) if the engine is unavailable -- no silent CPU fallback; CPU
-// decode is turbojpeg_decoder's job.  Mirrors turbojpeg_decoder's interface
-// exactly -- same flags, same MONO8 output and TurboJpegDecoderStatus on the
-// same /cameraX/gray channel -- so swapping decoders is just an
+// Drop-in alternative to turbojpeg_decoder that decodes on one of the Orin's
+// two NVJPG hardware engines, chosen with --nvjpg_engine, through NvMedia's
+// JPEG decoder (see nvmedia_jpeg_decoder.h).  Dies loudly at startup if the
+// engine is unavailable -- no silent CPU fallback; CPU decode is
+// turbojpeg_decoder's job.  Mirrors turbojpeg_decoder's interface -- same
+// flags (plus --nvjpg_engine), same MONO8 output and TurboJpegDecoderStatus
+// on the same /cameraX/gray channel -- so swapping decoders is an
 // executable_name change in the config.
 //
-// The hardware decoder is most effective under sustained multi-camera load,
-// where the engine does the decode work while CPU cores stay free for
-// AprilTag detection and pose estimation.  Measured on an Orin Nano
-// (JetPack 6, L4T r36.4), 1280x800 4:2:2 UVC frames at 120 Hz: 3.56 ms
-// per frame and 0.19 cores per camera, vs 3.3 ms and 0.40 cores for
-// turbojpeg.
+// One engine decodes about 450 1280x800 frames a second, so four 120 Hz
+// cameras need both: split the cameras' decoders across the engines in the
+// config.
 //
-// libnvjpeg is closed-source and has returned stale or delayed pixels while
-// reporting success on other call sequences.  This class does not check its
-// output itself, so the nvjpeg_decoder service adds no CPU decode load:
-// nvjpeg_seq_test checks the library against turbojpeg on real camera
-// frames, and nvjpeg_decoder_verify overrides CheckDecode to also decode
-// every frame with turbojpeg and die if the hardware output does not match.
+// Each frame is decoded straight into the outgoing message's shared memory
+// (the engine's luma plane copied out on the CPU, 0.1 ms at 1280x800), so a
+// detector that registers the channel with CUDA reads it in place.
 //
-// There is deliberately no startup self-test on synthetic frames: decoding
-// them while the rest of the stack starts made libnvjpeg hang in about 8% of
-// decoder starts on the bench, and 0 of 96 without it.
+// The decoder does not check its own output, so the nvjpeg_decoder service
+// adds no CPU decode load: nvmedia_jpeg_decoder_test checks it against
+// turbojpeg on real camera frames, and nvjpeg_decoder_verify overrides
+// CheckDecode to also decode every frame with turbojpeg and die if the
+// hardware output does not match.
 class NvjpegDecoder {
  public:
   explicit NvjpegDecoder(aos::EventLoop *event_loop);
@@ -55,7 +52,7 @@ class NvjpegDecoder {
   void SendStatus();
 
   aos::EventLoop *event_loop_;
-  NvJpegDecoderLib hw_decoder_;
+  NvMediaJpegDecoder hw_decoder_;
   aos::Sender<CameraImage> camera_output_sender_;
 
   aos::Sender<TurboJpegDecoderStatusStatic> status_sender_;

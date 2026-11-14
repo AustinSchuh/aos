@@ -18,6 +18,11 @@ ABSL_FLAG(uint32_t, skip, 0,
           "Number of images to skip to reduce the framerate of inference to "
           "reduce GPU load.");
 
+ABSL_FLAG(int32_t, nvjpg_engine, 0,
+          "Which of the Orin's two NVJPG engines, 0 or 1, decodes this camera. "
+          "One engine runs out at about 450 1280x800 frames a second, so "
+          "split the cameras across both.");
+
 ABSL_FLAG(uint32_t, max_image_age_ms, 50,
           "Skip images older than this.  Keeps a (re)starting decoder from "
           "burning through a queued backlog faster than the output channel's "
@@ -27,6 +32,7 @@ namespace frc::vision {
 
 NvjpegDecoder::NvjpegDecoder(aos::EventLoop *event_loop)
     : event_loop_(event_loop),
+      hw_decoder_(absl::GetFlag(FLAGS_nvjpg_engine)),
       camera_output_sender_(event_loop_->MakeSender<CameraImage>(
           absl::StrCat(absl::GetFlag(FLAGS_channel), "/gray"))),
       status_sender_(event_loop_->MakeSender<TurboJpegDecoderStatusStatic>(
@@ -90,22 +96,27 @@ void NvjpegDecoder::ProcessImage(const CameraImage &image) {
       builder.fbb()->CreateUninitializedVector(gray_size, 1, &image_data_ptr);
 
   // On failure the builder is dropped without Send, like turbojpeg_decoder.
-  NvJpegDecoderLib::Result result;
-  {
-    aos::ScopedNotRealtime nrt;
-    if (!hw_decoder_.DecodeToGray(image.data()->data(), image.data()->size(),
-                                  image_data_ptr, gray_size, &result)) {
-      ++failed_decodes_;
-      // The library only VLOGs failures; the status channel carries the
-      // reason (truncated to the message field's static_length).
-      const std::string_view error = hw_decoder_.last_error();
-      const size_t truncated_len =
-          std::min(error.size(), last_error_message_.capacity());
-      last_error_message_.resize(truncated_len);
-      memcpy(last_error_message_.data(), error.data(), truncated_len);
-      return;
+  // Realtime-safe: the decoder steps out of realtime itself where NVIDIA's
+  // code allocates.
+  const aos::Result<NvMediaJpegDecoder::ImageSize> decoded =
+      hw_decoder_.DecodeToGray(image.data()->data(), image.data()->size(),
+                               image_data_ptr, gray_size);
+  if (!decoded.has_value()) {
+    ++failed_decodes_;
+    // The status channel carries the reason (truncated to the message
+    // field's static_length).
+    const std::string_view error = decoded.error().message();
+    const size_t truncated_len =
+        std::min(error.size(), last_error_message_.capacity());
+    last_error_message_.resize(truncated_len);
+    memcpy(last_error_message_.data(), error.data(), truncated_len);
+    if (ABSL_VLOG_IS_ON(1)) {
+      aos::ScopedNotRealtime not_realtime;
+      ABSL_VLOG(1) << decoded.error();
     }
+    return;
   }
+  const NvMediaJpegDecoder::ImageSize result = decoded.value();
   if (result.width != cols || result.height != rows) {
     ++failed_decodes_;
     constexpr std::string_view kError =
@@ -153,8 +164,9 @@ void NvjpegDecoder::ProcessImage(const CameraImage &image) {
                          1000000;
   max_publish_age_ms_ = std::max(max_publish_age_ms_, age_ms);
 
-  ABSL_VLOG(1) << "NVJPG decoded " << image.data()->size() << " bytes to "
-               << result.width << "x" << result.height << " in "
+  ABSL_VLOG(1) << "NVJPG" << hw_decoder_.engine() << " decoded "
+               << image.data()->size() << " bytes to " << result.width << "x"
+               << result.height << " in "
                << std::chrono::duration<double>(
                       event_loop_->monotonic_now() -
                       event_loop_->context().monotonic_event_time)
