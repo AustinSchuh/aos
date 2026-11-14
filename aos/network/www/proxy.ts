@@ -105,7 +105,9 @@ export class Connection {
 
   constructor() {
     const server = location.host;
-    this.webSocketUrl = `ws://${server}/ws`;
+    // A page served over https may only open wss:// websockets.
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    this.webSocketUrl = `${scheme}://${server}/ws`;
   }
 
   addConfigHandler(handler: (config: Configuration) => void): void {
