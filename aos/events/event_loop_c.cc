@@ -454,6 +454,68 @@ aos_event_loop_t *aos_shm_event_loop_create(
       static_cast<aos::EventLoop *>(event_loop.release()));
 }
 
+aos_event_loop_t *aos_shm_event_loop_create_on_aio(
+    const aos_configuration_t *configuration, aos_aio_t *aio) {
+  auto event_loop = std::make_unique<aos::ShmEventLoop>(
+      reinterpret_cast<const aos::Configuration *>(configuration),
+      reinterpret_cast<aos::Aio *>(ABSL_DIE_IF_NULL(aio)));
+  return reinterpret_cast<aos_event_loop_t *>(
+      static_cast<aos::EventLoop *>(event_loop.release()));
+}
+
+void aos_shm_event_loop_startup(aos_event_loop_t *self) {
+  static_cast<aos::ShmEventLoop *>(
+      reinterpret_cast<aos::EventLoop *>(ABSL_DIE_IF_NULL(self)))
+      ->Startup();
+}
+
+aos_error_t *aos_shm_event_loop_shutdown(aos_event_loop_t *self) {
+  return to_error_t(
+      static_cast<aos::ShmEventLoop *>(
+          reinterpret_cast<aos::EventLoop *>(ABSL_DIE_IF_NULL(self)))
+          ->Shutdown());
+}
+
+aos_aio_t *aos_aio_create(void) {
+  return reinterpret_cast<aos_aio_t *>(new aos::Aio());
+}
+
+void aos_aio_destroy(aos_aio_t *self) {
+  delete reinterpret_cast<aos::Aio *>(self);
+}
+
+bool aos_aio_poll(aos_aio_t *self, bool block) {
+  return reinterpret_cast<aos::Aio *>(ABSL_DIE_IF_NULL(self))->Poll(block);
+}
+
+bool aos_aio_should_run(aos_aio_t *self) {
+  return reinterpret_cast<aos::Aio *>(ABSL_DIE_IF_NULL(self))->should_run();
+}
+
+int64_t aos_monotonic_clock_now(void) {
+  return aos::monotonic_clock::now().time_since_epoch().count();
+}
+
+void aos_aio_prepare_to_wait(aos_aio_t *self, bool *poll_now,
+                             int64_t *deadline_ns) {
+  const aos::Aio::ExternalWait wait =
+      reinterpret_cast<aos::Aio *>(ABSL_DIE_IF_NULL(self))->PrepareToWait();
+  *poll_now = wait.poll_now;
+  *deadline_ns = wait.deadline == aos::monotonic_clock::max_time
+                     ? INT64_MAX
+                     : wait.deadline.time_since_epoch().count();
+}
+
+intptr_t aos_aio_wait_fd(aos_aio_t *self) {
+  const aos::FileDescriptor fd =
+      reinterpret_cast<aos::Aio *>(ABSL_DIE_IF_NULL(self))->WaitFd();
+#if defined(_WIN32)
+  return reinterpret_cast<intptr_t>(fd);
+#else
+  return static_cast<intptr_t>(fd);
+#endif
+}
+
 void aos_init(int *argc, char ***argv) { aos::InitGoogle(argc, argv); }
 
 const void *aos_configuration_buffer_get_data(
