@@ -59,6 +59,11 @@ impl<'config> SimulatedEventLoopFactory<'config> {
     /// You probably don't want to call this directly if you're creating a Rust application. This
     /// is intended for creating C++ applications. Use [`Self::make_runtime`] instead when creating Rust
     /// applications.
+    /// The underlying C++ factory, for code that drives it itself (e.g. `aos_events_tokio`).
+    pub fn as_raw(&mut self) -> *mut aos_simulated_event_loop_factory_t {
+        self.factory
+    }
+
     pub fn make_event_loop(&mut self, name: &str, node_name: &str) -> *mut aos_event_loop_t {
         let name_c = CString::new(name).unwrap();
         let node_c = CString::new(node_name).unwrap();

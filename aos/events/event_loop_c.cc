@@ -699,6 +699,40 @@ aos_exit_handle_t *aos_simulated_event_loop_factory_make_exit_handle(
   return reinterpret_cast<aos_exit_handle_t *>(exit_handle.release());
 }
 
+aos_aio_t *aos_simulated_event_loop_factory_scheduler_aio(
+    aos_simulated_event_loop_factory_t *self) {
+  return reinterpret_cast<aos_aio_t *>(
+      reinterpret_cast<aos::SimulatedEventLoopFactory *>(ABSL_DIE_IF_NULL(self))
+          ->scheduler_aio());
+}
+
+aos_error_t *aos_simulated_event_loop_factory_start_external_run(
+    aos_simulated_event_loop_factory_t *self) {
+  return to_error_t(
+      reinterpret_cast<aos::SimulatedEventLoopFactory *>(ABSL_DIE_IF_NULL(self))
+          ->StartExternalRun());
+}
+
+aos_error_t *aos_simulated_event_loop_factory_finish_external_run(
+    aos_simulated_event_loop_factory_t *self) {
+  return to_error_t(
+      reinterpret_cast<aos::SimulatedEventLoopFactory *>(ABSL_DIE_IF_NULL(self))
+          ->FinishExternalRun());
+}
+
+void aos_simulated_event_loop_factory_end_slice(
+    aos_simulated_event_loop_factory_t *self) {
+  reinterpret_cast<aos::SimulatedEventLoopFactory *>(ABSL_DIE_IF_NULL(self))
+      ->EndSlice();
+}
+
+bool aos_simulated_event_loop_factory_is_running(
+    aos_simulated_event_loop_factory_t *self) {
+  return reinterpret_cast<aos::SimulatedEventLoopFactory *>(
+             ABSL_DIE_IF_NULL(self))
+      ->is_running();
+}
+
 aos_simulated_event_loop_factory_t *aos_simulated_event_loop_factory_create(
     const aos_configuration_t *configuration) {
   auto factory = std::make_unique<aos::SimulatedEventLoopFactory>(

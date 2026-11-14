@@ -58,16 +58,22 @@ use tokio::{io::unix::AsyncFd, sync::Notify};
 
 use aos_events_event_loop_c::{
     aos_aio_create, aos_aio_destroy, aos_aio_poll, aos_aio_prepare_to_wait, aos_aio_should_run,
-    aos_aio_t, aos_aio_wait_fd, aos_context_t, aos_error_code, aos_error_destroy,
+    aos_aio_t, aos_aio_wait_fd, aos_context_t, aos_error_code, aos_error_destroy, aos_error_t,
     aos_event_loop_add_timer, aos_event_loop_destroy, aos_event_loop_make_fetcher,
     aos_event_loop_make_no_arg_watcher, aos_event_loop_make_sender, aos_event_loop_monotonic_now,
     aos_event_loop_t, aos_exit_handle_destroy, aos_exit_handle_exit, aos_exit_handle_t,
     aos_fetcher_context, aos_fetcher_destroy, aos_fetcher_fetch, aos_fetcher_fetch_next,
     aos_fetcher_t, aos_monotonic_clock_now, aos_sender_destroy, aos_sender_send_copy, aos_sender_t,
     aos_shm_event_loop_create_on_aio, aos_shm_event_loop_make_exit_handle,
-    aos_shm_event_loop_shutdown, aos_shm_event_loop_startup, aos_timer_handler_schedule,
-    aos_timer_handler_t,
+    aos_shm_event_loop_shutdown, aos_shm_event_loop_startup,
+    aos_simulated_event_loop_factory_end_slice,
+    aos_simulated_event_loop_factory_finish_external_run,
+    aos_simulated_event_loop_factory_is_running, aos_simulated_event_loop_factory_make_exit_handle,
+    aos_simulated_event_loop_factory_scheduler_aio,
+    aos_simulated_event_loop_factory_start_external_run, aos_simulated_event_loop_factory_t,
+    aos_timer_handler_schedule, aos_timer_handler_t,
 };
+use aos_events_simulated_event_loop::SimulatedEventLoopFactory;
 
 /// The `Aio` an event loop runs on, driven from tokio.
 struct Aio(*mut aos_aio_t);
@@ -141,18 +147,33 @@ unsafe impl Send for AioForParkHook {}
 // SAFETY: As above.
 unsafe impl Sync for AioForParkHook {}
 
-/// Drives `aio` until it is told to stop: drains it with `Poll(false)`, asks `PrepareToWait()`,
-/// and waits for its fd, its deadline, or the park hook.
-async fn drive(aio: &Aio, wait_fd: RawFd, park: &ParkState) {
-    // SAFETY: The Aio owns the fd and outlives this future: run() drops the future before it
-    // destroys the Aio.
+/// How many AOS callbacks to run before letting tokio's tasks have a turn.  Poll() runs one each,
+/// and something can keep it busy forever: a simulation at an infinite replay rate rearms its
+/// timer for "now" after every slice of events.
+const POLLS_PER_TURN: usize = 64;
+
+/// Drives `aio` until `keep_going` says to stop: drains it with `Poll(false)`, asks
+/// `PrepareToWait()`, and waits for its fd, its deadline, or the park hook.
+async fn drive(aio: &Aio, wait_fd: RawFd, park: &ParkState, keep_going: &dyn Fn(&Aio) -> bool) {
+    // SAFETY: The Aio owns the fd and outlives this future: run() and run_simulation() drop the
+    // future before the Aio can go.
     let wait_fd =
         unsafe { AsyncFd::register_with_interest(WaitFd(wait_fd), tokio::io::Interest::READABLE) }
             .expect("Failed to register the Aio's wait fd with tokio");
     loop {
-        while aio.poll() {}
-        if !aio.should_run() {
+        let mut polls = 0;
+        while polls < POLLS_PER_TURN && aio.poll() {
+            if !keep_going(aio) {
+                return;
+            }
+            polls += 1;
+        }
+        if !keep_going(aio) {
             return;
+        }
+        if polls == POLLS_PER_TURN {
+            tokio::task::yield_now().await;
+            continue;
         }
         let Some(deadline_ns) = aio.prepare_to_wait() else {
             // Poll() has more to deliver right away, but let tokio's tasks run first.
@@ -160,15 +181,7 @@ async fn drive(aio: &Aio, wait_fd: RawFd, park: &ParkState) {
             continue;
         };
         park.armed_deadline_ns.store(deadline_ns, Ordering::Relaxed);
-        let sleep = async {
-            if deadline_ns == i64::MAX {
-                std::future::pending::<()>().await;
-            }
-            // SAFETY: Takes no arguments and only reads a clock.
-            let now_ns = unsafe { aos_monotonic_clock_now() };
-            let remaining = u64::try_from(deadline_ns.saturating_sub(now_ns)).unwrap_or(0);
-            tokio::time::sleep(Duration::from_nanos(remaining)).await;
-        };
+        let sleep = sleep_until_ns(deadline_ns);
         tokio::select! {
             guard = wait_fd.readable() => {
                 // Readiness is level-triggered on the Aio's side: Poll() does the consuming, so
@@ -240,42 +253,11 @@ impl<'config> TokioShmEventLoop<'config> {
         let wait_fd = self.aio.wait_fd();
 
         let handle = AosHandle {
-            inner: Rc::new(HandleInner {
-                event_loop: Cell::new(self.event_loop),
-                wakers: RefCell::new(Vec::new()),
-                exit_handle: Cell::new(std::ptr::null_mut()),
-                graveyard: RefCell::new(Vec::new()),
-                live_objects: Cell::new(0),
-            }),
+            inner: HandleInner::new(self.event_loop, ExitSource::Shm),
         };
         let user_future = setup(&handle);
 
-        let park = Arc::new(ParkState {
-            armed_deadline_ns: AtomicI64::new(i64::MAX),
-            rearm: Notify::new(),
-        });
-        let park_hook_state = park.clone();
-        let park_hook_aio = AioForParkHook(self.aio.0);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            // Runs right before tokio parks, which is where the event loop is about to wait: run
-            // the before-wait functions, hand over what's staged, and make sure the driver isn't
-            // sleeping past something due.  tokio checks for ready tasks again after this, so
-            // waking the driver here keeps it from parking.
-            .on_thread_park(move || {
-                let aio = park_hook_aio.aio();
-                let wake_driver = match aio.prepare_to_wait() {
-                    None => true,
-                    Some(deadline_ns) => {
-                        deadline_ns < park_hook_state.armed_deadline_ns.load(Ordering::Relaxed)
-                    }
-                };
-                if wake_driver {
-                    park_hook_state.rearm.notify_one();
-                }
-            })
-            .build()
-            .expect("Failed to build the tokio runtime");
+        let (runtime, park) = build_runtime(&self.aio);
 
         // SAFETY: The event loop is live, and the Aio it borrows hasn't been polled yet.
         unsafe { aos_shm_event_loop_startup(self.event_loop) };
@@ -284,7 +266,7 @@ impl<'config> TokioShmEventLoop<'config> {
         let output = local.block_on(&runtime, async {
             tokio::select! {
                 output = user_future => Some(output),
-                _ = drive(&self.aio, wait_fd, &park) => None,
+                _ = drive(&self.aio, wait_fd, &park, &|aio| aio.should_run()) => None,
             }
         });
         // Tasks the user spawned may hold AOS objects; they go before the event loop shuts down.
@@ -293,41 +275,277 @@ impl<'config> TokioShmEventLoop<'config> {
 
         // SAFETY: The event loop is live, started, and its Aio won't be polled again.
         let error = unsafe { aos_shm_event_loop_shutdown(self.event_loop) };
-        if !error.is_null() {
-            // SAFETY: We own the error that came back.
-            let code = unsafe {
-                let code = aos_error_code(error);
-                aos_error_destroy(error);
-                code
-            };
-            panic!("The event loop shut down with error code {code}");
-        }
-        // Everything setup made and tasks dropped is in the graveyard by now: the future's and
-        // the spawned tasks' state went with the LocalSet.
-        handle.inner.empty_graveyard();
-        assert_eq!(
-            handle.inner.live_objects.get(),
-            0,
-            "An AOS fetcher or sender outlived TokioShmEventLoop::run(): don't return one, or \
-             keep one anywhere longer-lived than the future"
-        );
-        handle.inner.event_loop.set(std::ptr::null_mut());
-        let exit_handle = handle.inner.exit_handle.replace(std::ptr::null_mut());
-        if !exit_handle.is_null() {
-            // SAFETY: Made by aos_shm_event_loop_make_exit_handle, and owned here.
-            unsafe { aos_exit_handle_destroy(exit_handle) };
-        }
+        check_shutdown_error(error, "The event loop shut down");
+        handle.inner.finish();
         output
     }
 }
 
+/// Panics if `error` (owned) isn't null.
+fn check_shutdown_error(error: *mut aos_error_t, what: &str) {
+    if !error.is_null() {
+        // SAFETY: We own the error that came back.
+        let code = unsafe {
+            let code = aos_error_code(error);
+            aos_error_destroy(error);
+            code
+        };
+        panic!("{what} with error code {code}");
+    }
+}
+
+/// Builds the current-thread runtime that drives `aio`, with the park hook that calls
+/// `PrepareToWait()`.
+fn build_runtime(aio: &Aio) -> (tokio::runtime::Runtime, Arc<ParkState>) {
+    let park = Arc::new(ParkState {
+        armed_deadline_ns: AtomicI64::new(i64::MAX),
+        rearm: Notify::new(),
+    });
+    let park_hook_state = park.clone();
+    let park_hook_aio = AioForParkHook(aio.0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        // Runs right before tokio parks, which is where the event loop is about to wait: run
+        // the before-wait functions, hand over what's staged, and make sure the driver isn't
+        // sleeping past something due.  tokio checks for ready tasks again after this, so
+        // waking the driver here keeps it from parking.
+        .on_thread_park(move || {
+            let aio = park_hook_aio.aio();
+            let wake_driver = match aio.prepare_to_wait() {
+                None => true,
+                Some(deadline_ns) => {
+                    deadline_ns < park_hook_state.armed_deadline_ns.load(Ordering::Relaxed)
+                }
+            };
+            if wake_driver {
+                park_hook_state.rearm.notify_one();
+            }
+        })
+        .build()
+        .expect("Failed to build the tokio runtime");
+    (runtime, park)
+}
+
+/// A simulation factory pointer which tokio's park hook may hold; see [`AioForParkHook`].
+struct FactoryForParkHook(*mut aos_simulated_event_loop_factory_t);
+
+impl FactoryForParkHook {
+    fn is_running(&self) -> bool {
+        // SAFETY: The factory outlives the runtime whose hook this is.
+        unsafe { aos_simulated_event_loop_factory_is_running(self.0) }
+    }
+}
+
+// SAFETY: As for AioForParkHook: only used on the simulation's thread.
+unsafe impl Send for FactoryForParkHook {}
+// SAFETY: As above.
+unsafe impl Sync for FactoryForParkHook {}
+
+/// Builds the current-thread runtime for a simulation, whose park hook runs the simulation.
+///
+/// Simulated time only moves on when tokio has nothing to run.  tokio calls the hook right before
+/// it parks, when no task is ready; the hook runs simulated events until one wakes a task, which
+/// also ends the scheduler's slice right after that event (see `wake_callback`).  tokio checks
+/// for ready tasks again after the hook, so the woken task runs at that event's simulated time,
+/// and the hook carries on once tokio is idle again.
+fn build_simulation_runtime(
+    aio: &Aio,
+    factory: *mut aos_simulated_event_loop_factory_t,
+) -> (tokio::runtime::Runtime, Arc<ParkState>) {
+    let park = Arc::new(ParkState {
+        armed_deadline_ns: AtomicI64::new(i64::MAX),
+        rearm: Notify::new(),
+    });
+    let park_hook_state = park.clone();
+    let park_hook_aio = AioForParkHook(aio.0);
+    let park_hook_factory = FactoryForParkHook(factory);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_park(move || {
+            let aio = park_hook_aio.aio();
+            for _ in 0..POLLS_PER_TURN {
+                if !park_hook_factory.is_running() {
+                    // Let the driver see it and return.
+                    park_hook_state.rearm.notify_one();
+                    return;
+                }
+                TASK_WOKEN.with(|woken| woken.set(false));
+                if aio.poll() {
+                    if TASK_WOKEN.with(|woken| woken.get()) {
+                        // tokio sees the woken task and runs it rather than parking.
+                        return;
+                    }
+                    continue;
+                }
+                match aio.prepare_to_wait() {
+                    None => continue,
+                    Some(deadline_ns) => {
+                        // Nothing to run until the deadline, or until the Aio's fd says so: let
+                        // tokio park, with the driver waiting for both.
+                        let armed = park_hook_state
+                            .armed_deadline_ns
+                            .swap(deadline_ns, Ordering::Relaxed);
+                        if deadline_ns < armed {
+                            park_hook_state.rearm.notify_one();
+                        }
+                        return;
+                    }
+                }
+            }
+            // A lot of simulation without waking anything: keep tokio from sleeping, give its own
+            // work (sockets, timers) a look, and come back.
+            park_hook_state.rearm.notify_one();
+        })
+        .build()
+        .expect("Failed to build the tokio runtime");
+    (runtime, park)
+}
+
+/// The simulation's driver task.  The park hook runs the simulation; this only waits for what
+/// should wake tokio up to run the hook again: the scheduler Aio's fd, its deadline, or the hook
+/// asking.  Returns once the simulation has stopped.
+async fn wait_for_simulation(
+    wait_fd: RawFd,
+    park: &ParkState,
+    factory: *mut aos_simulated_event_loop_factory_t,
+) {
+    // SAFETY: As in drive().
+    let wait_fd =
+        unsafe { AsyncFd::register_with_interest(WaitFd(wait_fd), tokio::io::Interest::READABLE) }
+            .expect("Failed to register the Aio's wait fd with tokio");
+    loop {
+        // SAFETY: The factory is live for the simulation.
+        if !unsafe { aos_simulated_event_loop_factory_is_running(factory) } {
+            return;
+        }
+        let deadline_ns = park.armed_deadline_ns.load(Ordering::Relaxed);
+        tokio::select! {
+            guard = wait_fd.readable() => {
+                guard.expect("Waiting on the Aio's wait fd failed").clear_ready();
+            }
+            _ = sleep_until_ns(deadline_ns) => {
+                park.armed_deadline_ns.store(i64::MAX, Ordering::Relaxed);
+            }
+            _ = park.rearm.notified() => {}
+        }
+    }
+}
+
+/// Sleeps until `deadline_ns` on the real monotonic clock; forever for `i64::MAX`.
+async fn sleep_until_ns(deadline_ns: i64) {
+    if deadline_ns == i64::MAX {
+        std::future::pending::<()>().await;
+    }
+    // SAFETY: Takes no arguments and only reads a clock.
+    let now_ns = unsafe { aos_monotonic_clock_now() };
+    let remaining = u64::try_from(deadline_ns.saturating_sub(now_ns)).unwrap_or(0);
+    tokio::time::sleep(Duration::from_nanos(remaining)).await;
+}
+
+/// What [`run_simulation()`]'s setup makes handles with.
+pub struct SimulationSetup {
+    factory: *mut aos_simulated_event_loop_factory_t,
+    handles: RefCell<Vec<Rc<HandleInner>>>,
+}
+
+impl SimulationSetup {
+    /// A handle on one of the simulation's event loops, for tasks to use it with.
+    ///
+    /// # Safety
+    ///
+    /// `event_loop` must be one of the simulation's event loops, and outlive
+    /// [`run_simulation()`].
+    pub unsafe fn handle(&self, event_loop: *mut aos_event_loop_t) -> AosHandle {
+        let inner = HandleInner::new(event_loop, ExitSource::Factory(self.factory));
+        self.handles.borrow_mut().push(inner.clone());
+        AosHandle { inner }
+    }
+}
+
+/// Runs a simulation with tokio as the outer loop, in place of the factory's `Run()`.
+///
+/// tokio drives the simulation scheduler's `Aio`, which runs the simulated events; between
+/// batches of them, tokio runs its tasks. Tasks see simulated time through
+/// [`AosHandle::monotonic_now_ns()`] and AOS timers, while tokio's own timers and sockets run
+/// in real time. See `documentation/adr/0008-tokio-on-the-event-loop-thread.md`.
+///
+/// `setup` runs first, before the simulation starts: make handles on the simulation's event
+/// loops ([`SimulationSetup::handle()`]), and AOS objects with them. The future it returns
+/// runs on a tokio `LocalSet`, and may `spawn_local()` more tasks.
+///
+/// Runs until the simulation stops, when its events run out or something exits it. Returns
+/// the future's output if it finished first.
+///
+/// # Panics
+///
+/// Panics if the simulation reports an error.
+pub fn run_simulation<F, Fut>(
+    factory: &mut SimulatedEventLoopFactory<'_>,
+    setup: F,
+) -> Option<Fut::Output>
+where
+    F: FnOnce(&SimulationSetup) -> Fut,
+    Fut: Future + 'static,
+{
+    let factory = factory.as_raw();
+    // SAFETY: The factory is live for this call, and owns its scheduler's Aio.
+    let aio = Aio(unsafe { aos_simulated_event_loop_factory_scheduler_aio(factory) });
+    // First, before anything can submit raw requests; see TokioShmEventLoop::run().
+    let wait_fd = aio.wait_fd();
+
+    let simulation = SimulationSetup {
+        factory,
+        handles: RefCell::new(Vec::new()),
+    };
+    let user_future = setup(&simulation);
+
+    let (runtime, park) = build_simulation_runtime(&aio, factory);
+    // SAFETY: The factory is live.
+    check_shutdown_error(
+        unsafe { aos_simulated_event_loop_factory_start_external_run(factory) },
+        "The simulation failed to start",
+    );
+
+    let output = Rc::new(RefCell::new(None));
+    let local = tokio::task::LocalSet::new();
+    {
+        let output = output.clone();
+        local.spawn_local(async move {
+            *output.borrow_mut() = Some(user_future.await);
+        });
+    }
+    local.block_on(&runtime, wait_for_simulation(wait_fd, &park, factory));
+    // Tasks may hold AOS objects; they go before the simulation's run ends.
+    drop(local);
+    drop(runtime);
+
+    // SAFETY: The factory is live, and its external run has stopped.
+    check_shutdown_error(
+        unsafe { aos_simulated_event_loop_factory_finish_external_run(factory) },
+        "The simulation stopped",
+    );
+    for inner in simulation.handles.borrow().iter() {
+        inner.finish();
+    }
+    let output = output.borrow_mut().take();
+    output
+}
+
 /// State a C callback wakes a task through.  Lives as long as the event loop: AOS watchers can't
 /// be removed, and a timer's callback may still be registered.
-#[derive(Default)]
 struct WakeState {
     /// Set by the callback; cleared by whoever consumes the event.
     fired: Cell<bool>,
     waker: RefCell<Option<Waker>>,
+    /// In a simulation, its factory: waking a task ends the slice of simulated events, so the
+    /// task runs before simulated time moves on.  Null otherwise.
+    simulation: *mut aos_simulated_event_loop_factory_t,
+}
+
+thread_local! {
+    /// Whether an AOS callback woke a waiting task since this was last cleared.  The simulation
+    /// driver's park hook uses it to stop running simulated events and let the task run.
+    static TASK_WOKEN: Cell<bool> = const { Cell::new(false) };
 }
 
 extern "C" fn wake_callback(user_data: *mut c_void) {
@@ -337,6 +555,11 @@ extern "C" fn wake_callback(user_data: *mut c_void) {
     state.fired.set(true);
     if let Some(waker) = state.waker.borrow_mut().take() {
         waker.wake();
+        TASK_WOKEN.with(|woken| woken.set(true));
+        if !state.simulation.is_null() {
+            // SAFETY: The factory outlives the simulation's handles.
+            unsafe { aos_simulated_event_loop_factory_end_slice(state.simulation) };
+        }
     }
 }
 
@@ -347,9 +570,19 @@ enum Deferred {
     Sender(*mut aos_sender_t),
 }
 
+/// Where an [`AosHandle::exit()`] goes.
+#[derive(Clone, Copy)]
+enum ExitSource {
+    /// The `ShmEventLoop` itself.
+    Shm,
+    /// The simulation the event loop is part of.
+    Factory(*mut aos_simulated_event_loop_factory_t),
+}
+
 struct HandleInner {
     /// Null once run() has returned and the event loop is gone.
     event_loop: Cell<*mut aos_event_loop_t>,
+    exit_source: ExitSource,
     wakers: RefCell<Vec<Rc<WakeState>>>,
     exit_handle: Cell<*mut aos_exit_handle_t>,
     /// Fetchers and senders dropped while the event loop ran; run() destroys them after it stops.
@@ -360,11 +593,42 @@ struct HandleInner {
 }
 
 impl HandleInner {
+    fn new(event_loop: *mut aos_event_loop_t, exit_source: ExitSource) -> Rc<Self> {
+        Rc::new(HandleInner {
+            event_loop: Cell::new(event_loop),
+            exit_source,
+            wakers: RefCell::new(Vec::new()),
+            exit_handle: Cell::new(std::ptr::null_mut()),
+            graveyard: RefCell::new(Vec::new()),
+            live_objects: Cell::new(0),
+        })
+    }
+
+    /// Cleans up once the event loop has stopped: destroys what tasks dropped, checks nothing
+    /// escaped, and retires the handle.
+    fn finish(&self) {
+        // Everything setup made and tasks dropped is in the graveyard by now: the future's and
+        // the spawned tasks' state went with the LocalSet.
+        self.empty_graveyard();
+        assert_eq!(
+            self.live_objects.get(),
+            0,
+            "An AOS fetcher or sender outlived the run: don't return one, or keep one anywhere \
+             longer-lived than the future"
+        );
+        self.event_loop.set(std::ptr::null_mut());
+        let exit_handle = self.exit_handle.replace(std::ptr::null_mut());
+        if !exit_handle.is_null() {
+            // SAFETY: Made by exit(), and owned here.
+            unsafe { aos_exit_handle_destroy(exit_handle) };
+        }
+    }
+
     fn event_loop(&self) -> *mut aos_event_loop_t {
         let event_loop = self.event_loop.get();
         assert!(
             !event_loop.is_null(),
-            "Used an AOS handle after TokioShmEventLoop::run() returned"
+            "Used an AOS handle after its run returned"
         );
         event_loop
     }
@@ -401,7 +665,14 @@ fn c_string(s: &str) -> CString {
 
 impl AosHandle {
     fn new_wake_state(&self) -> Rc<WakeState> {
-        let state = Rc::new(WakeState::default());
+        let state = Rc::new(WakeState {
+            fired: Cell::new(false),
+            waker: RefCell::new(None),
+            simulation: match self.inner.exit_source {
+                ExitSource::Shm => std::ptr::null_mut(),
+                ExitSource::Factory(factory) => factory,
+            },
+        });
         self.inner.wakers.borrow_mut().push(state.clone());
         state
     }
@@ -485,13 +756,21 @@ impl AosHandle {
         Timer { timer, state }
     }
 
-    /// Tells the event loop to stop. `run()` returns `None` once it has.
+    /// Tells the event loop to stop, or in a simulation, the whole simulation. `run()` returns
+    /// `None` once it has.
     pub fn exit(&self) {
         if self.inner.exit_handle.get().is_null() {
-            // SAFETY: The event loop is live.
-            self.inner
-                .exit_handle
-                .set(unsafe { aos_shm_event_loop_make_exit_handle(self.inner.event_loop()) });
+            let event_loop = self.inner.event_loop();
+            // SAFETY: The event loop (and in a simulation, its factory) is live.
+            let exit_handle = unsafe {
+                match self.inner.exit_source {
+                    ExitSource::Shm => aos_shm_event_loop_make_exit_handle(event_loop),
+                    ExitSource::Factory(factory) => {
+                        aos_simulated_event_loop_factory_make_exit_handle(factory)
+                    }
+                }
+            };
+            self.inner.exit_handle.set(exit_handle);
         }
         // SAFETY: Made just above, and destroyed only after run() is done with the event loop.
         unsafe { aos_exit_handle_exit(self.inner.exit_handle.get()) };
@@ -733,6 +1012,87 @@ mod tests {
             let _ = watching_rx.recv();
             assert_eq!(result.unwrap().unwrap(), b"hello");
         });
+    }
+
+    /// In a simulation, tasks run between simulated events and see simulated time: a timer task
+    /// sends a ping one simulated second in, another task watching for it gets it at exactly that
+    /// simulated time, and a tokio TCP round trip works in the middle of the simulation.
+    #[test]
+    fn simulation_runs_tasks_on_simulated_time() {
+        use aos_events_event_loop_c::aos_event_loop_destroy as destroy_event_loop;
+        use aos_events_simulated_event_loop::SimulatedEventLoopFactory;
+        use ping_rust_fbs::aos::examples as ping;
+
+        const VALUE: i32 = 3132;
+        init();
+        let config = read_config_from(&artifact_path(Path::new(
+            "aos/testing/ping_pong/multinode_pingpong_test_combined_config.json",
+        )))
+        .unwrap();
+        let mut factory = SimulatedEventLoopFactory::new(&config);
+        let ping_loop = factory.make_event_loop("ping", "pi1");
+        let listen_loop = factory.make_event_loop("listen", "pi1");
+
+        let result = run_simulation(&mut factory, |simulation| {
+            // SAFETY: Both are this simulation's, and destroyed only after the run.
+            let (ping_aos, listen_aos) =
+                unsafe { (simulation.handle(ping_loop), simulation.handle(listen_loop)) };
+            let mut timer = ping_aos.make_timer();
+            let mut sender = ping_aos.make_sender("/test", "aos.examples.Ping");
+            let mut watch = listen_aos.make_watch("/test", "aos.examples.Ping");
+            async move {
+                let start_ns = ping_aos.monotonic_now_ns();
+                let send = async {
+                    timer.sleep_until(start_ns + 1_000_000_000).await;
+                    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+                    let mut builder = ping::PingBuilder::new(&mut fbb);
+                    builder.add_value(VALUE);
+                    let message = builder.finish();
+                    fbb.finish_minimal(message);
+                    sender.send_copy(fbb.finished_data());
+                };
+                let receive = async {
+                    let message = watch.next().await;
+                    let value = flatbuffers::root::<ping::Ping>(message.data().unwrap())
+                        .unwrap()
+                        .value();
+                    (value, listen_aos.monotonic_now_ns() - start_ns)
+                };
+                let ((), received) = tokio::join!(send, receive);
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let echo = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0u8; 4];
+                    socket.read_exact(&mut buffer).await.unwrap();
+                    socket.write_all(&buffer).await.unwrap();
+                };
+                let call = async {
+                    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+                    client.write_all(b"echo").await.unwrap();
+                    let mut buffer = [0u8; 4];
+                    client.read_exact(&mut buffer).await.unwrap();
+                    buffer
+                };
+                let ((), echoed) = tokio::join!(echo, call);
+
+                listen_aos.exit();
+                (received, echoed)
+            }
+        });
+        // SAFETY: Made by the factory above, and the run is over.
+        unsafe {
+            destroy_event_loop(ping_loop);
+            destroy_event_loop(listen_loop);
+        }
+        let ((value, elapsed_ns), echoed) = result.expect("The simulation ended first");
+        assert_eq!(value, VALUE);
+        assert_eq!(
+            elapsed_ns, 1_000_000_000,
+            "the ping arrived at simulated +{elapsed_ns} ns"
+        );
+        assert_eq!(&echoed, b"echo");
     }
 
     /// Watch::latest() skips to the newest message: three are sent before the watching task
