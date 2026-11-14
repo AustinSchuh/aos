@@ -99,6 +99,7 @@ cc_binary(
         "//frc/vision:coral_detection_fbs",
         "//frc/vision:vision_fbs",
         "//frc/vision/camera:cuda_camera_image_callback",
+        "//frc/vision/util:charuco_lib",
         "//third_party:cudart",
         "//third_party:opencv",
         "//third_party:tensorrt",

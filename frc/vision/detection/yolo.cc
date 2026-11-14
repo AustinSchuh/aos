@@ -19,6 +19,7 @@
 #include "frc/orin/resize_normalize.h"
 #include "frc/vision/camera/cuda_camera_image_callback.h"
 #include "frc/vision/coral_detection_static.h"
+#include "frc/vision/util/charuco_lib.h"
 #include "frc/vision/vision_generated.h"
 
 using frc::vision::CudaCameraImageCallback;
@@ -409,6 +410,14 @@ class YoloApplication {
       points_builder.add_outline_colors(colors_offset);
       points_builder.add_thickness(5);
       foxglove_corners.push_back(points_builder.Finish());
+    }
+    // An ImageAnnotations carries its time only in its annotations.  So that
+    // viewers waiting for this frame's overlays get them even when nothing
+    // was found, send an annotation with no points, stamped with the capture
+    // time.
+    if (foxglove_corners.empty()) {
+      foxglove_corners.push_back(frc::vision::BuildPointsAnnotation(
+          builder.fbb(), eof, std::vector<cv::Point2f>()));
     }
     const auto corners_offset = builder.fbb()->CreateVector(foxglove_corners);
     foxglove::ImageAnnotations::Builder annotation_builder(*builder.fbb());
