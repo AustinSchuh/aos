@@ -1144,6 +1144,27 @@ rust_library(
     ],
 )
 
+# Tokio as a guest on an event loop's thread; see tokio_event_loop.rs and
+# documentation/adr/0008-tokio-on-the-event-loop-thread.md.
+rust_library(
+    name = "tokio_event_loop_rs",
+    srcs = ["tokio_event_loop.rs"],
+    crate_name = "aos_events_tokio",
+    test_data = ["//aos/testing/ping_pong:pingpong_config"],
+    test_deps = [
+        "//aos:test_init_rs",
+        "//aos/testing:path_rs",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":event_loop_c_rs",
+        "//aos:configuration_rs",
+        "//aos:configuration_rust_fbs",
+        "//aos:flatbuffers_rs",
+        "@crate_index//:tokio",
+    ],
+)
+
 cc_test(
     name = "event_scheduler_test",
     srcs = ["event_scheduler_test.cc"],
