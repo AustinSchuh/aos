@@ -351,6 +351,22 @@ aos_error_t *aos_simulated_event_loop_factory_non_fatal_run(
     aos_simulated_event_loop_factory_t *self);
 aos_exit_handle_t *aos_simulated_event_loop_factory_make_exit_handle(
     aos_simulated_event_loop_factory_t *self);
+// For driving a simulation from another event loop: see
+// SimulatedEventLoopFactory::StartExternalRun().  Drive the returned Aio
+// with the aos_aio_* functions while
+// aos_simulated_event_loop_factory_is_running().
+aos_aio_t *aos_simulated_event_loop_factory_scheduler_aio(
+    aos_simulated_event_loop_factory_t *self);
+// Return nullptr to indicate Ok().
+aos_error_t *aos_simulated_event_loop_factory_start_external_run(
+    aos_simulated_event_loop_factory_t *self);
+aos_error_t *aos_simulated_event_loop_factory_finish_external_run(
+    aos_simulated_event_loop_factory_t *self);
+bool aos_simulated_event_loop_factory_is_running(
+    aos_simulated_event_loop_factory_t *self);
+// SimulatedEventLoopFactory::EndSlice().
+void aos_simulated_event_loop_factory_end_slice(
+    aos_simulated_event_loop_factory_t *self);
 
 aos_node_event_loop_factory_t *
 aos_simulated_event_loop_factory_get_node_event_loop_factory(

@@ -1150,14 +1150,20 @@ rust_library(
     name = "tokio_event_loop_rs",
     srcs = ["tokio_event_loop.rs"],
     crate_name = "aos_events_tokio",
-    test_data = ["//aos/testing/ping_pong:pingpong_config"],
+    test_data = [
+        "//aos/testing/ping_pong:multinode_pingpong_test_combined_config",
+        "//aos/testing/ping_pong:pingpong_config",
+    ],
     test_deps = [
         "//aos:test_init_rs",
         "//aos/testing:path_rs",
+        "//aos/testing/ping_pong:ping_rust_fbs",
+        "@aos_flatbuffers//rust:flatbuffers",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":event_loop_c_rs",
+        ":simulated_event_loop_rs",
         "//aos:configuration_rs",
         "//aos:configuration_rust_fbs",
         "//aos:flatbuffers_rs",
