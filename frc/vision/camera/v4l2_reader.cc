@@ -9,6 +9,8 @@
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
 
+#include "aos/uuid.h"
+
 ABSL_FLAG(bool, ignore_timestamps, false,
           "Don't require timestamps on images.  Used to allow webcams");
 ABSL_FLAG(uint32_t, imagewidth, 0,
@@ -36,6 +38,10 @@ V4L2ReaderBase::V4L2ReaderBase(aos::EventLoop *event_loop,
       event_loop_(event_loop),
       image_channel_(image_channel) {
   ABSL_PCHECK(fd_.get() != -1) << " Failed to open device " << device_name;
+
+  // Seed this thread's UUID generator now, outside the realtime path; every
+  // image gets a UUID::Random() later.
+  aos::UUID::Random();
 
   // Figure out if we are multi-planar or not.
   {
@@ -263,8 +269,16 @@ void V4L2ReaderBase::Buffer::PrepareMessage(
 
   *length_offset = valid_size;
 
+  // Each image gets a fresh random UUID that everything derived from it
+  // carries.  The generator was seeded in the constructor, so this doesn't
+  // allocate.
+  const aos::UUID capture_uuid = aos::UUID::Random();
+  const auto capture_uuid_offset = builder.fbb()->CreateVector(
+      capture_uuid.span().data(), capture_uuid.span().size());
+
   auto image_builder = builder.MakeBuilder<CameraImage>();
   image_builder.add_data(data_offset);
+  image_builder.add_capture_uuid(capture_uuid_offset);
   image_builder.add_format(format);
   image_builder.add_rows(rows);
   image_builder.add_cols(cols);

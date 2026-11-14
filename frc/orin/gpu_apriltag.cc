@@ -395,8 +395,16 @@ void ApriltagDetector::HandleImage(const vision::CameraImage &image,
   }
   const auto target_poses_offset =
       map_builder.fbb()->CreateVector(target_poses);
+  flatbuffers::Offset<flatbuffers::Vector<uint8_t>> capture_uuid_offset;
+  if (image.capture_uuid() != nullptr) {
+    capture_uuid_offset = map_builder.fbb()->CreateVector(
+        image.capture_uuid()->data(), image.capture_uuid()->size());
+  }
   auto target_map_builder = map_builder.MakeBuilder<frc::vision::TargetMap>();
   target_map_builder.add_target_poses(target_poses_offset);
+  if (!capture_uuid_offset.IsNull()) {
+    target_map_builder.add_capture_uuid(capture_uuid_offset);
+  }
   target_map_builder.add_monotonic_timestamp_ns(eof.time_since_epoch().count());
   target_map_builder.add_rejections(rejections_);
   map_builder.CheckOk(map_builder.Send(target_map_builder.Finish()));
