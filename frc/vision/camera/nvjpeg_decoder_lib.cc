@@ -153,7 +153,10 @@ NvJpegDecoderLib::NvJpegDecoderLib() : impl_(new Impl()) {
            "Orin.  For CPU decode, switch the config template to "
            "turbojpeg_decoder instead.";
   }
-  if (access("/dev/nvmap", R_OK | W_OK) != 0) {
+  // Read access is all libnvjpeg needs: on L4T R39 /dev/nvmap is 0440
+  // root:video, and decoding (into its own buffers and, through EGL, into
+  // CUDA) works for a member of the video group.
+  if (access("/dev/nvmap", R_OK) != 0) {
     ABSL_LOG(FATAL) << "/dev/nvmap is not accessible: " << strerror(errno)
                     << " -- libnvjpeg needs it (does this user have the video "
                        "group?)";
