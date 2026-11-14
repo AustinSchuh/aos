@@ -108,6 +108,58 @@ cc_test(
     ],
 )
 
+# Decodes JPEGs on a chosen one of the Orin's two NVJPG engines; see
+# nvmedia_jpeg_decoder.h.
+cc_library(
+    name = "nvmedia_jpeg_decoder",
+    srcs = ["nvmedia_jpeg_decoder.cc"],
+    hdrs = ["nvmedia_jpeg_decoder.h"],
+    target_compatible_with = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        "//aos:realtime",
+        "//aos/util:status",
+        "//third_party/nvmedia:nvmedia_ijpd",
+        "@arm64_debian_sysroot//:nvscibuf",
+        "@arm64_debian_sysroot//:nvscisync",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+# Checks NvMediaJpegDecoder against turbojpeg on each engine.  Needs the
+# NVJPG engines, so CI (x86) skips it -- build with --config=arm64 and run it
+# on an Orin.
+cc_test(
+    name = "nvmedia_jpeg_decoder_test",
+    srcs = ["nvmedia_jpeg_decoder_test.cc"],
+    data = [
+        "testdata/camera_a.jpg",
+        "testdata/camera_b.jpg",
+        "testdata/camera_c.jpg",
+        "testdata/seq_040.jpg",
+        "testdata/seq_080.jpg",
+        "testdata/seq_120.jpg",
+        "testdata/seq_200.jpg",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        ":gray_image_diff",
+        ":nvmedia_jpeg_decoder",
+        "//aos:realtime",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//third_party:libturbojpeg",
+        "@com_google_absl//absl/log:absl_check",
+    ],
+)
+
 # Thin wrapper around the Jetson NVJPG hardware JPEG decoder; see
 # nvjpeg_decoder_lib.h.
 cc_library(
