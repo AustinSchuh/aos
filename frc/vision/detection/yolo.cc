@@ -374,8 +374,9 @@ class YoloApplication {
     std::vector<flatbuffers::Offset<foxglove::PointsAnnotation>>
         foxglove_corners;
     for (const Detection detection : nms) {
-      const struct timespec now_t =
-          aos::time::to_timespec(event_loop_->context().monotonic_event_time);
+      // Stamped with the image's capture time, not when it reached us, so
+      // viewers can match the boxes to their frame.
+      const struct timespec now_t = aos::time::to_timespec(eof);
       foxglove::Time time{static_cast<uint32_t>(now_t.tv_sec),
                           static_cast<uint32_t>(now_t.tv_nsec)};
 
