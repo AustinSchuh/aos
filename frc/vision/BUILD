@@ -115,6 +115,7 @@ robot_downloader(
         ":game_piece_mapper",
         "//frc/vision/camera:image_logger",
         "//frc/vision/calibration:intrinsics_calibration",
+        "//frc/vision/camera:nvjpeg_decoder",
         "//frc/vision/camera:turbojpeg_decoder",
         "//frc/vision/networking:network_tables_publisher",
         "//frc/vision/networking:network_tables_client",

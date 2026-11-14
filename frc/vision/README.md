@@ -210,10 +210,10 @@ localizer_logger               orin       RUNNING  605    312s      -
 localizer_main                 orin       RUNNING  626    312s      -
 network_tables_publisher       orin       RUNNING  627    312s      -
 network_tables_swerve_client   orin       RUNNING  603    312s      -
-turbojpeg_decoder0             orin       RUNNING  614    312s      -
-turbojpeg_decoder1             orin       RUNNING  628    312s      -
-turbojpeg_decoder2             orin       RUNNING  602    312s      -
-turbojpeg_decoder3             orin       RUNNING  601    312s      -
+nvjpeg_decoder0                orin       RUNNING  614    312s      -
+nvjpeg_decoder1                orin       RUNNING  628    312s      -
+nvjpeg_decoder2                orin       RUNNING  602    312s      -
+nvjpeg_decoder3                orin       RUNNING  601    312s      -
 vision_constants_sender        orin       STOPPED                   0
 web_proxy                      orin       RUNNING  609    312s      -
 yolo                           orin       RUNNING  618    312s      -
