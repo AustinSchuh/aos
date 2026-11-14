@@ -32,6 +32,7 @@ cc_library(
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
+        "//aos:uuid",
         "//aos/events:aio",
         "//aos/events:event_loop",
         "//aos/scoped:scoped_fd",

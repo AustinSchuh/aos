@@ -106,11 +106,20 @@ class TurboJpegDecoder {
     }
     ++successful_decodes_;
 
+    // Carry the camera image's UUID through to the decoded image.
+    flatbuffers::Offset<flatbuffers::Vector<uint8_t>> capture_uuid_offset;
+    if (image.capture_uuid() != nullptr) {
+      capture_uuid_offset = builder.fbb()->CreateVector(
+          image.capture_uuid()->data(), image.capture_uuid()->size());
+    }
     CameraImage::Builder camera_image_builder(*builder.fbb());
 
     camera_image_builder.add_rows(height);
     camera_image_builder.add_cols(width);
     camera_image_builder.add_data(data_offset);
+    if (!capture_uuid_offset.IsNull()) {
+      camera_image_builder.add_capture_uuid(capture_uuid_offset);
+    }
     camera_image_builder.add_monotonic_timestamp_ns(
         image.monotonic_timestamp_ns());
     camera_image_builder.add_format(frc::vision::ImageFormat::MONO8);

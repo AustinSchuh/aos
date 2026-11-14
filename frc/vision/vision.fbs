@@ -27,6 +27,11 @@ table CameraImage {
   monotonic_timestamp_ns:int64 (id: 3);
   // Image format in memory
   format:ImageFormat = YUYV422 (id: 4);
+  // A random (version 4) UUID, 16 bytes, made by the camera reader for each
+  // image it captures.  Everything derived from the image (the decoded image,
+  // detections, overlays' sources, stored captures) carries the same UUID, so
+  // any of them can be traced back to exactly this image.
+  capture_uuid:[ubyte] (id: 5);
 }
 
 root_type CameraImage;

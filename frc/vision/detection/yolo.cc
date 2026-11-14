@@ -305,7 +305,7 @@ class YoloApplication {
   };
 
   void DetectImage(const frc::vision::CameraImage &camera_image,
-                   aos::monotonic_clock::time_point /*eof*/) {
+                   aos::monotonic_clock::time_point eof) {
     Preprocess(camera_image,
                reinterpret_cast<float *>(normalized_image_device_.get()));
     inference_.Infer(normalized_image_device_.get(), output_.get());
@@ -348,6 +348,12 @@ class YoloApplication {
     {
       aos::Sender<frc::vision::BoundingBoxesStatic>::StaticBuilder builder =
           detections_sender_.MakeStaticBuilder();
+      builder->set_monotonic_timestamp_ns(eof.time_since_epoch().count());
+      if (camera_image.capture_uuid() != nullptr) {
+        ABSL_CHECK(builder->add_capture_uuid()->FromData(
+            camera_image.capture_uuid()->data(),
+            camera_image.capture_uuid()->size()));
+      }
       auto boxes = builder->add_boxes();
       ABSL_CHECK(boxes->reserve(nms.size()));
       for (const Detection detection : nms) {

@@ -83,6 +83,10 @@ table TargetMap {
   // Size of the field in meters.
   fieldlength:double (id: 4);
   fieldwidth:double (id: 5);
+
+  // CameraImage.capture_uuid of the image these detections came from (for
+  // use case 2.).
+  capture_uuid:[ubyte] (id: 6);
 }
 
 root_type TargetMap;

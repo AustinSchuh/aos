@@ -1,3 +1,5 @@
+attribute "static_length";
+
 namespace frc.vision;
 
 // Bounding box detection.
@@ -20,6 +22,13 @@ table BoundingBox {
 
 table BoundingBoxes {
   boxes:[BoundingBox] (id: 0);
+
+  // End-of-frame timestamp of the image these boxes came from, as in
+  // CameraImage.monotonic_timestamp_ns.
+  monotonic_timestamp_ns:int64 (id: 1);
+
+  // CameraImage.capture_uuid of the image these boxes came from.
+  capture_uuid:[ubyte] (id: 2, static_length: 16);
 }
 
 root_type BoundingBoxes;
