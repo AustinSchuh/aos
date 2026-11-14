@@ -407,6 +407,12 @@ Status EventSchedulerScheduler::Run() {
   return result;
 }
 
+// At an infinite replay rate, how long the timer callback runs events before
+// returning to aio_ (rearmed to fire again at once), so that anything else on
+// it -- fds registered through scheduler_aio() -- gets a turn.  Event order is
+// unaffected.
+constexpr std::chrono::milliseconds kInfiniteRateSlice{5};
+
 template <typename F>
 Result<void> EventSchedulerScheduler::RunMaybeRealtimeLoop(F loop_body) {
   Aio::Timer timer(&aio_);
@@ -439,9 +445,11 @@ Result<void> EventSchedulerScheduler::RunMaybeRealtimeLoop(F loop_body) {
         c->self->aio_.Quit();
         return;
       }
+      const monotonic_clock::time_point slice_end =
+          monotonic_clock::now() + kInfiniteRateSlice;
       // Call loop_body() at least once; if we are in infinite-speed replay,
       // we don't actually want/need the context switches from the timer, so
-      // just loop.
+      // just loop, for up to a slice.
       // This is deliberately written to support the user changing replay
       // rates dynamically.
       do {
@@ -499,10 +507,15 @@ Result<void> EventSchedulerScheduler::RunMaybeRealtimeLoop(F loop_body) {
         }
       } while (c->self->replay_rate_ ==
                    std::numeric_limits<double>::infinity() &&
-               c->self->is_running_);
+               c->self->is_running_ && monotonic_clock::now() < slice_end);
 
       if (!c->self->is_running_) {
         c->self->aio_.Quit();
+      } else if (c->self->replay_rate_ ==
+                 std::numeric_limits<double>::infinity()) {
+        // The slice ran out: give the rest of aio_ a turn, and carry on as
+        // soon as it has had one.
+        c->timer->Schedule(monotonic_clock::now(), &Context::OnTimer, c);
       }
     }
   };
