@@ -495,6 +495,8 @@ fbs_npm_repositories()
 http_archive(
     name = "rules_rust",
     integrity = "sha256-w4tiLybzXDRzgQDibReT/yUolzgVRkZ7IticnU2L/VA=",
+    patch_args = ["-p1"],
+    patches = ["@aos//third_party:rules_rust-0.63.0.patch"],
     urls = ["https://github.com/bazelbuild/rules_rust/releases/download/0.63.0/rules_rust-0.63.0.tar.gz"],
 )
 

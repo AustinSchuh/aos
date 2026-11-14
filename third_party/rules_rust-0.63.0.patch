@@ -1,0 +1,42 @@
+--- a/cargo/private/cargo_build_script.bzl
++++ b/cargo/private/cargo_build_script.bzl
+@@ -232,8 +232,38 @@
+             res.append(arg)
+     return res
+ 
++def _pwd_flags_resource_dir_idirafter(args):
++    """Prefix execroot-relative paths of -resource-dir and -idirafter with ${pwd}.
++
++    Backported from rules_rust 0.71 (-resource-dir), plus -idirafter.  Build
++    scripts run the compiler from their own directory, so a relative clang
++    resource directory or include directory doesn't resolve and C build
++    scripts (ring) can't find <stddef.h>.
++
++    Args:
++        args (list): List of tool arguments.
++
++    Returns:
++        list: The modified argument list.
++    """
++    res = []
++    fix_next_arg = False
++    for arg in args:
++        if fix_next_arg and not paths.is_absolute(arg):
++            res.append("${{pwd}}/{}".format(arg))
++        else:
++            s, opt, path = arg.partition("-resource-dir=")
++            if s == "" and opt and not paths.is_absolute(path):
++                res.append("{}${{pwd}}/{}".format(opt, path))
++            else:
++                res.append(arg)
++
++        fix_next_arg = arg in ("-resource-dir", "-idirafter")
++
++    return res
++
+ def _pwd_flags(args):
+-    return _pwd_flags_fsanitize_ignorelist(_pwd_flags_isystem(_pwd_flags_bindir(_pwd_flags_sysroot(args))))
++    return _pwd_flags_resource_dir_idirafter(_pwd_flags_fsanitize_ignorelist(_pwd_flags_isystem(_pwd_flags_bindir(_pwd_flags_sysroot(args)))))
+ 
+ def _feature_enabled(ctx, feature_name, default = False):
+     """Check if a feature is enabled.
