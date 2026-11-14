@@ -380,6 +380,13 @@ void ApriltagDetector::HandleImage(const vision::CameraImage &image,
     }
   }
 
+  // An ImageAnnotations carries its time only in its annotations.  So that
+  // viewers waiting for this frame's overlays get them even when nothing was
+  // found, send an annotation with no points, stamped with the capture time.
+  if (foxglove_corners.empty()) {
+    foxglove_corners.push_back(frc::vision::BuildPointsAnnotation(
+        builder.fbb(), eof, std::vector<cv::Point2f>()));
+  }
   const auto corners_offset = builder.fbb()->CreateVector(foxglove_corners);
   foxglove::ImageAnnotations::Builder annotation_builder(*builder.fbb());
   annotation_builder.add_points(corners_offset);
