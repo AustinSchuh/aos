@@ -1,0 +1,762 @@
+//! The robot's HTTPS front door: static pages, and the websocket proxies to the servers behind
+//! it, over TLS from the robot's certificate.  See
+//! `documentation/adr/0007-robot-web-server-tls-mcp-logs.md`, and ADR 0008 for how it runs on
+//! the AOS event loop's thread.
+
+use std::{
+    ffi::CString,
+    fs, io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
+
+use axum::{
+    extract::ws::{self, WebSocket, WebSocketUpgrade},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use futures::{SinkExt, StreamExt};
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use rustls::{
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+    ServerConfig,
+};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+use tower_http::services::ServeDir;
+
+/// The certificate chain file `aos_make_tls_cert` writes: the server certificate, then its CA.
+pub const CHAIN_FILE: &str = "server-chain.crt";
+/// The private key file `aos_make_tls_cert` writes.
+pub const KEY_FILE: &str = "server.key";
+
+/// The websocket subprotocol Foxglove speaks.
+const FOXGLOVE_SUBPROTOCOL: &str = "foxglove.websocket.v1";
+
+/// The robot's certificate, read again whenever its files change.
+///
+/// `aos_make_tls_cert` reissues the certificate at boot and after a rename, and a server that
+/// kept the old one would serve a certificate for the wrong name until restarted.  Checking the
+/// files' modification times on each handshake is two `stat()`s, and a reissued certificate
+/// takes effect on the next connection.
+#[derive(Debug)]
+pub struct ReloadingCert {
+    chain_path: PathBuf,
+    key_path: PathBuf,
+    loaded: Mutex<Loaded>,
+}
+
+#[derive(Debug)]
+struct Loaded {
+    stamp: (SystemTime, SystemTime),
+    key: Arc<CertifiedKey>,
+}
+
+fn modified(path: &Path) -> io::Result<SystemTime> {
+    fs::metadata(path)?.modified()
+}
+
+fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+impl ReloadingCert {
+    /// Loads [`CHAIN_FILE`] and [`KEY_FILE`] from `tls_dir`.
+    pub fn new(tls_dir: &Path) -> io::Result<Arc<Self>> {
+        let chain_path = tls_dir.join(CHAIN_FILE);
+        let key_path = tls_dir.join(KEY_FILE);
+        let loaded = Self::load(&chain_path, &key_path)?;
+        Ok(Arc::new(Self {
+            chain_path,
+            key_path,
+            loaded: Mutex::new(loaded),
+        }))
+    }
+
+    fn load(chain_path: &Path, key_path: &Path) -> io::Result<Loaded> {
+        // Before reading, so a file replaced while reading is read again next time.
+        let stamp = (modified(chain_path)?, modified(key_path)?);
+        let chain = CertificateDer::pem_file_iter(chain_path)
+            .map_err(invalid)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(invalid)?;
+        if chain.is_empty() {
+            return Err(invalid(format!(
+                "{} has no certificates",
+                chain_path.display()
+            )));
+        }
+        let key = PrivateKeyDer::from_pem_file(key_path).map_err(invalid)?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(invalid)?;
+        Ok(Loaded {
+            stamp,
+            key: Arc::new(CertifiedKey::new(chain, signing_key)),
+        })
+    }
+
+    /// The current certificate, reloaded first if its files changed.  A reload that fails (a
+    /// file half-written) keeps serving the previous one.
+    fn current(&self) -> Arc<CertifiedKey> {
+        let mut loaded = self.loaded.lock().unwrap();
+        let stamp = (modified(&self.chain_path), modified(&self.key_path));
+        if let (Ok(chain), Ok(key)) = stamp {
+            if (chain, key) != loaded.stamp {
+                match Self::load(&self.chain_path, &self.key_path) {
+                    Ok(reloaded) => {
+                        log::info!(
+                            "Reloaded the TLS certificate from {}",
+                            self.chain_path.display()
+                        );
+                        *loaded = reloaded;
+                    }
+                    Err(error) => log::warn!(
+                        "Failed to reload the TLS certificate, keeping the old one: {error}"
+                    ),
+                }
+            }
+        }
+        loaded.key.clone()
+    }
+}
+
+impl ResolvesServerCert for ReloadingCert {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+}
+
+/// A rustls server configuration serving the robot's certificate from `tls_dir`.
+pub fn tls_config(tls_dir: &Path) -> io::Result<Arc<ServerConfig>> {
+    let mut config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(invalid)?
+            .with_no_client_auth()
+            .with_cert_resolver(ReloadingCert::new(tls_dir)?);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// Where the HTTPS router finds what it serves.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// The pages, as `web_proxy` serves them from its `--data_dir`.
+    pub data_dir: PathBuf,
+    /// `web_proxy`'s websocket, which only carries WebRTC signaling (`ws://127.0.0.1:1180/ws`).
+    pub web_proxy_ws: String,
+    /// The Foxglove server's websocket (`ws://127.0.0.1:8765`).
+    pub foxglove_ws: String,
+}
+
+/// The HTTPS side: the pages, and the websocket proxies.
+pub fn router(options: Options) -> Router {
+    let web_proxy_ws = options.web_proxy_ws.clone();
+    let foxglove_ws = options.foxglove_ws.clone();
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let upstream = web_proxy_ws.clone();
+                async move { proxy_websocket(upgrade, upstream, None) }
+            }),
+        )
+        .route(
+            "/foxglove",
+            get(move |upgrade: WebSocketUpgrade| {
+                let upstream = foxglove_ws.clone();
+                async move { proxy_websocket(upgrade, upstream, Some(FOXGLOVE_SUBPROTOCOL)) }
+            }),
+        )
+        .fallback_service(ServeDir::new(options.data_dir))
+        // The pages change with every deploy.  Browsers may keep them, but must ask the robot
+        // (a 304 if unchanged) before showing them, rather than guess from their age.
+        .layer(axum::middleware::map_response(no_cache))
+}
+
+async fn no_cache(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+/// Accepts the browser's websocket and joins it to `upstream`, passing `subprotocol` through.
+fn proxy_websocket(
+    upgrade: WebSocketUpgrade,
+    upstream: String,
+    subprotocol: Option<&'static str>,
+) -> Response {
+    let upgrade = match subprotocol {
+        Some(subprotocol) => upgrade.protocols([subprotocol]),
+        None => upgrade,
+    };
+    upgrade.on_upgrade(move |browser| async move {
+        if let Err(error) = pump(browser, &upstream, subprotocol).await {
+            log::warn!("Websocket proxy to {upstream} ended: {error}");
+        }
+    })
+}
+
+/// Copies messages both ways between `browser` and a new connection to `upstream`, until either
+/// side closes.
+async fn pump(
+    browser: WebSocket,
+    upstream: &str,
+    subprotocol: Option<&'static str>,
+) -> anyhow::Result<()> {
+    let mut request = upstream.into_client_request()?;
+    if let Some(subprotocol) = subprotocol {
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", subprotocol.parse()?);
+    }
+    let (upstream, _) = tokio_tungstenite::connect_async(request).await?;
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let (mut browser_tx, mut browser_rx) = browser.split();
+
+    let to_upstream = async {
+        while let Some(message) = browser_rx.next().await {
+            let message = match message? {
+                ws::Message::Text(text) => tungstenite::Message::text(text.as_str()),
+                ws::Message::Binary(data) => tungstenite::Message::binary(data),
+                ws::Message::Close(_) => break,
+                // Each side answers its own pings.
+                ws::Message::Ping(_) | ws::Message::Pong(_) => continue,
+            };
+            upstream_tx.send(message).await?;
+        }
+        let _ = upstream_tx.close().await;
+        anyhow::Ok(())
+    };
+    let to_browser = async {
+        while let Some(message) = upstream_rx.next().await {
+            let message = match message? {
+                tungstenite::Message::Text(text) => ws::Message::text(text.as_str()),
+                tungstenite::Message::Binary(data) => ws::Message::binary(data),
+                tungstenite::Message::Close(_) => break,
+                tungstenite::Message::Ping(_)
+                | tungstenite::Message::Pong(_)
+                | tungstenite::Message::Frame(_) => continue,
+            };
+            browser_tx.send(message).await?;
+        }
+        let _ = browser_tx.close().await;
+        anyhow::Ok(())
+    };
+    // Whichever side closes first ends both.
+    tokio::select! {
+        result = to_upstream => result,
+        result = to_browser => result,
+    }
+}
+
+/// The plain-HTTP side: whatever path is asked for, a page that checks whether this computer
+/// trusts the robot's certificate.  If it does, the page goes straight to the same path over
+/// HTTPS; if not, it says how to trust it, and keeps checking.  A browser can't tell an
+/// untrusted certificate from an unreachable server, but a page that loaded over HTTP knows the
+/// robot is reachable, so a failed HTTPS probe means the certificate.
+pub fn trust_router(https_port: u16) -> Router {
+    let page = trust_page(https_port);
+    Router::new().fallback(get(move || {
+        let page = page.clone();
+        async move { Html(page).into_response() }
+    }))
+}
+
+fn trust_page(https_port: u16) -> String {
+    // What follows the host in the HTTPS links: nothing on the default port.
+    let port = if https_port == 443 {
+        String::new()
+    } else {
+        format!(":{https_port}")
+    };
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot pages</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+  code {{ background: #eee; padding: 0.1rem 0.3rem; border-radius: 3px; }}
+  .hidden {{ display: none; }}
+</style>
+</head>
+<body>
+<h1>Robot pages</h1>
+<p id="checking">Checking whether this computer trusts the robot's certificate&hellip;</p>
+<p id="trusted" class="hidden">This computer trusts the robot. Going to
+  <a id="secure" href="#">the secure page</a>&hellip;</p>
+<div id="untrusted" class="hidden">
+  <p>This computer doesn't trust the robot's certificate yet, so browsers and Foxglove can't
+  connect to it securely. To trust it, once per computer:</p>
+  <ol>
+    <li>Get <code>trust_orin.py</code> from meta-frc4646 and run it:
+      <p><code id="command">python3 trust_orin.py</code></p>
+      It shows the robot's certificate authority and what it can vouch for: only your team's
+      robots, nothing else. Check the fingerprint it prints, then say yes.</li>
+    <li>Restart the browser completely (every window). Chrome remembers a certificate it has
+      already rejected until it restarts.</li>
+    <li>Come back to <a id="again" href="#">this page</a>. It goes on to the secure page by
+      itself once the robot is trusted.</li>
+  </ol>
+  <p>On a Mac, it asks for your password. On Windows, it asks you to confirm. On Linux, it
+  needs <code>certutil</code> (<code>sudo apt install libnss3-tools</code>). Firefox on a Mac
+  or Windows also needs <code>security.enterprise_roots.enabled</code> set in
+  <code>about:config</code>. Foxglove's desktop app trusts it after a restart too.</p>
+</div>
+<script>
+  // The certificate names orin-TEAM-N.local, not the bare name, so always go there.
+  const host = /^orin-[0-9]+-[0-9]$/.test(location.hostname)
+      ? `${{location.hostname}}.local` : location.hostname;
+  const https = `https://${{host}}{port}`;
+  const target = https + location.pathname + location.search + location.hash;
+  document.getElementById('secure').href = target;
+  document.getElementById('again').href = `http://${{host}}${{location.pathname}}`;
+  document.getElementById('command').textContent =
+      `python3 trust_orin.py ${{host.replace(/\.local$/, '')}}`;
+  const show = (id) => {{
+    for (const other of ['checking', 'trusted', 'untrusted']) {{
+      document.getElementById(other).classList.toggle('hidden', other !== id);
+    }}
+  }};
+  // An opaque response is enough: it only resolves if the TLS handshake succeeded.  A probe
+  // that hangs counts as untrusted.
+  const probe = () => fetch(`${{https}}/healthz`, {{
+    mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(5000)}});
+  const check = () => probe().then(() => {{
+    show('trusted');
+    // replace, so Back doesn't return here and bounce straight forward again.
+    location.replace(target);
+  }}, () => {{
+    show('untrusted');
+    setTimeout(check, 3000);
+  }});
+  check();
+</script>
+</body>
+</html>
+"##
+    )
+}
+
+/// Becomes `user` for good: its groups, then its group and user IDs, real, effective and saved.
+///
+/// Starter runs robot_server as root so it can listen on 443 and 80, as `irq_affinity` is run
+/// as root.  Unlike `irq_affinity`, nothing after the listeners needs root, so this keeps no
+/// way back to it.  Call it before anything else starts threads, and before the event loop
+/// creates its shared memory, so that belongs to `user`.
+pub fn drop_privileges(user: &str) -> io::Result<()> {
+    let name = CString::new(user).map_err(|_| invalid(format!("Bad user name {user:?}")))?;
+    let last_error = |what: String| {
+        let error = io::Error::last_os_error();
+        io::Error::new(error.kind(), format!("{what}: {error}"))
+    };
+
+    // SAFETY: getpwnam_r writes only into `entry` and `buffer`, which outlive the call, and
+    // `entry`'s pointers into `buffer` aren't used after it.
+    let (uid, gid) = unsafe {
+        let mut entry: libc::passwd = std::mem::zeroed();
+        let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let result = libc::getpwnam_r(
+            name.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        );
+        if result != 0 {
+            let error = io::Error::from_raw_os_error(result);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("Failed to look up user {user}: {error}"),
+            ));
+        }
+        if found.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("There is no user {user}"),
+            ));
+        }
+        (entry.pw_uid, entry.pw_gid)
+    };
+
+    // Groups first: only root may set them.
+    // SAFETY: plain syscalls on values, and `name` is a valid C string.
+    unsafe {
+        if libc::initgroups(name.as_ptr(), gid) != 0 {
+            return Err(last_error(format!("Failed to set {user}'s groups")));
+        }
+        if libc::setresgid(gid, gid, gid) != 0 {
+            return Err(last_error(format!(
+                "Failed to change the group ID to {gid}"
+            )));
+        }
+        if libc::setresuid(uid, uid, uid) != 0 {
+            return Err(last_error(format!("Failed to change the user ID to {uid}")));
+        }
+        if uid != 0 && libc::setuid(0) == 0 {
+            return Err(io::Error::other(format!(
+                "Still able to become root after changing to {user}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Serves `router` over TLS on `listener`, until the future is dropped.
+pub async fn serve_https(listener: TcpListener, tls: Arc<ServerConfig>, router: Router) {
+    let acceptor = TlsAcceptor::from(tls);
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                log::warn!("Failed to accept an HTTPS connection: {error}");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let stream = match acceptor.accept(tcp).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // Untrusted-certificate rejections from browsers land here, routinely.
+                    log::debug!("TLS handshake with {peer} failed: {error}");
+                    return;
+                }
+            };
+            serve_connection(TokioIo::new(stream), router, peer).await;
+        });
+    }
+}
+
+/// Serves `router` over plain HTTP on `listener`, until the future is dropped.
+pub async fn serve_http(listener: TcpListener, router: Router) {
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                log::warn!("Failed to accept an HTTP connection: {error}");
+                continue;
+            }
+        };
+        let router = router.clone();
+        tokio::spawn(async move { serve_connection(TokioIo::new(tcp), router, peer).await });
+    }
+}
+
+async fn serve_connection<I>(io: I, router: Router, peer: SocketAddr)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    if let Err(error) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, TowerToHyperService::new(router))
+        // Websockets upgrade the connection.
+        .with_upgrades()
+        .await
+    {
+        log::debug!("HTTP connection from {peer} ended: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+
+    fn testdata(name: &str) -> PathBuf {
+        aos_testing_path::artifact_path(Path::new("aos/network/robot_server/testdata")).join(name)
+    }
+
+    /// A directory holding certificate `which` ("a" or "b") under the names the server reads.
+    /// Writes certificate `which` into `dir`.  It copies the contents, not the files: runfiles
+    /// can be read-only (they are on remote executors), and fs::copy would copy that mode, so
+    /// the next install couldn't overwrite them.
+    fn install_cert(dir: &Path, which: &str) {
+        for (from, to) in [
+            (format!("server-{which}-chain.crt"), CHAIN_FILE),
+            (format!("server-{which}.key"), KEY_FILE),
+        ] {
+            fs::write(dir.join(to), fs::read(testdata(&from)).unwrap()).unwrap();
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("robot_server_test_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn client_tls() -> TlsConnector {
+        let mut roots = RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(testdata("ca.crt")).unwrap() {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        TlsConnector::from(Arc::new(config))
+    }
+
+    async fn start(tls_dir: &Path, options: Options) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_https(
+            listener,
+            tls_config(tls_dir).unwrap(),
+            router(options),
+        ));
+        address
+    }
+
+    fn options(data_dir: &Path) -> Options {
+        Options {
+            data_dir: data_dir.to_path_buf(),
+            web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
+            foxglove_ws: "ws://127.0.0.1:1".to_string(),
+        }
+    }
+
+    /// GETs `path` over TLS, returning the response and the server's leaf certificate.
+    async fn get(address: SocketAddr, path: &str) -> (String, Vec<u8>) {
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut stream = client_tls()
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .unwrap();
+        let leaf = stream.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        (response, leaf)
+    }
+
+    fn leaf_of(which: &str) -> Vec<u8> {
+        CertificateDer::pem_file_iter(testdata(&format!("server-{which}-chain.crt")))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The pages are served over TLS, with the robot's certificate.
+    #[tokio::test]
+    async fn serves_pages_over_tls() {
+        let tls_dir = temp_dir("pages_tls");
+        install_cert(&tls_dir, "a");
+        let data_dir = temp_dir("pages_data");
+        fs::write(data_dir.join("field.html"), "<p>field</p>").unwrap();
+        let address = start(&tls_dir, options(&data_dir)).await;
+
+        let (response, leaf) = get(address, "/field.html").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("<p>field</p>"), "{response}");
+        // Pages change with each deploy, so browsers must check before reusing them.
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("cache-control: no-cache"),
+            "{response}"
+        );
+        assert_eq!(leaf, leaf_of("a"));
+
+        let (response, _) = get(address, "/healthz").await;
+        assert!(response.ends_with("ok"), "{response}");
+    }
+
+    /// A reissued certificate is served from the next connection on, without a restart.
+    #[tokio::test]
+    async fn reloads_a_reissued_certificate() {
+        let tls_dir = temp_dir("reload_tls");
+        install_cert(&tls_dir, "a");
+        let data_dir = temp_dir("reload_data");
+        let address = start(&tls_dir, options(&data_dir)).await;
+
+        assert_eq!(get(address, "/healthz").await.1, leaf_of("a"));
+        // Modification times can be coarse; make sure the new files look newer.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        install_cert(&tls_dir, "b");
+        let later = SystemTime::now() + std::time::Duration::from_secs(1);
+        for file in [CHAIN_FILE, KEY_FILE] {
+            fs::File::options()
+                .append(true)
+                .open(tls_dir.join(file))
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        assert_eq!(get(address, "/healthz").await.1, leaf_of("b"));
+    }
+
+    /// A websocket to /foxglove reaches the server behind it, with Foxglove's subprotocol passed
+    /// through both ways, and messages flow in both directions.
+    #[tokio::test]
+    async fn proxies_foxglove_websocket() {
+        // The "Foxglove server": accepts one websocket, checks the subprotocol, echoes.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = upstream.accept().await.unwrap();
+            let callback =
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request.headers().get("Sec-WebSocket-Protocol").unwrap(),
+                        FOXGLOVE_SUBPROTOCOL
+                    );
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        FOXGLOVE_SUBPROTOCOL.parse().unwrap(),
+                    );
+                    Ok(response)
+                };
+            let mut socket = tokio_tungstenite::accept_hdr_async(tcp, callback)
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_text() || message.is_binary() {
+                    socket.send(message).await.unwrap();
+                }
+            }
+        });
+
+        let tls_dir = temp_dir("ws_tls");
+        install_cert(&tls_dir, "a");
+        let data_dir = temp_dir("ws_data");
+        let address = start(
+            &tls_dir,
+            Options {
+                data_dir: data_dir.clone(),
+                web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
+                foxglove_ws: format!("ws://{upstream_address}"),
+            },
+        )
+        .await;
+
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let tls = client_tls()
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .unwrap();
+        let mut request = format!("wss://127.0.0.1:{}/foxglove", address.port())
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            FOXGLOVE_SUBPROTOCOL.parse().unwrap(),
+        );
+        let (mut socket, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+        assert_eq!(
+            response.headers().get("Sec-WebSocket-Protocol").unwrap(),
+            FOXGLOVE_SUBPROTOCOL
+        );
+        socket
+            .send(tungstenite::Message::text("hello"))
+            .await
+            .unwrap();
+        let echoed = socket.next().await.unwrap().unwrap();
+        assert_eq!(echoed.to_text().unwrap(), "hello");
+        socket
+            .send(tungstenite::Message::binary(vec![1u8, 2, 3]))
+            .await
+            .unwrap();
+        let echoed = socket.next().await.unwrap().unwrap();
+        assert_eq!(echoed.into_data().to_vec(), vec![1u8, 2, 3]);
+    }
+
+    /// Fetches `path` over plain HTTP from a trust router for `https_port`.
+    async fn fetch_trust_page(https_port: u16, path: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_http(listener, trust_router(https_port)));
+        let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        tcp.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tcp.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response
+    }
+
+    /// The plain-HTTP page probes the HTTPS port it was told about, goes on to the same path
+    /// there once that works, and says how to trust the robot until it does.
+    #[tokio::test]
+    async fn trust_page_redirects_when_trusted() {
+        let response = fetch_trust_page(8443, "/").await;
+        assert!(response.contains("`https://${host}:8443`"), "{response}");
+        assert!(response.contains("fetch(`${https}/healthz`"), "{response}");
+        assert!(
+            response.contains("https + location.pathname + location.search + location.hash"),
+            "{response}"
+        );
+        assert!(response.contains("location.replace(target)"), "{response}");
+        assert!(response.contains("python3 trust_orin.py"), "{response}");
+        // Retries until the robot is trusted.
+        assert!(response.contains("setTimeout(check"), "{response}");
+    }
+
+    /// The bare name has no certificate, so the page probes and redirects to the .local name.
+    #[tokio::test]
+    async fn trust_page_uses_the_certificates_name() {
+        let response = fetch_trust_page(443, "/").await;
+        assert!(response.contains("/^orin-[0-9]+-[0-9]$/"), "{response}");
+        assert!(
+            response.contains("`${location.hostname}.local`"),
+            "{response}"
+        );
+    }
+
+    /// Every path gets the page, so the redirect keeps the page that was asked for.
+    #[tokio::test]
+    async fn trust_page_serves_every_path() {
+        let response = fetch_trust_page(443, "/field.html?x=1").await;
+        assert!(response.contains("location.replace(target)"), "{response}");
+    }
+
+    /// On 443 the page's URLs leave the port out, as a browser would.
+    #[tokio::test]
+    async fn trust_page_omits_the_default_port() {
+        let response = fetch_trust_page(443, "/").await;
+        assert!(response.contains("`https://${host}`"), "{response}");
+        assert!(!response.contains(":443"), "{response}");
+    }
+
+    /// Dropping to a user that doesn't exist fails, naming it, instead of carrying on as root.
+    #[test]
+    fn drop_privileges_to_unknown_user_fails() {
+        let error = drop_privileges("no-such-user-robot-server-test").unwrap_err();
+        assert!(
+            error.to_string().contains("no-such-user-robot-server-test"),
+            "{error}"
+        );
+    }
+}
