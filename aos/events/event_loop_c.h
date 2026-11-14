@@ -33,6 +33,9 @@ typedef struct aos_timer_handler_t aos_timer_handler_t;
 // member functions.
 typedef struct aos_exit_handle_t aos_exit_handle_t;
 
+// Wrapper for aos::Aio. See the aos_aio_* functions for the member functions.
+typedef struct aos_aio_t aos_aio_t;
+
 // Wrapper for aos::Context. Fields correspond one-to-one with the same names.
 // See aos/events/context.h for detailed documentation.
 typedef struct aos_context_t {
@@ -211,6 +214,35 @@ void aos_shm_event_loop_set_fd_events(aos_event_loop_t *self, intptr_t fd,
                                       uint32_t events);
 aos_event_loop_t *aos_shm_event_loop_create(
     const aos_configuration_t *configuration);
+
+// Makes a ShmEventLoop on an Aio that the caller drives, rather than one it
+// runs itself with aos_shm_event_loop_run().  Call
+// aos_shm_event_loop_startup() before the Aio is first polled, and
+// aos_shm_event_loop_shutdown() once it won't be again.  aio must outlive the
+// event loop.  See aos::QueueEventLoop::Startup().
+aos_event_loop_t *aos_shm_event_loop_create_on_aio(
+    const aos_configuration_t *configuration, aos_aio_t *aio);
+void aos_shm_event_loop_startup(aos_event_loop_t *self);
+// Returns nullptr to indicate Ok(), like aos_shm_event_loop_run().
+aos_error_t *aos_shm_event_loop_shutdown(aos_event_loop_t *self);
+
+// aos::Aio, for driving one from another event loop.  See aos/events/aio.h.
+// The backend is the one --aio_backend selects.
+aos_aio_t *aos_aio_create(void);
+void aos_aio_destroy(aos_aio_t *self);
+bool aos_aio_poll(aos_aio_t *self, bool block);
+// Aio::should_run(): false once the loop has been told to stop (an event
+// loop on it exited, or ^C).
+bool aos_aio_should_run(aos_aio_t *self);
+// Aio::PrepareToWait().  *deadline_ns is on the monotonic clock, and
+// INT64_MAX when nothing is due.
+void aos_aio_prepare_to_wait(aos_aio_t *self, bool *poll_now,
+                             int64_t *deadline_ns);
+// Aio::WaitFd(), widened to intptr_t like the fds above.
+intptr_t aos_aio_wait_fd(aos_aio_t *self);
+// The real monotonic clock, in nanoseconds: what Aio's deadlines are on, even
+// under simulation, where an event loop's own monotonic_now() is simulated.
+int64_t aos_monotonic_clock_now(void);
 
 void aos_fetcher_destroy(aos_fetcher_t *self);
 // Fetches the latest message on the channel. Returns true if a new message
