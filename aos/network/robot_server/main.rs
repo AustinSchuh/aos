@@ -1,8 +1,8 @@
 //! The robot's HTTPS front door.  See `documentation/adr/0007-robot-web-server-tls-mcp-logs.md`.
 //!
 //! Serves the robot's pages (what `web_proxy` serves from its `--data_dir`) over HTTPS with the
-//! robot's certificate, and proxies `/ws` to `web_proxy` and `/foxglove` to the Foxglove server,
-//! so browsers and the Foxglove web app connect over `wss://`.
+//! robot's certificate, and proxies `/ws` to `web_proxy`, `/foxglove` to the Foxglove server and
+//! `/cameras/ws` to camera_streamer, so browsers and the Foxglove web app connect over `wss://`.
 //! Plain HTTP serves a page that checks whether this computer trusts the certificate.
 //!
 //! Starter runs it as root so it can listen on 443 and 80; it drops to `--user` as soon as it
@@ -47,6 +47,9 @@ struct App {
     /// The Foxglove server's port; /foxglove is proxied to it.
     #[arg(long, default_value_t = 8765)]
     foxglove_port: u16,
+    /// camera_streamer's signalling port; /cameras/ws is proxied to it.
+    #[arg(long, default_value_t = 1190)]
+    camera_streamer_port: u16,
 }
 
 /// Listens on `port` on every address, IPv4 included, ready for tokio.
@@ -85,6 +88,7 @@ fn main() {
         data_dir: app.data_dir.clone(),
         web_proxy_ws: format!("ws://127.0.0.1:{}/ws", app.web_proxy_port),
         foxglove_ws: format!("ws://127.0.0.1:{}", app.foxglove_port),
+        camera_streamer_ws: format!("ws://127.0.0.1:{}", app.camera_streamer_port),
     });
 
     TokioShmEventLoop::new(&config).run(|_aos| async move {
