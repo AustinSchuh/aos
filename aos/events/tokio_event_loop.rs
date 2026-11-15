@@ -442,7 +442,7 @@ async fn sleep_until_ns(deadline_ns: i64) {
     tokio::time::sleep(Duration::from_nanos(remaining)).await;
 }
 
-/// What [`run_simulation()`]'s setup makes handles with.
+/// What a simulation's tasks make handles with.
 pub struct SimulationSetup {
     factory: *mut aos_simulated_event_loop_factory_t,
     handles: RefCell<Vec<Rc<HandleInner>>>,
@@ -453,8 +453,7 @@ impl SimulationSetup {
     ///
     /// # Safety
     ///
-    /// `event_loop` must be one of the simulation's event loops, and outlive
-    /// [`run_simulation()`].
+    /// `event_loop` must be one of the simulation's event loops, and outlive the simulation's run.
     pub unsafe fn handle(&self, event_loop: *mut aos_event_loop_t) -> AosHandle {
         let inner = HandleInner::new(event_loop, ExitSource::Factory(self.factory));
         self.handles.borrow_mut().push(inner.clone());
@@ -462,19 +461,102 @@ impl SimulationSetup {
     }
 }
 
-/// Runs a simulation with tokio as the outer loop, in place of the factory's `Run()`.
+/// A simulation with tokio as the outer loop, in place of the factory's `Run()`.
 ///
 /// tokio drives the simulation scheduler's `Aio`, which runs the simulated events; between
-/// batches of them, tokio runs its tasks. Tasks see simulated time through
-/// [`AosHandle::monotonic_now_ns()`] and AOS timers, while tokio's own timers and sockets run
-/// in real time. See `documentation/adr/0008-tokio-on-the-event-loop-thread.md`.
+/// batches of them, tokio runs its tasks.  Tasks see simulated time through
+/// [`AosHandle::monotonic_now_ns()`] and AOS timers, while tokio's own timers and sockets run in
+/// real time.  See `documentation/adr/0008-tokio-on-the-event-loop-thread.md`.
+///
+/// Whoever owns the factory, Rust or C++ (through `aos/events/tokio_simulation.h`), makes one,
+/// adds tasks that use the simulation's event loops, and runs it.
+pub struct TokioSimulation {
+    aio: Aio,
+    wait_fd: RawFd,
+    setup: SimulationSetup,
+    tasks: Vec<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl TokioSimulation {
+    /// # Safety
+    ///
+    /// `factory` must stay live, and not run otherwise, until this is run or dropped.
+    pub unsafe fn new(factory: *mut aos_simulated_event_loop_factory_t) -> Self {
+        // SAFETY: The factory is live, and owns its scheduler's Aio.
+        let aio = Aio(unsafe { aos_simulated_event_loop_factory_scheduler_aio(factory) });
+        // First, before anything can submit raw requests; see TokioShmEventLoop::run().
+        let wait_fd = aio.wait_fd();
+        Self {
+            aio,
+            wait_fd,
+            setup: SimulationSetup {
+                factory,
+                handles: RefCell::new(Vec::new()),
+            },
+            tasks: Vec::new(),
+        }
+    }
+
+    /// For making handles on the simulation's event loops, and AOS objects with them, before it
+    /// runs.
+    pub fn setup(&self) -> &SimulationSetup {
+        &self.setup
+    }
+
+    /// A task to run on the simulation's thread, from when it starts.
+    pub fn spawn(&mut self, task: impl Future<Output = ()> + 'static) {
+        self.tasks.push(Box::pin(task));
+    }
+
+    /// Runs the simulation until it stops, when its events run out or something exits it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the simulation reports an error.
+    pub fn run(mut self) {
+        let factory = self.setup.factory;
+        let (runtime, park) = build_simulation_runtime(&self.aio, factory);
+        // SAFETY: The factory is live.
+        check_shutdown_error(
+            unsafe { aos_simulated_event_loop_factory_start_external_run(factory) },
+            "The simulation failed to start",
+        );
+        let local = tokio::task::LocalSet::new();
+        for task in self.tasks.drain(..) {
+            local.spawn_local(task);
+        }
+        local.block_on(&runtime, wait_for_simulation(self.wait_fd, &park, factory));
+        // Tasks may hold AOS objects; they go before the simulation's run ends.
+        drop(local);
+        drop(runtime);
+
+        // SAFETY: The factory is live, and its external run has stopped.
+        check_shutdown_error(
+            unsafe { aos_simulated_event_loop_factory_finish_external_run(factory) },
+            "The simulation stopped",
+        );
+    }
+}
+
+impl Drop for TokioSimulation {
+    fn drop(&mut self) {
+        // Tasks that never ran may hold AOS objects; they go first.
+        self.tasks.clear();
+        for inner in self.setup.handles.borrow().iter() {
+            inner.finish();
+        }
+    }
+}
+
+/// Runs a simulation with tokio as the outer loop, in place of the factory's `Run()`: a
+/// [`TokioSimulation`] with one task.
 ///
 /// `setup` runs first, before the simulation starts: make handles on the simulation's event
-/// loops ([`SimulationSetup::handle()`]), and AOS objects with them. The future it returns
-/// runs on a tokio `LocalSet`, and may `spawn_local()` more tasks.
+/// loops ([`SimulationSetup::handle()`]), and AOS objects with them.  The future it returns runs
+/// on a tokio `LocalSet`, and may `spawn_local()` more tasks.
 ///
-/// Runs until the simulation stops, when its events run out or something exits it. Returns
-/// the future's output if it finished first.
+/// Runs until the simulation stops, when its events run out or something exits it.  Returns the
+/// future's output if it finished first.
 ///
 /// # Panics
 ///
@@ -487,48 +569,57 @@ where
     F: FnOnce(&SimulationSetup) -> Fut,
     Fut: Future + 'static,
 {
-    let factory = factory.as_raw();
-    // SAFETY: The factory is live for this call, and owns its scheduler's Aio.
-    let aio = Aio(unsafe { aos_simulated_event_loop_factory_scheduler_aio(factory) });
-    // First, before anything can submit raw requests; see TokioShmEventLoop::run().
-    let wait_fd = aio.wait_fd();
-
-    let simulation = SimulationSetup {
-        factory,
-        handles: RefCell::new(Vec::new()),
-    };
-    let user_future = setup(&simulation);
-
-    let (runtime, park) = build_simulation_runtime(&aio, factory);
-    // SAFETY: The factory is live.
-    check_shutdown_error(
-        unsafe { aos_simulated_event_loop_factory_start_external_run(factory) },
-        "The simulation failed to start",
-    );
-
+    // SAFETY: The factory is borrowed for the whole run.
+    let mut simulation = unsafe { TokioSimulation::new(factory.as_raw()) };
+    let user_future = setup(simulation.setup());
     let output = Rc::new(RefCell::new(None));
-    let local = tokio::task::LocalSet::new();
     {
         let output = output.clone();
-        local.spawn_local(async move {
+        simulation.spawn(async move {
             *output.borrow_mut() = Some(user_future.await);
         });
     }
-    local.block_on(&runtime, wait_for_simulation(wait_fd, &park, factory));
-    // Tasks may hold AOS objects; they go before the simulation's run ends.
-    drop(local);
-    drop(runtime);
-
-    // SAFETY: The factory is live, and its external run has stopped.
-    check_shutdown_error(
-        unsafe { aos_simulated_event_loop_factory_finish_external_run(factory) },
-        "The simulation stopped",
-    );
-    for inner in simulation.handles.borrow().iter() {
-        inner.finish();
-    }
+    simulation.run();
     let output = output.borrow_mut().take();
     output
+}
+
+/// The C API for [`TokioSimulation`], which `aos/events/tokio_simulation.h` declares.
+pub mod c_api {
+    use super::*;
+
+    /// # Safety
+    ///
+    /// As [`TokioSimulation::new()`].
+    #[no_mangle]
+    pub unsafe extern "C" fn aos_tokio_simulation_create(
+        factory: *mut aos_simulated_event_loop_factory_t,
+    ) -> *mut TokioSimulation {
+        // SAFETY: Passed on.
+        Box::into_raw(Box::new(unsafe { TokioSimulation::new(factory) }))
+    }
+
+    /// Runs the simulation, and destroys it.
+    ///
+    /// # Safety
+    ///
+    /// `simulation` must be from [`aos_tokio_simulation_create()`], not yet run or destroyed.
+    #[no_mangle]
+    pub unsafe extern "C" fn aos_tokio_simulation_run(simulation: *mut TokioSimulation) {
+        // SAFETY: Owned, as above.
+        unsafe { Box::from_raw(simulation) }.run();
+    }
+
+    /// Destroys a simulation that hasn't run.
+    ///
+    /// # Safety
+    ///
+    /// As [`aos_tokio_simulation_run()`].
+    #[no_mangle]
+    pub unsafe extern "C" fn aos_tokio_simulation_destroy(simulation: *mut TokioSimulation) {
+        // SAFETY: Owned, as above.
+        drop(unsafe { Box::from_raw(simulation) });
+    }
 }
 
 /// State a C callback wakes a task through.  Lives as long as the event loop: AOS watchers can't
