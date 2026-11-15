@@ -95,8 +95,10 @@ pub trait Init: Parser {
             .expect("Error setting C++ flag: stderrthreshold");
         let this = Self::parse_with_cpp_flags();
         internal::init();
-        // Non-test initialization below
-        env_logger::init();
+        // Non-test initialization below.  INFO and up, as the C++ side logs by default
+        // (stderrthreshold 0 above); env_logger alone would show only errors.  RUST_LOG still
+        // overrides it.
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
         this
     }
 
