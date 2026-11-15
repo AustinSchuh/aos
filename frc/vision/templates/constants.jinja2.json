@@ -22,6 +22,10 @@
       "team": 1868,
       "robot_name": "austin",
       "data": {
+        /* The fixed_extrinsics are placeholders, not measured: each camera
+           0.5 m up and 0.3 m out from the robot's centre, facing front,
+           left, back and right by camera number.  Replace them when the
+           cameras are calibrated on the robot. */
         "calibration": [
           {% include 'frc/vision/constants/calibration_orin-4646-0_cam-25-01_2025-03-06_09-08-48.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-1_cam-25-02_2025-02-02_21-25-24.json' %},

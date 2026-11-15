@@ -31,5 +31,25 @@
  "calibration_timestamp": 1741280928754949431,
  "camera_id": "25-01",
  "camera_number": 0,
- "reprojection_error": 0.54337317
+ "reprojection_error": 0.54337317,
+ "fixed_extrinsics": {
+  "data": [
+   0.0,
+   0.0,
+   1.0,
+   0.3,
+   -1.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   -1.0,
+   0.0,
+   0.5,
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ }
 }
