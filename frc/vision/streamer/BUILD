@@ -2,17 +2,25 @@ load("//tools/rust:defs.bzl", "rust_binary", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# What needs no GStreamer: frames for the encoder, and the signalling
+# What needs no GStreamer: frames for the encoder, the boxes on the AprilTags
+# and drawing them, joining frames with their boxes, and the signalling
 # messages.  Builds and tests anywhere.
 rust_library(
     name = "camera_streamer_core",
     srcs = [
         "core.rs",
+        "draw.rs",
         "frame.rs",
+        "join.rs",
+        "overlay.rs",
         "signalling.rs",
+        "tag_box.rs",
     ],
     crate_root = "core.rs",
     deps = [
+        "//frc/vision:camera_constants_rust_fbs",
+        "//frc/vision:target_map_rust_fbs",
+        "@aos_flatbuffers//rust:flatbuffers",
         "@crate_index//:serde_json",
     ],
 )

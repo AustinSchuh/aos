@@ -1,8 +1,9 @@
 //! camera_streamer: the robot's cameras, as live video in the browser.
 //!
 //! Watches each camera's decoded `/cameraN/gray` images, and streams those that someone is
-//! watching: H.264 from x264, one encoder per camera shared by every viewer.  Each viewer gets one
-//! WebRTC peer connection carrying every camera it watches.  Browsers set up their
+//! watching, with a box drawn on each AprilTag the detector found (`/cameraN/gray`
+//! `frc.vision.TargetMap`): H.264 from x264, one encoder per camera shared by every viewer.  Each
+//! viewer gets one WebRTC peer connection carrying every camera it watches.  Browsers set up their
 //! sessions over a websocket on localhost, which robot_server serves to them as
 //! `wss://<robot>/cameras/ws`.
 //!
@@ -16,6 +17,7 @@ use std::rc::Rc;
 use aos_configuration::read_config_from;
 use aos_events_tokio::TokioShmEventLoop;
 use aos_init::Init;
+use camera_streamer::join::JoinOptions;
 use camera_streamer::pipeline::Settings;
 use camera_streamer::signalling::{FromBrowser, ToBrowser};
 use camera_streamer::streamer::{Options, Streamer};
@@ -51,6 +53,17 @@ struct App {
     min_port: u32,
     #[arg(long, default_value_t = 5830)]
     max_port: u32,
+    /// The longest a frame waits for its overlays (the boxes on the tags in /cameraN/gray
+    /// frc.vision.TargetMap) before it is sent without them.
+    #[arg(long, default_value_t = 50)]
+    overlay_wait_ms: i64,
+    /// The node whose cameras' calibrations, in /constants frc.vision.CameraConstants, to draw
+    /// the tags' boxes with.
+    #[arg(long, default_value = "orin")]
+    node: String,
+    /// The AprilTags' size, in meters: 6.5 inches, as the detector assumes.
+    #[arg(long, default_value_t = 6.5 * 0.0254)]
+    tag_size: f64,
 }
 
 type Shared = Rc<RefCell<Streamer>>;
@@ -130,8 +143,15 @@ fn main() {
                 },
                 half_size: app.half_size,
                 max_fps: app.max_fps,
+                join: JoinOptions {
+                    max_wait_ns: app.overlay_wait_ms * 1_000_000,
+                    // A detector quiet for a second has stopped; don't hold the video for it.
+                    absent_after_ns: 1_000_000_000,
+                },
                 // A camera that hasn't sent a frame in 2 s isn't worth holding the others for.
                 start_wait_ns: 2_000_000_000,
+                node: app.node.clone(),
+                tag_size: app.tag_size,
             },
             &app.cameras,
         )
@@ -143,40 +163,98 @@ fn main() {
             .cameras
             .iter()
             .map(|&camera| {
+                let channel = format!("/camera{camera}/gray");
                 (
                     camera,
-                    aos.make_watch(&format!("/camera{camera}/gray"), "frc.vision.CameraImage"),
+                    aos.make_watch(&channel, "frc.vision.CameraImage"),
+                    aos.make_watch(&channel, "frc.vision.TargetMap"),
+                    aos.make_timer(),
                 )
             })
             .collect();
+        // The calibrations: whatever was sent before we started, then any changes.
+        let mut constants_fetcher = aos.make_fetcher("/constants", "frc.vision.CameraConstants");
+        let mut constants = aos.make_watch("/constants", "frc.vision.CameraConstants");
         async move {
-            for (camera, mut images) in watches {
+            if constants_fetcher.fetch() {
+                if let Some(data) = constants_fetcher.message().data() {
+                    streamer.borrow_mut().on_constants(data);
+                }
+            } else {
+                log::warn!("No /constants frc.vision.CameraConstants yet, so no boxes on tags");
+            }
+            {
                 let streamer = streamer.clone();
                 tokio::task::spawn_local(async move {
                     loop {
-                        let message = images.latest().await;
-                        let now_ns = message.monotonic_event_time_ns();
-                        let Some(data) = message.data() else {
-                            continue;
-                        };
-                        let Ok(image) = vision::root_as_camera_image(data) else {
-                            log::warn!("Camera {camera}: not a CameraImage");
-                            continue;
-                        };
-                        if image.format() != vision::ImageFormat::MONO8 {
-                            continue;
+                        let message = constants.next().await;
+                        if let Some(data) = message.data() {
+                            streamer.borrow_mut().on_constants(data);
                         }
-                        let Some(gray) = image.data() else {
-                            continue;
-                        };
-                        streamer.borrow_mut().on_image(
-                            camera,
-                            gray.bytes(),
-                            image.cols() as u32,
-                            image.rows() as u32,
-                            image.monotonic_timestamp_ns(),
-                            now_ns,
-                        );
+                    }
+                });
+            }
+
+            for (camera, mut images, mut overlays, mut timer) in watches {
+                let streamer = streamer.clone();
+                tokio::task::spawn_local(async move {
+                    loop {
+                        let deadline = streamer.borrow().next_deadline_ns(camera);
+                        tokio::select! {
+                            message = images.latest() => {
+                                let now_ns = message.monotonic_event_time_ns();
+                                let Some(data) = message.data() else {
+                                    continue;
+                                };
+                                let Ok(image) = vision::root_as_camera_image(data) else {
+                                    log::warn!("Camera {camera}: not a CameraImage");
+                                    continue;
+                                };
+                                if image.format() != vision::ImageFormat::MONO8 {
+                                    continue;
+                                }
+                                let Some(gray) = image.data() else {
+                                    continue;
+                                };
+                                streamer.borrow_mut().on_image(
+                                    camera,
+                                    gray.bytes(),
+                                    image.cols() as u32,
+                                    image.rows() as u32,
+                                    image.monotonic_timestamp_ns(),
+                                    now_ns,
+                                );
+                            }
+                            message = overlays.latest() => {
+                                let now_ns = message.monotonic_event_time_ns();
+                                if let Some(data) = message.data() {
+                                    streamer.borrow_mut().on_target_map(camera, data, now_ns);
+                                }
+                            }
+                            // The oldest waiting frame has waited long enough for its overlays.
+                            now_ns = async {
+                                match deadline {
+                                    Some(deadline) => {
+                                        timer.sleep_until(deadline).await;
+                                        deadline
+                                    }
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                streamer.borrow_mut().expire(camera, now_ns);
+                            }
+                        }
+                    }
+                });
+            }
+
+            {
+                let streamer = streamer.clone();
+                tokio::task::spawn_local(async move {
+                    let mut every = tokio::time::interval(std::time::Duration::from_secs(10));
+                    loop {
+                        every.tick().await;
+                        streamer.borrow_mut().log_statistics();
                     }
                 });
             }
