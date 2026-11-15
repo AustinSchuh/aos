@@ -289,8 +289,8 @@ FoxgloveWebsocketServer::FoxgloveWebsocketServer(
         ABSL_LOG(INFO) << "Client wants to publish to topic " << topic
                        << " with channelId " << client_advertisement.channelId;
         if (!senders_.contains(topic)) {
-          ABSL_LOG(ERROR) << "Topic " << topic
-                          << " has no senders pre-configured.";
+          ABSL_LOG(INFO) << "No AOS channel takes " << topic
+                         << "; dropping what the client sends on it.";
         }
       };
   handlers.clientUnadvertiseHandler =
@@ -305,7 +305,9 @@ FoxgloveWebsocketServer::FoxgloveWebsocketServer(
         const std::string &topic = client_message.advertisement.topic;
         auto it = senders_.find(topic);
         if (it == senders_.end()) {
-          ABSL_LOG(ERROR) << "Lacking sender for topic " << topic;
+          // Whitelisted, but no AOS channel takes it (Foxglove's panels'
+          // click-to-publish topics); said once when it was advertised.
+          ABSL_VLOG(1) << "Dropping a message on " << topic;
           return;
         }
         if (ABSL_VLOG_IS_ON(1)) {

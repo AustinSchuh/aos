@@ -70,6 +70,11 @@ int main(int argc, char *argv[]) {
       {
           // We want foxglove to control AOS apps.
           std::regex(".* aos\\.starter\\.StarterRpc$"),
+          // Foxglove's 3D and Image panels advertise their click-to-publish
+          // topics on every connection, and won't keep a layout without them.
+          // Accept them so Foxglove doesn't warn; with no AOS channel behind
+          // them, whatever arrives is dropped.
+          std::regex("/move_base_simple/goal|/clicked_point|/initialpose"),
       });
 
   event_loop.Run();
