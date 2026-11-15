@@ -28,7 +28,7 @@ use rustls::{
     ServerConfig,
 };
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 use tower_http::services::ServeDir;
@@ -156,18 +156,17 @@ pub struct Options {
     pub foxglove_ws: String,
     /// camera_streamer's websocket, which carries its WebRTC signalling (`ws://127.0.0.1:1190`).
     pub camera_streamer_ws: String,
-    /// Where `/api` asks for what's on the channels; see [`api`].
-    pub api: tokio::sync::mpsc::UnboundedSender<api::ApiRequest>,
 }
 
-/// The HTTPS side: the pages, the channels' latest messages, and the websocket proxies.
-pub fn router(options: Options) -> Router {
+/// The HTTPS side: the pages, the channels' latest messages, which it asks `api` for, and the
+/// websocket proxies.
+pub fn router(options: Options, api: mpsc::UnboundedSender<api::ApiRequest>) -> Router {
     let web_proxy_ws = options.web_proxy_ws.clone();
     let foxglove_ws = options.foxglove_ws.clone();
     let camera_streamer_ws = options.camera_streamer_ws.clone();
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(api::router(options.api.clone()))
+        .merge(api::router(api))
         .route(
             "/ws",
             get(move |upgrade: WebSocketUpgrade| {
@@ -485,6 +484,124 @@ where
     }
 }
 
+/// How robot_server listens.
+pub enum Listen {
+    /// HTTPS, and the page that checks whether a computer trusts the robot on plain HTTP: the
+    /// robot.
+    Tls {
+        https: std::net::TcpListener,
+        https_port: u16,
+        tls: Arc<ServerConfig>,
+        http: std::net::TcpListener,
+    },
+    /// Plain HTTP only: a replay on a laptop, which has no robot certificate.
+    Plain { http: std::net::TcpListener },
+}
+
+/// Sets robot_server up on `aos`'s event loop, which mustn't be running yet: `/api`'s fetchers
+/// are made now.  The future serves until the process ends; run it on the event loop's thread.
+pub fn start(
+    aos: &aos_events_tokio::AosHandle,
+    config: aos_configuration_fbs::aos::Configuration<'static>,
+    options: Options,
+    listen: Listen,
+) -> impl std::future::Future<Output = ()> + 'static {
+    let fetchers = api::Fetchers::new(aos, config);
+    let (api_requests, api_incoming) = mpsc::unbounded_channel();
+    let router = router(options, api_requests);
+    async move {
+        tokio::task::spawn_local(api::serve(fetchers, api_incoming));
+        let tokio_listener = |listener: std::net::TcpListener| {
+            listener
+                .set_nonblocking(true)
+                .expect("Failed to make a listener non-blocking");
+            TcpListener::from_std(listener).expect("Failed to hand a listener to tokio")
+        };
+        match listen {
+            Listen::Tls {
+                https,
+                https_port,
+                tls,
+                http,
+            } => {
+                tokio::join!(
+                    serve_https(tokio_listener(https), tls, router),
+                    serve_http(tokio_listener(http), trust_router(https_port)),
+                );
+            }
+            Listen::Plain { http } => serve_http(tokio_listener(http), router).await,
+        }
+    }
+}
+
+/// robot_server in a simulation a C++ replay assembled (`aos/events/tokio_simulation.h`):
+/// serves the pages from `data_dir` and `/api` on plain HTTP on `port`, and proxies `/ws` to a
+/// web_proxy on `web_proxy_port`.  `config` is a copy of the configuration, as a flatbuffer of
+/// `config_size` bytes.  Returns false, having logged why, if it can't.
+///
+/// # Safety
+///
+/// `simulation` is a live, unrun `aos_tokio_simulation_t`, `event_loop` one of its event loops,
+/// `config` points to `config_size` bytes, and `data_dir` is a C string.
+#[no_mangle]
+pub unsafe extern "C" fn robot_server_add_to_simulation(
+    simulation: *mut aos_events_tokio::TokioSimulation,
+    event_loop: *mut aos_events_event_loop_c::aos_event_loop_t,
+    config: *const u8,
+    config_size: usize,
+    data_dir: *const std::os::raw::c_char,
+    port: u16,
+    web_proxy_port: u16,
+) -> bool {
+    use aos_flatbuffers::Flatbuffer;
+    // SAFETY: As the caller promises.
+    let bytes = unsafe { std::slice::from_raw_parts(config, config_size) }.to_vec();
+    // Kept for as long as the process runs, as the server's tasks are.
+    let config: &'static _ = match aos_flatbuffers::NonSizePrefixedFlatbuffer::<
+        aos_configuration_fbs::aos::Configuration<'static>,
+        Vec<u8>,
+    >::new(bytes)
+    {
+        Ok(config) => Box::leak(Box::new(config)),
+        Err(error) => {
+            log::error!("robot_server: the configuration isn't one: {error}");
+            return false;
+        }
+    };
+    // SAFETY: As the caller promises.
+    let data_dir = match unsafe { std::ffi::CStr::from_ptr(data_dir) }.to_str() {
+        Ok(data_dir) => PathBuf::from(data_dir),
+        Err(_) => {
+            log::error!("robot_server: data_dir isn't UTF-8");
+            return false;
+        }
+    };
+    let http = match std::net::TcpListener::bind(("::", port)) {
+        Ok(http) => http,
+        Err(error) => {
+            log::error!("robot_server: can't listen on {port}: {error}");
+            return false;
+        }
+    };
+    // SAFETY: As the caller promises.
+    let simulation = unsafe { &mut *simulation };
+    // SAFETY: As the caller promises.
+    let aos = unsafe { simulation.setup().handle(event_loop) };
+    let server = start(
+        &aos,
+        config.message(),
+        Options {
+            data_dir,
+            web_proxy_ws: format!("ws://127.0.0.1:{web_proxy_port}/ws"),
+            foxglove_ws: "ws://127.0.0.1:8765".to_string(),
+            camera_streamer_ws: "ws://127.0.0.1:1190".to_string(),
+        },
+        Listen::Plain { http },
+    );
+    simulation.spawn(server);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,7 +654,7 @@ mod tests {
         tokio::spawn(serve_https(
             listener,
             tls_config(tls_dir).unwrap(),
-            router(options),
+            router(options, mpsc::unbounded_channel().0),
         ));
         address
     }
@@ -548,7 +665,6 @@ mod tests {
             web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
             foxglove_ws: "ws://127.0.0.1:1".to_string(),
             camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
-            api: tokio::sync::mpsc::unbounded_channel().0,
         }
     }
 
@@ -672,7 +788,6 @@ mod tests {
                 web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
                 foxglove_ws: format!("ws://{upstream_address}"),
                 camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
-                api: tokio::sync::mpsc::unbounded_channel().0,
             },
         )
         .await;

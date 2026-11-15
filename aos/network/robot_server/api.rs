@@ -11,10 +11,16 @@
 //! ```
 //!
 //! The router's handlers run on any of tokio's threads, but AOS's fetchers live on the event
-//! loop's, so they ask an [`ApiRequest`] of whatever serves them there and wait for its answer.
+//! loop's, so they ask an [`ApiRequest`] of [`serve()`], which runs there, and wait for its
+//! answer.
 //! Channels too big to want as JSON (images) aren't fetchable.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ffi::CStr};
+
+use aos_configuration::{AsChannel, ChannelExt, ConfigurationExt, Node};
+use aos_configuration_fbs::aos::{Channel, Configuration, ReadMethod};
+use aos_events_event_loop_c::aos_configuration_node_name;
+use aos_events_tokio::{AosHandle, RawFetcher};
 
 use axum::{
     extract::Query,
@@ -190,6 +196,148 @@ pub fn router(requests: mpsc::UnboundedSender<ApiRequest>) -> Router {
                 latest(for_latest.clone(), query)
             }),
         )
+}
+
+/// The event loop's node, in `config`: the configuration this serves from may be a copy of the
+/// event loop's own.
+fn node_of(aos: &AosHandle, config: Configuration<'static>) -> Option<&'static Node> {
+    let node = aos.node()?;
+    // SAFETY: Nodes always have names, and the event loop's outlives this call.
+    let name = unsafe { CStr::from_ptr(aos_configuration_node_name(node)) };
+    config.get_node(name.to_str().ok()?).ok()
+}
+
+/// Why `/api/latest` won't fetch `channel`, if it won't.
+fn not_fetchable(channel: &Channel, node: Option<&Node>) -> Option<String> {
+    if !channel.as_channel().is_readable_on_node(node) {
+        Some("This node can't read it".into())
+    } else if channel.read_method() == ReadMethod::PIN {
+        Some("It's read by pinning, which counts its readers, so it isn't fetched".into())
+    } else if channel.max_size() as i64 > MAX_FETCHABLE_SIZE as i64 {
+        Some(format!(
+            "Its messages can be {} bytes, more than the {MAX_FETCHABLE_SIZE} fetched for the web",
+            channel.max_size()
+        ))
+    } else {
+        None
+    }
+}
+
+/// A channel's name and type, as `/api` names it.
+type ChannelKey = (String, String);
+
+fn key(channel: &Channel) -> ChannelKey {
+    (
+        channel.name().unwrap_or_default().to_string(),
+        channel.type_().unwrap_or_default().to_string(),
+    )
+}
+
+/// What `/api` serves from: the configuration, and a fetcher on every channel it may fetch.
+/// AOS makes fetchers only before the event loop runs, so they're all made up front.
+pub struct Fetchers {
+    config: Configuration<'static>,
+    node: Option<&'static Node>,
+    fetchers: HashMap<ChannelKey, RawFetcher>,
+}
+
+impl Fetchers {
+    /// Makes the fetchers on `aos`'s event loop, which mustn't be running yet.
+    pub fn new(aos: &AosHandle, config: Configuration<'static>) -> Self {
+        let node = node_of(aos, config);
+        let fetchers = config
+            .channels()
+            .iter()
+            .flatten()
+            .filter(|channel| not_fetchable(channel, node).is_none())
+            .map(|channel| {
+                let (name, type_) = key(&channel);
+                let fetcher = aos.make_fetcher(&name, &type_);
+                ((name, type_), fetcher)
+            })
+            .collect();
+        Self {
+            config,
+            node,
+            fetchers,
+        }
+    }
+
+    fn channels(&self) -> Vec<ChannelInfo> {
+        self.config
+            .channels()
+            .iter()
+            .flatten()
+            .map(|channel| {
+                let (name, type_) = key(&channel);
+                ChannelInfo {
+                    name,
+                    type_,
+                    max_size: channel.max_size().max(0) as u32,
+                    frequency: channel.frequency(),
+                    fetchable: not_fetchable(&channel, self.node).is_none(),
+                }
+            })
+            .collect()
+    }
+
+    /// The latest message on `name` `type_`, after the configuration's maps.
+    fn latest(
+        &mut self,
+        name: &str,
+        type_: &str,
+        max_vector_size: usize,
+    ) -> Result<Latest, LatestError> {
+        let channel = self
+            .config
+            .get_channel(name, type_, "robot_server", self.node)
+            .map_err(|_| LatestError::NoChannel)?;
+        let channel_key = (
+            channel.name().unwrap_or_default().to_string(),
+            channel.type_().unwrap_or_default().to_string(),
+        );
+        let Some(fetcher) = self.fetchers.get_mut(&channel_key) else {
+            let entry = self
+                .config
+                .channels()
+                .iter()
+                .flatten()
+                .find(|entry| key(entry) == channel_key)
+                .ok_or(LatestError::NoChannel)?;
+            return Err(LatestError::NotFetchable(
+                not_fetchable(&entry, self.node).unwrap_or_default(),
+            ));
+        };
+        fetcher.fetch();
+        let message = fetcher.message();
+        let data = message.data().ok_or(LatestError::NoMessage)?;
+        Ok(Latest {
+            monotonic_event_time_ns: message.monotonic_event_time_ns(),
+            realtime_event_time_ns: message.realtime_event_time_ns(),
+            json: channel
+                .message_to_json(data, max_vector_size)
+                .ok_or(LatestError::NotJson)?,
+        })
+    }
+}
+
+/// Answers `/api`'s requests, on the event loop's thread where the fetchers live.
+pub async fn serve(mut api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiRequest>) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            ApiRequest::Channels { reply } => {
+                let _ = reply.send(api.channels());
+            }
+            ApiRequest::Latest {
+                name,
+                type_,
+                max_vector_size,
+                reply,
+            } => {
+                let _ = reply.send(api.latest(&name, &type_, max_vector_size));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
