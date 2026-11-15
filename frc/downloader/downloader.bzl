@@ -1,5 +1,3 @@
-load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
-
 AosDownloaderDirInfo = provider(
     doc = "Files and destination directory for an aos_downloader_dir.",
     fields = {
@@ -27,9 +25,8 @@ def _aos_downloader_impl(ctx):
             'cd "${BASH_SOURCE[0]}.runfiles/%s"' % ctx.workspace_name,
             'for T in "$@";',
             "do",
-            '  time %s --rsync_mode %s --target "${T}" --type %s %s %s' % (
+            '  time %s --target "${T}" --type %s %s %s' % (
                 ctx.executable._downloader.short_path,
-                ctx.attr._rsync_mode[BuildSettingInfo].value,
                 ctx.attr.target_type,
                 " ".join([src.short_path for src in all_files]),
                 " ".join(target_files),
@@ -86,7 +83,6 @@ aos_downloader = rule(
             cfg = "exec",
             default = Label("//frc/downloader:downloader"),
         ),
-        "_rsync_mode": attr.label(default = Label("//frc/downloader:rsync_mode")),
     },
     executable = True,
     implementation = _aos_downloader_impl,
