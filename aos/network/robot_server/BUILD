@@ -6,11 +6,15 @@ package(default_visibility = ["//visibility:public"])
 # documentation/adr/0007-robot-web-server-tls-mcp-logs.md.
 rust_library(
     name = "robot_server_lib",
-    srcs = ["lib.rs"],
+    srcs = [
+        "api.rs",
+        "lib.rs",
+    ],
     crate_name = "robot_server",
     test_data = glob(["testdata/*"]),
     test_deps = [
         "//aos/testing:path_rs",
+        "@crate_index//:tower",
     ],
     deps = [
         "@crate_index//:anyhow",
@@ -22,6 +26,7 @@ rust_library(
         "@crate_index//:log",
         "@crate_index//:rustls",
         "@crate_index//:rustls-pki-types",
+        "@crate_index//:serde_json",
         "@crate_index//:tokio",
         "@crate_index//:tokio-rustls",
         "@crate_index//:tokio-tungstenite",
@@ -32,6 +37,8 @@ rust_library(
 _BINARY_DEPS = [
     ":robot_server_lib",
     "//aos:configuration_rs",
+    "//aos:configuration_rust_fbs",
+    "//aos:flatbuffers_rs",
     "//aos:init_rs",
     "//aos/events:tokio_event_loop_rs",
     "@crate_index//:clap",

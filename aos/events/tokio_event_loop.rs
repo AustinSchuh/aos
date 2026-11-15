@@ -61,11 +61,11 @@ use aos_events_event_loop_c::{
     aos_aio_t, aos_aio_wait_fd, aos_context_t, aos_error_code, aos_error_destroy, aos_error_t,
     aos_event_loop_add_timer, aos_event_loop_destroy, aos_event_loop_make_fetcher,
     aos_event_loop_make_no_arg_watcher, aos_event_loop_make_sender, aos_event_loop_monotonic_now,
-    aos_event_loop_t, aos_exit_handle_destroy, aos_exit_handle_exit, aos_exit_handle_t,
-    aos_fetcher_context, aos_fetcher_destroy, aos_fetcher_fetch, aos_fetcher_fetch_next,
-    aos_fetcher_t, aos_monotonic_clock_now, aos_sender_destroy, aos_sender_send_copy, aos_sender_t,
-    aos_shm_event_loop_create_on_aio, aos_shm_event_loop_make_exit_handle,
-    aos_shm_event_loop_shutdown, aos_shm_event_loop_startup,
+    aos_event_loop_node, aos_event_loop_t, aos_exit_handle_destroy, aos_exit_handle_exit,
+    aos_exit_handle_t, aos_fetcher_context, aos_fetcher_destroy, aos_fetcher_fetch,
+    aos_fetcher_fetch_next, aos_fetcher_t, aos_monotonic_clock_now, aos_node_t, aos_sender_destroy,
+    aos_sender_send_copy, aos_sender_t, aos_shm_event_loop_create_on_aio,
+    aos_shm_event_loop_make_exit_handle, aos_shm_event_loop_shutdown, aos_shm_event_loop_startup,
     aos_simulated_event_loop_factory_end_slice,
     aos_simulated_event_loop_factory_finish_external_run,
     aos_simulated_event_loop_factory_is_running, aos_simulated_event_loop_factory_make_exit_handle,
@@ -683,6 +683,15 @@ impl AosHandle {
         unsafe { aos_event_loop_monotonic_now(self.inner.event_loop()) }
     }
 
+    /// The node this event loop runs on, or `None` in a configuration without nodes.  What the
+    /// configuration's lookups (`ConfigurationExt::get_channel`) take to find channels as the
+    /// event loop does.
+    pub fn node(&self) -> Option<&aos_node_t> {
+        // SAFETY: The event loop is live.  The node is part of the configuration, which outlives
+        // run(), and so every handle.
+        unsafe { aos_event_loop_node(self.inner.event_loop()).as_ref() }
+    }
+
     /// Makes a fetcher. Dies if the channel doesn't exist.
     pub fn make_fetcher(&self, channel_name: &str, channel_type: &str) -> RawFetcher {
         let name = c_string(channel_name);
@@ -800,6 +809,11 @@ impl<'a> Message<'a> {
     /// When the message was sent, on the event loop's monotonic clock.
     pub fn monotonic_event_time_ns(&self) -> i64 {
         self.context.monotonic_event_time
+    }
+
+    /// When the message was sent, on the realtime clock.
+    pub fn realtime_event_time_ns(&self) -> i64 {
+        self.context.realtime_event_time
     }
 }
 

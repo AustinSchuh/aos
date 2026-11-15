@@ -10,9 +10,9 @@ use aos_events_event_loop_c::{
     aos_configuration_buffer_destroy, aos_configuration_buffer_get_data,
     aos_configuration_buffer_get_size, aos_configuration_buffer_maybe_read_from_file,
     aos_configuration_channel_has_name, aos_configuration_channel_has_type,
-    aos_configuration_channel_message_to_json, aos_configuration_channel_name,
-    aos_configuration_channel_type, aos_configuration_get_channel, aos_configuration_get_node,
-    aos_string_destroy,
+    aos_configuration_channel_is_readable_on_node, aos_configuration_channel_message_to_json,
+    aos_configuration_channel_name, aos_configuration_channel_type, aos_configuration_get_channel,
+    aos_configuration_get_node, aos_string_destroy,
 };
 use aos_flatbuffers::{transmute_table_to, NonSizePrefixedFlatbuffer};
 
@@ -154,6 +154,17 @@ pub trait ChannelExt<'a>: AsChannel<'a> {
             } else {
                 None
             }
+        }
+    }
+
+    /// Whether `node` can read this channel: always, in a configuration without nodes (`None`).
+    fn is_readable_on_node(self, node: Option<&Node>) -> bool {
+        match node {
+            None => true,
+            // SAFETY: Both are valid for the call, which keeps neither.
+            Some(node) => unsafe {
+                aos_configuration_channel_is_readable_on_node(self.as_channel(), node)
+            },
         }
     }
 
