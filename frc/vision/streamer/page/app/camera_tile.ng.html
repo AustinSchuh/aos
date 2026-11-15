@@ -1,0 +1,14 @@
+<div class="tile-head">
+  <span class="tile-name">Camera {{ camera }}</span>
+  <span class="tile-line">{{ line }}</span>
+</div>
+<div class="tile-view">
+  <video
+    #video
+    autoplay
+    playsinline
+    [muted]="true"
+    (playing)="playing = true"
+  ></video>
+  <div class="no-signal" *ngIf="!stream || !playing">No signal</div>
+</div>

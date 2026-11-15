@@ -160,6 +160,7 @@ robot_downloader(
     dirs = [
         ":base_intrinsics_files",
         "//frc/vision/field_map/www:www_files",
+        "//frc/vision/streamer/page:www_files",
     ],
     target_compatible_with = [
         "@platforms//cpu:arm64",
@@ -171,6 +172,17 @@ robot_downloader(
 static_flatbuffer(
     name = "turbojpeg_decoder_status_fbs",
     srcs = ["turbojpeg_decoder_status.fbs"],
+    visibility = ["//visibility:public"],
+)
+
+flatbuffer_ts_library(
+    name = "turbojpeg_decoder_status_ts_fbs",
+    srcs = ["turbojpeg_decoder_status.fbs"],
+    target_compatible_with = ["@platforms//os:linux"],
+    ts_files = [
+        "frc/vision.ts",
+        "frc/vision/turbo-jpeg-decoder-status.ts",
+    ],
     visibility = ["//visibility:public"],
 )
 

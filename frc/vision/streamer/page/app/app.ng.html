@@ -1,0 +1,61 @@
+<header>
+  <h1>Vision</h1>
+  <nav>
+    <button
+      type="button"
+      [class.active]="tab === 'feeds'"
+      (click)="show('feeds')"
+    >
+      Feeds
+    </button>
+    <button
+      type="button"
+      [class.active]="tab === 'settings'"
+      (click)="show('settings')"
+    >
+      Settings
+    </button>
+  </nav>
+  <span class="status" [class.ok]="connected">
+    <span class="dot"></span>
+    {{ connected ? 'Connected' : streams.status }}
+    <ng-container *ngIf="totalLine !== null">· {{ totalLine }}</ng-container>
+  </span>
+</header>
+
+<main class="feeds" *ngIf="tab === 'feeds'">
+  <camera-tile
+    *ngFor="let camera of cameras"
+    [camera]="camera"
+    [stream]="streams.videoFor(camera).stream"
+    [line]="line(camera)"
+  ></camera-tile>
+</main>
+
+<main class="settings" *ngIf="tab === 'settings'">
+  <section class="card">
+    <h2>Cameras</h2>
+    <dl>
+      <dt>Image size</dt>
+      <dd>{{ size }}</dd>
+      <ng-container *ngFor="let camera of cameras">
+        <dt>Camera {{ camera }} stream</dt>
+        <dd>{{ streamSize(camera) }}</dd>
+      </ng-container>
+      <dt>Exposure</dt>
+      <dd>{{ exposure }}</dd>
+      <dt>Gain</dt>
+      <dd>{{ gain }}</dd>
+      <dt>Node</dt>
+      <dd>{{ node }}</dd>
+    </dl>
+    <p class="source">From default_camera_stream_settings in /constants.</p>
+  </section>
+  <intrinsics-card
+    *ngFor="let calibration of robot.calibrations"
+    [calibration]="calibration"
+  ></intrinsics-card>
+  <p *ngIf="robot.calibrations.length === 0">
+    No calibrations for node {{ node }} in /constants yet.
+  </p>
+</main>
