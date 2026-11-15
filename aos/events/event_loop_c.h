@@ -333,6 +333,17 @@ bool aos_configuration_node_has_name(const aos_node_t *node);
 const char *aos_configuration_node_name(const aos_node_t *node);
 const char *aos_configuration_channel_name(const aos_channel_t *channel);
 
+// Writes the `size` bytes at `data`, a message on `channel`, as single line
+// JSON into a new string of `*json_size` bytes (and a NUL), leaving out the
+// contents of vectors longer than `max_vector_size`.  Returns NULL if the
+// channel has no schema or the message doesn't verify against it.  Free the
+// string with aos_string_destroy.
+char *aos_configuration_channel_message_to_json(const aos_channel_t *channel,
+                                                const void *data, size_t size,
+                                                size_t max_vector_size,
+                                                size_t *json_size);
+void aos_string_destroy(char *string);
+
 // All aos_simulated_event_loop_* functions may move to a different file, once
 // we decide on a path for scalable shared libraries.
 
