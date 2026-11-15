@@ -147,6 +147,7 @@ robot_downloader(
         "//frc/vision/networking:network_tables_swerve_client",
         "//frc/vision/camera:camera_reader",
         "//frc/vision/camera:log_camera_player",
+        "//frc/vision/streamer:camera_streamer",
     ],
     data = [
         ":aos_config",
