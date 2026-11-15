@@ -458,9 +458,12 @@ rust_library(
     ],
     test_data = [
         "//aos/testdata:test_configs",
+        "//aos/testing/ping_pong:pingpong_config",
     ],
     test_deps = [
         "//aos/testing:path_rs",
+        "//aos/testing/ping_pong:ping_rust_fbs",
+        "@aos_flatbuffers//rust:flatbuffers",
     ],
     visibility = ["//visibility:public"],
     deps = [

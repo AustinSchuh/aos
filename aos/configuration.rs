@@ -10,8 +10,9 @@ use aos_events_event_loop_c::{
     aos_configuration_buffer_destroy, aos_configuration_buffer_get_data,
     aos_configuration_buffer_get_size, aos_configuration_buffer_maybe_read_from_file,
     aos_configuration_channel_has_name, aos_configuration_channel_has_type,
-    aos_configuration_channel_name, aos_configuration_channel_type, aos_configuration_get_channel,
-    aos_configuration_get_node,
+    aos_configuration_channel_message_to_json, aos_configuration_channel_name,
+    aos_configuration_channel_type, aos_configuration_get_channel, aos_configuration_get_node,
+    aos_string_destroy,
 };
 use aos_flatbuffers::{transmute_table_to, NonSizePrefixedFlatbuffer};
 
@@ -155,6 +156,30 @@ pub trait ChannelExt<'a>: AsChannel<'a> {
             }
         }
     }
+
+    /// `data`, a message on this channel, as single line JSON, leaving out the contents of
+    /// vectors longer than `max_vector_size`.  `None` if the channel has no schema, or `data`
+    /// doesn't verify against it.
+    fn message_to_json(self, data: &[u8], max_vector_size: usize) -> Option<String> {
+        let mut size = 0;
+        // SAFETY: The channel and data are valid for the call, which keeps neither.
+        let json = unsafe {
+            aos_configuration_channel_message_to_json(
+                self.as_channel(),
+                data.as_ptr().cast(),
+                data.len(),
+                max_vector_size,
+                &mut size,
+            )
+        };
+        if json.is_null() {
+            return None;
+        }
+        // SAFETY: It returned `size` bytes, which are ours until we destroy them.
+        let result = unsafe { std::slice::from_raw_parts(json as *const u8, size) }.to_vec();
+        unsafe { aos_string_destroy(json) };
+        Some(String::from_utf8(result).expect("FlatbufferToJson writes UTF-8"))
+    }
 }
 
 impl<'a, T: AsChannel<'a>> ChannelExt<'a> for T {}
@@ -223,5 +248,33 @@ mod tests {
             "Failed to find the .aos.bar channel: {:?}",
             config.message()
         );
+    }
+
+    #[test]
+    fn message_to_json() {
+        use ping_rust_fbs::aos::examples as ping;
+        let config = read_config_from(&artifact_path(Path::new(
+            "aos/testing/ping_pong/pingpong_config.json",
+        )))
+        .unwrap();
+        let channel = config
+            .message()
+            .get_channel("/test", "aos.examples.Ping", "", None)
+            .unwrap();
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let message = ping::Ping::create(
+            &mut fbb,
+            &ping::PingArgs {
+                value: 7,
+                send_time: 123,
+            },
+        );
+        fbb.finish_minimal(message);
+        assert_eq!(
+            channel.message_to_json(fbb.finished_data(), 100).as_deref(),
+            Some(r#"{ "value": 7, "send_time": 123 }"#)
+        );
+        // Not a Ping.
+        assert_eq!(channel.message_to_json(&[1, 2, 3], 100), None);
     }
 }

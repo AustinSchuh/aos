@@ -1,5 +1,6 @@
 #include "aos/events/event_loop_c.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <chrono>
@@ -9,6 +10,7 @@
 #include "absl/log/absl_log.h"
 #include "absl/log/die_if_null.h"
 #include "flatbuffers/buffer.h"
+#include "flatbuffers/reflection.h"
 
 #include "aos/configuration.h"
 #include "aos/configuration_generated.h"
@@ -19,6 +21,7 @@
 #include "aos/events/shm_event_loop.h"
 #include "aos/events/simulated_event_loop.h"
 #include "aos/init.h"
+#include "aos/json_to_flatbuffer.h"
 
 namespace {
 
@@ -642,6 +645,35 @@ const char *aos_configuration_channel_name(const aos_channel_t *channel) {
       ->name()
       ->c_str();
 }
+
+char *aos_configuration_channel_message_to_json(const aos_channel_t *channel,
+                                                const void *data, size_t size,
+                                                size_t max_vector_size,
+                                                size_t *json_size) {
+  const aos::Channel *c =
+      reinterpret_cast<const aos::Channel *>(ABSL_DIE_IF_NULL(channel));
+  ABSL_CHECK(json_size != nullptr);
+  if (!c->has_schema() || c->schema()->root_table() == nullptr ||
+      data == nullptr) {
+    return nullptr;
+  }
+  const uint8_t *bytes = static_cast<const uint8_t *>(data);
+  if (!flatbuffers::Verify(*c->schema(), *c->schema()->root_table(), bytes,
+                           size)) {
+    return nullptr;
+  }
+  const std::string json = aos::FlatbufferToJson(
+      c->schema(), bytes,
+      {.multi_line = false, .max_vector_size = max_vector_size});
+  char *result = static_cast<char *>(malloc(json.size() + 1));
+  ABSL_CHECK(result != nullptr);
+  memcpy(result, json.data(), json.size());
+  result[json.size()] = '\0';
+  *json_size = json.size();
+  return result;
+}
+
+void aos_string_destroy(char *string) { free(string); }
 
 bool aos_configuration_node_has_name(const aos_node_t *node) {
   return reinterpret_cast<const aos::Node *>(ABSL_DIE_IF_NULL(node))
