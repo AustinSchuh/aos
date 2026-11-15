@@ -415,6 +415,12 @@
       "nodes": ["orin"]
     },
     {
+      "name": "log_camera_player",
+      "args": ["--cameras=0,1,2,3", "/home/pi/sim_logs/image_log-063"],
+      "autostart": false,
+      "nodes": ["orin"]
+    },
+    {
       "name": "nvjpeg_decoder0",
       "executable_name": "nvjpeg_decoder",
       "args": ["--nvjpg_engine=0"],
