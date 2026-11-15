@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <linux/securebits.h>
 #include <pwd.h>
 #include <sched.h>
@@ -10,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <ostream>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -96,10 +98,31 @@ struct ParsedIrqConfig {
       }
     }
 
-    if (contents != new_contents) {
-      util::WriteStringToFileOrDie(affinity_filename, new_contents);
+    if (contents == new_contents) {
+      return;
+    }
+    util::FileWriter writer(affinity_filename);
+    const util::FileWriter::WriteResult result =
+        writer.WriteBytes(new_contents);
+    if (result.bytes_written == new_contents.size()) {
+      return;
+    }
+    // The kernel refuses with EPERM when an IRQ's chip can't retarget it.  A
+    // DesignWare PCIe controller's MSIs, for one, are all demultiplexed by a
+    // chained handler, so they follow it and can't be moved on their own
+    // (eth0 and the NVMe queues on an Orin).  Leave those where they are.
+    ABSL_PCHECK(result.return_code < 0 && errno == EPERM)
+        << ": Failed to write " << new_contents.size() << " bytes to "
+        << affinity_filename;
+    if (unmovable_irqs.insert(interrupt_number).second) {
+      ABSL_LOG(WARNING) << "The kernel can't move IRQ " << interrupt_number
+                        << " (" << name << "), leaving its affinity at "
+                        << contents.substr(0, contents.size() - 1);
     }
   }
+
+  // IRQs the kernel refused to move, so the warning is only logged once.
+  mutable std::set<int> unmovable_irqs;
 };
 
 // Class to hold the configuration for a kthread.
@@ -188,6 +211,7 @@ class IrqAffinity {
         irqs_.push_back(ParsedIrqConfig{
             .name = irq_config->name()->str(),
             .affinity = AffinityFromFlatbuffer(irq_config->affinity()),
+            .unmovable_irqs = {},
         });
       }
     }
