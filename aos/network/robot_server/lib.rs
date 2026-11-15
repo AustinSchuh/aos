@@ -3,6 +3,8 @@
 //! `documentation/adr/0007-robot-web-server-tls-mcp-logs.md`, and ADR 0008 for how it runs on
 //! the AOS event loop's thread.
 
+pub mod api;
+
 use std::{
     ffi::CString,
     fs, io,
@@ -154,15 +156,18 @@ pub struct Options {
     pub foxglove_ws: String,
     /// camera_streamer's websocket, which carries its WebRTC signalling (`ws://127.0.0.1:1190`).
     pub camera_streamer_ws: String,
+    /// Where `/api` asks for what's on the channels; see [`api`].
+    pub api: tokio::sync::mpsc::UnboundedSender<api::ApiRequest>,
 }
 
-/// The HTTPS side: the pages, and the websocket proxies.
+/// The HTTPS side: the pages, the channels' latest messages, and the websocket proxies.
 pub fn router(options: Options) -> Router {
     let web_proxy_ws = options.web_proxy_ws.clone();
     let foxglove_ws = options.foxglove_ws.clone();
     let camera_streamer_ws = options.camera_streamer_ws.clone();
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .merge(api::router(options.api.clone()))
         .route(
             "/ws",
             get(move |upgrade: WebSocketUpgrade| {
@@ -543,6 +548,7 @@ mod tests {
             web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
             foxglove_ws: "ws://127.0.0.1:1".to_string(),
             camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
+            api: tokio::sync::mpsc::unbounded_channel().0,
         }
     }
 
@@ -666,6 +672,7 @@ mod tests {
                 web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
                 foxglove_ws: format!("ws://{upstream_address}"),
                 camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
+                api: tokio::sync::mpsc::unbounded_channel().0,
             },
         )
         .await;
