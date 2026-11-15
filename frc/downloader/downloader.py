@@ -113,7 +113,18 @@ def main(argv):
             copied.add(s)
             if s.endswith(".stripped"):
                 destination = destination[:destination.find(".stripped")]
-            shutil.copy2(s, destination)
+            if os.path.isdir(s):
+                # A directory (a tree artifact, such as a built page) goes as it is.
+                shutil.copytree(s, destination, dirs_exist_ok=True)
+                # Bazel's outputs are read only, and rsync would make the
+                # robot's copies so, which a later download couldn't update.
+                for root, dirs, files in os.walk(destination):
+                    os.chmod(root, 0o755)
+                    for name in files:
+                        path = os.path.join(root, name)
+                        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+            else:
+                shutil.copy2(s, destination)
         # Make sure the folder that gets created on the roboRIO has open
         # permissions or the executables won't be visible to init.
         os.chmod(temp_dir, 0o775)
