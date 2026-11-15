@@ -118,7 +118,7 @@
       "name": "/camera0/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 4,
+      "num_readers": 6,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -192,7 +192,7 @@
       "name": "/camera1/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 4,
+      "num_readers": 6,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -245,7 +245,7 @@
       "name": "/camera2/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 4,
+      "num_readers": 6,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -298,7 +298,7 @@
       "name": "/camera3/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 4,
+      "num_readers": 6,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -412,6 +412,10 @@
           "name": "/camera3"
         }
       }],
+      "nodes": ["orin"]
+    },
+    {
+      "name": "camera_streamer",
       "nodes": ["orin"]
     },
     {
