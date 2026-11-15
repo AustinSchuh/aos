@@ -6,10 +6,17 @@ load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
 load("//frc:downloader.bzl", "robot_downloader")
 load("//frc/downloader:downloader.bzl", "aos_downloader_dir")
 load("//tools/build_rules:template.bzl", "jinja2_template")
+load("//tools/rust:defs.bzl", "flatbuffer_rust_library")
 load(":validator.bzl", "camera_constants_json")
 
 static_flatbuffer(
     name = "vision_fbs",
+    srcs = ["vision.fbs"],
+    visibility = ["//visibility:public"],
+)
+
+flatbuffer_rust_library(
+    name = "vision_rust_fbs",
     srcs = ["vision.fbs"],
     visibility = ["//visibility:public"],
 )
