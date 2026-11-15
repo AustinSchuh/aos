@@ -1,0 +1,40 @@
+<h2>
+  Camera {{ calibration.camera }}
+  <span class="card-id">{{ calibration.cameraId }}</span>
+</h2>
+<dl>
+  <dt>Calibrated</dt>
+  <dd>
+    {{ calibration.date ? (calibration.date | date: 'yyyy-MM-dd HH:mm') :
+    'unknown' }}
+  </dd>
+  <dt>fx, fy</dt>
+  <dd>
+    {{ calibration.fx | number: '1.1-1' }}, {{ calibration.fy | number: '1.1-1'
+    }}
+  </dd>
+  <dt>cx, cy</dt>
+  <dd>
+    {{ calibration.cx | number: '1.1-1' }}, {{ calibration.cy | number: '1.1-1'
+    }}
+  </dd>
+  <dt>Reprojection error</dt>
+  <dd [class.warn]="warn">
+    {{ calibration.reprojectionError === null ? 'unknown' :
+    (calibration.reprojectionError | number: '1.3-3') + ' px' }}
+    <span *ngIf="warn">(over {{ warningPx }} px)</span>
+  </dd>
+  <dt>Team</dt>
+  <dd>{{ calibration.team ?? 'unknown' }} · node {{ calibration.node }}</dd>
+</dl>
+<h3>K</h3>
+<table class="matrix">
+  <tr *ngFor="let row of rows">
+    <td *ngFor="let value of row">{{ value | number: '1.2-2' }}</td>
+  </tr>
+</table>
+<h3>Distortion</h3>
+<p class="dist">
+  <span *ngFor="let d of calibration.dist">{{ d | number: '1.4-4' }}</span>
+  <span *ngIf="calibration.dist.length === 0">none</span>
+</p>
