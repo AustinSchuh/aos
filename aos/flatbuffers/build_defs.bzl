@@ -27,7 +27,7 @@ load(
     _flatc_path = "flatc_path",
 )
 load(":go.bzl", _flatbuffer_go_library = "flatbuffer_go_library")
-load(":rust.bzl", _flatbuffer_rust_library = "flatbuffer_rust_library")
+load(":rust.bzl", _flatbuffer_rust_library = "flatbuffer_rust_library", _flatbuffer_rust_module_library = "flatbuffer_rust_module_library")
 
 flatc_path = _flatc_path
 DEFAULT_INCLUDE_PATHS = _DEFAULT_INCLUDE_PATHS
@@ -39,3 +39,4 @@ flatbuffer_library_public = _flatbuffer_library_public
 flatbuffer_cc_library = _flatbuffer_cc_library
 flatbuffer_go_library = _flatbuffer_go_library
 flatbuffer_rust_library = _flatbuffer_rust_library
+flatbuffer_rust_module_library = _flatbuffer_rust_module_library
