@@ -229,36 +229,7 @@ void Subscriber::RunIteration(bool fetch_new) {
       if (buffer_size_ == 0) {
         fetcher_->Fetch();
       }
-      Message message;
-      message.index = fetcher_->context().queue_index;
-      ABSL_VLOG(2) << "Packing a message with "
-                   << GetPacketCount(fetcher_->context()) << "packets";
-      for (int packet_index = 0;
-           packet_index < GetPacketCount(fetcher_->context()); ++packet_index) {
-        // Pack directly into the mbuffer.  This is admittedly a bit painful.
-        const size_t packet_size =
-            PackedMessageSize(fetcher_->context(), packet_index);
-        struct mbuf *mbuffer = mbuf_alloc(packet_size);
-
-        {
-          // Wrap a pre-allocated builder around the mbuffer.
-          PreallocatedAllocator allocator(mbuf_buf(mbuffer), packet_size);
-          flatbuffers::FlatBufferBuilder fbb(packet_size, &allocator);
-          flatbuffers::Offset<MessageHeader> message_offset = PackMessage(
-              &fbb, fetcher_->context(), channel_index_, packet_index);
-          fbb.Finish(message_offset);
-
-          // Now, the flatbuffer is built from the back to the front.  So any
-          // extra memory will be at the front.  Set up the end and start
-          // pointers on the mbuf.
-          mbuf_set_end(mbuffer, packet_size);
-          mbuf_set_pos(mbuffer, packet_size - fbb.GetSize());
-        }
-
-        message.data.emplace_back(
-            std::shared_ptr<struct mbuf>(mbuffer, mem_deref));
-      }
-      message_buffer_.push_back(std::move(message));
+      message_buffer_.push_back(PackFetchedMessage());
       // If we aren't keeping a buffer, then we should only do one iteration of
       // the while loop--otherwise, if additional messages arrive between the
       // first FetchNext() and the second iteration then we can end up behaving
@@ -295,10 +266,51 @@ void Subscriber::RunIteration(bool fetch_new) {
   }
 }
 
+Subscriber::Message Subscriber::PackFetchedMessage() {
+  Message message;
+  message.index = fetcher_->context().queue_index;
+  ABSL_VLOG(2) << "Packing a message with "
+               << GetPacketCount(fetcher_->context()) << "packets";
+  for (int packet_index = 0; packet_index < GetPacketCount(fetcher_->context());
+       ++packet_index) {
+    // Pack directly into the mbuffer.  This is admittedly a bit painful.
+    const size_t packet_size =
+        PackedMessageSize(fetcher_->context(), packet_index);
+    struct mbuf *mbuffer = mbuf_alloc(packet_size);
+
+    {
+      // Wrap a pre-allocated builder around the mbuffer.
+      PreallocatedAllocator allocator(mbuf_buf(mbuffer), packet_size);
+      flatbuffers::FlatBufferBuilder fbb(packet_size, &allocator);
+      flatbuffers::Offset<MessageHeader> message_offset =
+          PackMessage(&fbb, fetcher_->context(), channel_index_, packet_index);
+      fbb.Finish(message_offset);
+
+      // Now, the flatbuffer is built from the back to the front.  So any
+      // extra memory will be at the front.  Set up the end and start
+      // pointers on the mbuf.
+      mbuf_set_end(mbuffer, packet_size);
+      mbuf_set_pos(mbuffer, packet_size - fbb.GetSize());
+    }
+
+    message.data.emplace_back(std::shared_ptr<struct mbuf>(mbuffer, mem_deref));
+  }
+  return message;
+}
+
 void Subscriber::AddListener(std::shared_ptr<ScopedDataChannel> data_channel,
                              TransferMethod transfer_method) {
   ChannelInformation info;
   info.transfer_method = transfer_method;
+
+  // A SUBSAMPLE listener wants the latest message, so give it the one the
+  // channel has now, rather than have it wait for the next to be sent (a
+  // second, for a 1 Hz status).  With no listeners, RunIteration has been
+  // keeping the fetcher on the latest message and the buffer empty.
+  if (transfer_method == TransferMethod::SUBSAMPLE && message_buffer_.empty() &&
+      fetcher_->context().data != nullptr) {
+    message_buffer_.push_back(PackFetchedMessage());
+  }
 
   channels_.emplace_back(std::make_pair(data_channel, info));
 
