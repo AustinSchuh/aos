@@ -335,7 +335,8 @@
       "name": "/aos",
       "type": "aos.util.FilesystemStatus",
       "source_node": "orin",
-      "frequency": 1
+      "frequency": 1,
+      "max_size": 4096
     },
     {
       "name": "/localizer",
