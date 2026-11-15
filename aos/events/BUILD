@@ -1173,6 +1173,46 @@ rust_library(
     ],
 )
 
+# Lets C++ run a simulation under tokio, with Rust applications in it.
+cc_library(
+    name = "tokio_simulation",
+    hdrs = ["tokio_simulation.h"],
+    target_compatible_with = ["//tools/platforms/rust:has_support"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":event_loop_c_lib",
+        ":simulated_event_loop",
+        ":tokio_event_loop_rs",
+    ],
+)
+
+rust_library(
+    name = "tokio_simulation_test_lib_rs",
+    testonly = True,
+    srcs = ["tokio_simulation_test_lib.rs"],
+    crate_name = "tokio_simulation_test_lib",
+    deps = [
+        ":event_loop_c_rs",
+        ":tokio_event_loop_rs",
+        "//aos/testing/ping_pong:ping_rust_fbs",
+    ],
+)
+
+cc_test(
+    name = "tokio_simulation_test",
+    srcs = ["tokio_simulation_test.cc"],
+    data = ["//aos/testing/ping_pong:pingpong_config"],
+    target_compatible_with = ["//tools/platforms/rust:has_support"],
+    deps = [
+        ":tokio_simulation",
+        ":tokio_simulation_test_lib_rs",
+        "//aos:configuration",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing/ping_pong:ping_fbs",
+    ],
+)
+
 cc_test(
     name = "event_scheduler_test",
     srcs = ["event_scheduler_test.cc"],
