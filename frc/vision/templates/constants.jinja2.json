@@ -23,7 +23,7 @@
       "robot_name": "austin",
       "data": {
         "calibration": [
-          {% include 'frc/vision/constants/calibration_orin1-4646-0_cam-25-01_2025-03-06_09-08-48.json' %},
+          {% include 'frc/vision/constants/calibration_orin-4646-0_cam-25-01_2025-03-06_09-08-48.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-1_cam-25-02_2025-02-02_21-25-24.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-2_cam-25-03_fake.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-3_cam-25-04_fake.json' %}
