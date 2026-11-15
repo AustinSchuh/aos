@@ -1,6 +1,7 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//aos:config.bzl", "aos_config")
 
 cc_binary(
     name = "image_logger",
@@ -390,5 +391,70 @@ cc_binary(
         "//aos:init",
         "//aos/events:shm_event_loop",
         "//frc/constants:constants_sender_lib",
+    ],
+)
+
+# Plays the camera images in a log as live cameras, for a robot without (all
+# of) its cameras; see log_camera_player.h.
+cc_library(
+    name = "log_camera_player_lib",
+    srcs = ["log_camera_player.cc"],
+    hdrs = ["log_camera_player.h"],
+    deps = [
+        "//aos:configuration",
+        "//aos:uuid",
+        "//aos/events:event_loop",
+        "//aos/events/logging:log_reader",
+        "//aos/events/logging:logfile_utils",
+        "//frc/vision:vision_fbs",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_binary(
+    name = "log_camera_player",
+    srcs = ["log_camera_player_main.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_camera_player_lib",
+        "//aos:configuration",
+        "//aos:init",
+        "//aos/events:shm_event_loop",
+        "//aos/events/logging:logfile_utils",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+aos_config(
+    name = "log_camera_player_test_config",
+    testonly = True,
+    src = "log_camera_player_test_config_source.json",
+    flatbuffers = [
+        "//aos/events:event_loop_fbs",
+        "//aos/logging:log_message_fbs",
+        "//frc/vision:vision_fbs",
+    ],
+)
+
+cc_test(
+    name = "log_camera_player_test",
+    srcs = ["log_camera_player_test.cc"],
+    data = [":log_camera_player_test_config"],
+    deps = [
+        ":log_camera_player_lib",
+        "//aos:configuration",
+        "//aos:uuid",
+        "//aos/events:simulated_event_loop",
+        "//aos/events/logging:log_writer",
+        "//aos/events/logging:logfile_utils",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing:tmpdir",
+        "@com_google_absl//absl/strings",
     ],
 )
