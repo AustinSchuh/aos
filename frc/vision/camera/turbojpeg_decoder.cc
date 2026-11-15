@@ -40,6 +40,7 @@ class TurboJpegDecoder {
     aos::TimerHandler *status_timer =
         event_loop_->AddTimer([this]() { SendStatus(); });
     event_loop_->OnRun([this, status_timer]() {
+      status_window_start_ = event_loop_->monotonic_now();
       status_timer->Schedule(event_loop_->monotonic_now(),
                              std::chrono::seconds(1));
     });
@@ -139,6 +140,9 @@ class TurboJpegDecoder {
     auto builder = status_sender_.MakeStaticBuilder();
     builder->set_successful_decodes(successful_decodes_);
     builder->set_failed_decodes(failed_decodes_);
+    const aos::monotonic_clock::time_point now = event_loop_->monotonic_now();
+    builder->set_period_ns((now - status_window_start_).count());
+    status_window_start_ = now;
     if (failed_decodes_ > 0) {
       auto error_fbs = builder->add_last_error_message();
       ABSL_CHECK(error_fbs->reserve(last_error_message_.size()));
@@ -158,6 +162,9 @@ class TurboJpegDecoder {
   aos::Sender<TurboJpegDecoderStatusStatic> status_sender_;
   int successful_decodes_ = 0;
   int failed_decodes_ = 0;
+  // When the current status window started.
+  aos::monotonic_clock::time_point status_window_start_ =
+      aos::monotonic_clock::min_time;
   aos::InlinedVector<char, 128> last_error_message_;
 
   size_t skip_ = 0;

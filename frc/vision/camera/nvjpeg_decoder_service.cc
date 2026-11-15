@@ -40,6 +40,7 @@ NvjpegDecoder::NvjpegDecoder(aos::EventLoop *event_loop)
   aos::TimerHandler *status_timer =
       event_loop_->AddTimer([this]() { SendStatus(); });
   event_loop_->OnRun([this, status_timer]() {
+    status_window_start_ = event_loop_->monotonic_now();
     status_timer->Schedule(event_loop_->monotonic_now(),
                            std::chrono::seconds(1));
   });
@@ -190,6 +191,9 @@ void NvjpegDecoder::SendStatus() {
   builder->set_skipped_stale_frames(skipped_stale_frames_);
   builder->set_dropped_sends(dropped_sends_);
   builder->set_max_publish_age_ms(max_publish_age_ms_);
+  const aos::monotonic_clock::time_point now = event_loop_->monotonic_now();
+  builder->set_period_ns((now - status_window_start_).count());
+  status_window_start_ = now;
   if (failed_decodes_ > 0) {
     auto error_fbs = builder->add_last_error_message();
     ABSL_CHECK(error_fbs->reserve(last_error_message_.size()));

@@ -61,6 +61,9 @@ class NvjpegDecoder {
   int skipped_stale_frames_ = 0;
   int dropped_sends_ = 0;
   int64_t max_publish_age_ms_ = 0;
+  // When the current status window started.
+  aos::monotonic_clock::time_point status_window_start_ =
+      aos::monotonic_clock::min_time;
   aos::InlinedVector<char, 128> last_error_message_;
 
   size_t skip_ = 0;

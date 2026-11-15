@@ -27,6 +27,10 @@ table TurboJpegDecoderStatus {
   // If this approaches the detector's --max_image_age_ms, detections are
   // about to go dark (nvjpeg_decoder only).
   max_publish_age_ms:uint (id: 6);
+  // How long the counts above cover, in nanoseconds: since the status before
+  // this one, or since the decoder started.  So one status gives the decode
+  // rate, without waiting for the next.
+  period_ns:int64 (id: 7);
 }
 
 root_type TurboJpegDecoderStatus;
