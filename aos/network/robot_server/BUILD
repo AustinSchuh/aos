@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("//tools/rust:defs.bzl", "rust_binary", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -17,6 +18,11 @@ rust_library(
         "@crate_index//:tower",
     ],
     deps = [
+        "//aos:configuration_rs",
+        "//aos:configuration_rust_fbs",
+        "//aos:flatbuffers_rs",
+        "//aos/events:event_loop_c_rs",
+        "//aos/events:tokio_event_loop_rs",
         "@crate_index//:anyhow",
         "@crate_index//:axum",
         "@crate_index//:futures",
@@ -37,7 +43,6 @@ rust_library(
 _BINARY_DEPS = [
     ":robot_server_lib",
     "//aos:configuration_rs",
-    "//aos:configuration_rust_fbs",
     "//aos:flatbuffers_rs",
     "//aos:init_rs",
     "//aos/events:tokio_event_loop_rs",
@@ -61,4 +66,25 @@ rust_binary(
     crate_name = "robot_server_main",
     rustc_flags = ["-Cstrip=symbols"],
     deps = _BINARY_DEPS,
+)
+
+# A log replay with robot_server and web_proxy in it, to use the robot's pages
+# and /api against a log; see robot_server_replay.cc.
+cc_binary(
+    name = "robot_server_replay",
+    srcs = ["robot_server_replay.cc"],
+    target_compatible_with = ["//tools/platforms/rust:has_support"],
+    deps = [
+        ":robot_server_lib",
+        "//aos:configuration",
+        "//aos:flatbuffer_merge",
+        "//aos:init",
+        "//aos/events:simulated_event_loop",
+        "//aos/events:tokio_simulation",
+        "//aos/events/logging:log_reader",
+        "//aos/network:web_proxy",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+    ],
 )
