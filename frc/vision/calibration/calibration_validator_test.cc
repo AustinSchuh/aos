@@ -65,8 +65,10 @@ constexpr std::string_view k25_11 =
     "frc/vision/constants/"
     "calibration_orin1-1868-0_cam-25-11_1970-01-01_03-17-57.json";
 
-// Every calibration in frc/vision/constants, at the size its team's robots
-// run at, passes, except those of 25-09, which fail in the right corners.
+// Every calibration in frc/vision/constants, at the size its team's cameras
+// run at, passes, except those of 25-09, which fail in the right corners.  A
+// camera's team is the one it was calibrated for, which a robot entry can
+// borrow cameras from: team 1868's austin runs team 4646's.
 TEST(CalibrationValidatorTest, RepoCalibrations) {
   const aos::FlatbufferDetachedBuffer<CameraConstantsList> constants =
       aos::JsonFileToFlatbuffer<CameraConstantsList>(
@@ -77,8 +79,13 @@ TEST(CalibrationValidatorTest, RepoCalibrations) {
         entry->data()->default_camera_stream_settings();
     const std::pair<int, int> size(settings->image_width(),
                                    settings->image_height());
-    auto [it, inserted] = team_sizes.emplace(entry->team(), size);
-    ASSERT_EQ(it->second, size) << ": team " << entry->team();
+    for (const CameraCalibration *calibration : *entry->data()->calibration()) {
+      auto [it, inserted] =
+          team_sizes.emplace(calibration->team_number(), size);
+      ASSERT_EQ(it->second, size)
+          << ": team " << calibration->team_number() << "'s cameras, in "
+          << entry->robot_name()->string_view();
+    }
   }
 
   int validated = 0;
