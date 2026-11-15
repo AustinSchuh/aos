@@ -133,6 +133,7 @@ robot_downloader(
         "//frc/vision/field_map:localizer_main",
         "//frc/vision/networking:network_tables_swerve_client",
         "//frc/vision/camera:camera_reader",
+        "//frc/vision/camera:log_camera_player",
     ],
     data = [
         ":aos_config",
