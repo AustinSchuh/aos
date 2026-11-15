@@ -1,0 +1,35 @@
+{
+  "channels": [
+    {
+      "name": "/aos",
+      "type": "aos.timing.Report",
+      "frequency": 50,
+      "num_senders": 20,
+      "max_size": 8192
+    },
+    {
+      "name": "/aos",
+      "type": "aos.logging.LogMessageFbs",
+      "frequency": 200,
+      "num_senders": 20
+    },
+    {
+      "name": "/camera0",
+      "type": "frc.vision.CameraImage",
+      "frequency": 125,
+      "max_size": 65536
+    },
+    {
+      "name": "/camera1",
+      "type": "frc.vision.CameraImage",
+      "frequency": 125,
+      "max_size": 65536
+    },
+    {
+      "name": "/camera2",
+      "type": "frc.vision.CameraImage",
+      "frequency": 125,
+      "max_size": 65536
+    }
+  ]
+}
