@@ -163,6 +163,8 @@ class Subscriber {
     std::vector<std::shared_ptr<struct mbuf>> data;
   };
 
+  // Packs the fetcher's current message into packets to send.
+  Message PackFetchedMessage();
   std::shared_ptr<struct mbuf> NextBuffer(ChannelInformation *channel);
   void SkipToLastMessage(ChannelInformation *channel);
 
