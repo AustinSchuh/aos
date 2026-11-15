@@ -61,6 +61,7 @@ def ng_application(
         extra_srcs = [],
         assets = None,
         html_assets = APPLICATION_HTML_ASSETS,
+        tsconfig = None,
         visibility = ["//visibility:public"]):
     """
     Bazel macro for compiling an Angular application. Creates {name}, test, serve targets.
@@ -82,6 +83,7 @@ def ng_application(
       deps: direct dependencies of the application
       html_assets: assets to insert into the index.html, [styles.css, favicon.ico] by default
       assets: assets to include in the file bundle
+      tsconfig: the tsconfig to compile the app with, if not the repository's
       visibility: visibility of the primary targets ({name}, 'test', 'serve')
     """
     assets = assets if assets != None else native.glob(["assets/**/*"])
@@ -103,6 +105,7 @@ def ng_application(
             "no-remote-cache",
         ],
         visibility = ["//visibility:private"],
+        **({"tsconfig": tsconfig} if tsconfig else {})
     )
 
     # App polyfills source + bundle.
