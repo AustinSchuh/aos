@@ -1,7 +1,7 @@
 load("@aos//aos/flatbuffers:ts.bzl", "flatbuffer_ts_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("//aos:config.bzl", "aos_config")
-load("//aos/flatbuffers:build_defs.bzl", "DEFAULT_FLATC_ARGS")
+load("//aos/flatbuffers:build_defs.bzl", "DEFAULT_FLATC_ARGS", "flatbuffer_rust_module_library")
 load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
 load("//frc:downloader.bzl", "robot_downloader")
 load("//frc/downloader:downloader.bzl", "aos_downloader_dir")
@@ -68,6 +68,12 @@ flatbuffer_ts_library(
 
 static_flatbuffer(
     name = "target_map_fbs",
+    srcs = ["target_map.fbs"],
+    visibility = ["//visibility:public"],
+)
+
+flatbuffer_rust_library(
+    name = "target_map_rust_fbs",
     srcs = ["target_map.fbs"],
     visibility = ["//visibility:public"],
 )
@@ -184,6 +190,17 @@ static_flatbuffer(
         ":calibration_fbs",
         ":camera_settings_fbs",
     ],
+)
+
+flatbuffer_rust_module_library(
+    name = "camera_constants_rust_fbs",
+    srcs = ["camera_constants.fbs"],
+    crate_name = "camera_constants_rust_fbs",
+    includes = [
+        "calibration.fbs",
+        "camera_settings.fbs",
+    ],
+    visibility = ["//visibility:public"],
 )
 
 static_flatbuffer(

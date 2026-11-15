@@ -1,12 +1,15 @@
-//! Which cameras each viewer watches, and feeding the encoders their frames.
+//! Which cameras each viewer watches, and feeding the encoders frames with their overlays.
 
 use std::collections::HashMap;
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::draw::{self, Frame};
 use crate::frame;
+use crate::join::{Join, JoinOptions, Ready};
 use crate::pipeline::{Pipeline, Session, Settings};
 use crate::signalling::ToBrowser;
+use crate::tag_box::{self, Intrinsics};
 
 /// Who a viewer is: one websocket session.
 pub type ViewerId = u64;
@@ -19,13 +22,25 @@ pub struct Options {
     pub half_size: bool,
     /// Send at most this many frames a second of each camera; the rest are skipped.
     pub max_fps: f64,
+    /// How long a frame waits for its overlays, and when a detector counts as gone.
+    pub join: JoinOptions,
     /// How long a session waits for all its cameras' first frames before starting with the
     /// cameras it has.
     pub start_wait_ns: i64,
+    /// The node whose cameras' calibrations to use.
+    pub node: String,
+    /// How big the AprilTags are, in meters, edge to edge of their black squares.
+    pub tag_size: f64,
 }
 
 struct Camera {
     last_sent_ns: Option<i64>,
+    /// Frames waiting for their overlays.
+    join: Join<Frame>,
+    /// Stream pixels per camera-image pixel, for drawing the overlays.
+    scale: f64,
+    /// Its calibration, for drawing the tags' boxes; `None` until the constants have one.
+    intrinsics: Option<Intrinsics>,
 }
 
 struct Viewer {
@@ -51,7 +66,17 @@ impl Streamer {
             pipeline: Pipeline::new(options.settings.clone())?,
             cameras: cameras
                 .iter()
-                .map(|&camera| (camera, Camera { last_sent_ns: None }))
+                .map(|&camera| {
+                    (
+                        camera,
+                        Camera {
+                            last_sent_ns: None,
+                            join: Join::new(options.join),
+                            scale: 1.0,
+                            intrinsics: None,
+                        },
+                    )
+                })
                 .collect(),
             viewers: HashMap::new(),
             options,
@@ -193,8 +218,31 @@ impl Streamer {
         }
     }
 
-    /// One of `camera`'s gray images, arriving at `now_ns`.  Encoded if anyone is watching and it
-    /// isn't too soon after the last one sent.
+    /// Draws each ready frame's overlays and encodes it.
+    fn send(&self, camera: u32, ready: Vec<Ready<Frame>>) {
+        let Some(size) = self.pipeline.encoder_size(camera) else {
+            return;
+        };
+        let scale = self.cameras.get(&camera).map_or(1.0, |state| state.scale);
+        for Ready {
+            mut frame,
+            capture_ns,
+            overlay,
+        } in ready
+        {
+            if (frame.width, frame.height) != size {
+                // From before the camera changed size.
+                continue;
+            }
+            if let Some(overlay) = overlay {
+                draw::draw(&mut frame, &overlay, scale);
+            }
+            self.pipeline.push(camera, frame.i420, capture_ns);
+        }
+    }
+
+    /// One of `camera`'s gray images, arriving at `now_ns`.  Encoded, with its overlays, if
+    /// anyone is watching and it isn't too soon after the last one sent.
     pub fn on_image(
         &mut self,
         camera: u32,
@@ -247,8 +295,85 @@ impl Streamer {
 
         let mut i420 = Vec::new();
         frame::gray_to_i420(gray, cols, rows, self.options.half_size, &mut i420);
-        self.cameras.get_mut(&camera).expect("Checked").last_sent_ns = Some(capture_ns);
-        self.pipeline.push(camera, i420, capture_ns);
+        let state = self.cameras.get_mut(&camera).expect("Checked");
+        state.scale = size.0 as f64 / cols as f64;
+        state.last_sent_ns = Some(capture_ns);
+        let ready = state.join.add_frame(
+            Frame {
+                i420,
+                width: size.0,
+                height: size.1,
+            },
+            capture_ns,
+            now_ns,
+        );
+        self.send(camera, ready);
         self.start_waiting_sessions(now_ns);
+    }
+
+    /// The robot's `frc.vision.CameraConstants`: each camera's calibration.
+    pub fn on_constants(&mut self, data: &[u8]) {
+        for (&camera, state) in self.cameras.iter_mut() {
+            let intrinsics = Intrinsics::find(data, &self.options.node, camera);
+            if intrinsics.is_none() {
+                log::warn!(
+                    "No calibration for camera {camera} on {}, so no boxes on its tags",
+                    self.options.node
+                );
+            }
+            state.intrinsics = intrinsics;
+        }
+    }
+
+    /// One of `camera`'s `frc.vision.TargetMap`s, the tags found in one of its images, arriving
+    /// at `now_ns`.
+    pub fn on_target_map(&mut self, camera: u32, data: &[u8], now_ns: i64) {
+        let tag_size = self.options.tag_size;
+        let Some(state) = self.cameras.get_mut(&camera) else {
+            return;
+        };
+        let overlay = match tag_box::target_map_overlay(data, state.intrinsics.as_ref(), tag_size) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                log::warn!("Camera {camera}: bad TargetMap: {error}");
+                return;
+            }
+        };
+        let ready = state.join.add_overlay(overlay, now_ns);
+        self.send(camera, ready);
+    }
+
+    /// When `camera`'s oldest waiting frame stops waiting for its overlays, if one is waiting.
+    pub fn next_deadline_ns(&self, camera: u32) -> Option<i64> {
+        self.cameras
+            .get(&camera)
+            .and_then(|state| state.join.next_deadline_ns())
+    }
+
+    /// Sends `camera`'s frames whose wait is over by `now_ns`, without their overlays.
+    pub fn expire(&mut self, camera: u32, now_ns: i64) {
+        if let Some(state) = self.cameras.get_mut(&camera) {
+            let ready = state.join.expire(now_ns);
+            self.send(camera, ready);
+        }
+    }
+
+    /// Logs, for each camera, how many frames got their overlays since the last call.
+    pub fn log_statistics(&mut self) {
+        for camera in self.cameras() {
+            let join = &mut self.cameras.get_mut(&camera).expect("Listed").join;
+            if join.drawn + join.missed + join.unmatched > 0 {
+                log::info!(
+                    "Camera {camera}: {} frames with overlays, {} without (none in time), {} \
+                     overlays for no waiting frame",
+                    join.drawn,
+                    join.missed,
+                    join.unmatched
+                );
+            }
+            join.drawn = 0;
+            join.missed = 0;
+            join.unmatched = 0;
+        }
     }
 }
