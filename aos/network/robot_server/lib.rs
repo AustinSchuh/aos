@@ -152,12 +152,15 @@ pub struct Options {
     pub web_proxy_ws: String,
     /// The Foxglove server's websocket (`ws://127.0.0.1:8765`).
     pub foxglove_ws: String,
+    /// camera_streamer's websocket, which carries its WebRTC signalling (`ws://127.0.0.1:1190`).
+    pub camera_streamer_ws: String,
 }
 
 /// The HTTPS side: the pages, and the websocket proxies.
 pub fn router(options: Options) -> Router {
     let web_proxy_ws = options.web_proxy_ws.clone();
     let foxglove_ws = options.foxglove_ws.clone();
+    let camera_streamer_ws = options.camera_streamer_ws.clone();
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(
@@ -172,6 +175,13 @@ pub fn router(options: Options) -> Router {
             get(move |upgrade: WebSocketUpgrade| {
                 let upstream = foxglove_ws.clone();
                 async move { proxy_websocket(upgrade, upstream, Some(FOXGLOVE_SUBPROTOCOL)) }
+            }),
+        )
+        .route(
+            "/cameras/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let upstream = camera_streamer_ws.clone();
+                async move { proxy_websocket(upgrade, upstream, None) }
             }),
         )
         .fallback_service(ServeDir::new(options.data_dir))
@@ -532,6 +542,7 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
             foxglove_ws: "ws://127.0.0.1:1".to_string(),
+            camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
         }
     }
 
@@ -654,6 +665,7 @@ mod tests {
                 data_dir: data_dir.clone(),
                 web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
                 foxglove_ws: format!("ws://{upstream_address}"),
+                camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
             },
         )
         .await;
