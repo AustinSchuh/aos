@@ -537,6 +537,62 @@ crates_repository(
                 gen_build_script = False,
             ),
         ],
+        # gstreamer-rs's -sys crates: no pkg-config build script, link the
+        # sysroot's library instead.  See third_party/gstreamer.
+        "gio-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gio-2.0"],
+            ),
+        ],
+        "glib-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:glib-2.0"],
+            ),
+        ],
+        "gobject-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gobject-2.0"],
+            ),
+        ],
+        "gstreamer-app-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gstreamer-app-1.0"],
+            ),
+        ],
+        "gstreamer-base-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gstreamer-base-1.0"],
+            ),
+        ],
+        "gstreamer-sdp-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gstreamer-sdp-1.0"],
+            ),
+        ],
+        "gstreamer-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gstreamer-1.0"],
+            ),
+        ],
+        "gstreamer-video-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gstreamer-video-1.0"],
+            ),
+        ],
+        "gstreamer-webrtc-sys": [
+            crate.annotation(
+                gen_build_script = False,
+                deps = ["@//third_party/gstreamer:gstreamer-webrtc-1.0"],
+            ),
+        ],
         "link-cplusplus": [
             # Bazel toolchains take care of linking the C++ standard library, so don't add
             # an extra flag via Rust by enabling the `nothing` feature. I'm not even sure

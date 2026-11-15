@@ -1,5 +1,5 @@
 {
-  "checksum": "1752987d12b4982adb3b65b9004abb9366f5d1909a7ad9eed7713b057b7a5e8b",
+  "checksum": "15fa43ef530edacf85cb2f6c051fc572250537c98f93162840715dc97ee41b56",
   "crates": {
     "aho-corasick 1.0.2": {
       "name": "aho-corasick",
@@ -41,7 +41,7 @@
         "deps": {
           "common": [
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             }
           ],
@@ -508,6 +508,51 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "atomic_refcell 0.1.14": {
+      "name": "atomic_refcell",
+      "version": "0.1.14",
+      "package_url": "https://github.com/mozilla/atomic_refcell",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/atomic_refcell/0.1.14/download",
+          "sha256": "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "atomic_refcell",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "atomic_refcell",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.1.14"
+      },
+      "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE.APACHE"
+    },
     "atty 0.2.14": {
       "name": "atty",
       "version": "0.2.14",
@@ -698,7 +743,7 @@
               "target": "matchit"
             },
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             },
             {
@@ -1328,6 +1373,66 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "cfg-expr 0.20.11": {
+      "name": "cfg-expr",
+      "version": "0.20.11",
+      "package_url": "https://github.com/EmbarkStudios/cfg-expr",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/cfg-expr/0.20.11/download",
+          "sha256": "edd44d82755fb9210fb10d9daf8dd7e522da0efe1d5f263cffc5db07725663ff"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "cfg_expr",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "cfg_expr",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "target-lexicon",
+            "targets"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "smallvec 1.16.5",
+              "target": "smallvec"
+            },
+            {
+              "id": "target-lexicon 0.13.5",
+              "target": "target_lexicon"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.20.11"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "cfg-if 0.1.10": {
       "name": "cfg-if",
       "version": "0.1.10",
@@ -1946,6 +2051,26 @@
               "target": "futures"
             },
             {
+              "id": "gstreamer 0.24.5",
+              "target": "gstreamer"
+            },
+            {
+              "id": "gstreamer-app 0.24.5",
+              "target": "gstreamer_app"
+            },
+            {
+              "id": "gstreamer-sdp 0.24.5",
+              "target": "gstreamer_sdp"
+            },
+            {
+              "id": "gstreamer-video 0.24.5",
+              "target": "gstreamer_video"
+            },
+            {
+              "id": "gstreamer-webrtc 0.24.5",
+              "target": "gstreamer_webrtc"
+            },
+            {
               "id": "hyper 1.1.0",
               "target": "hyper"
             },
@@ -1982,7 +2107,11 @@
               "target": "rustls_pki_types"
             },
             {
-              "id": "smallvec 1.10.0",
+              "id": "serde_json 1.0.154",
+              "target": "serde_json"
+            },
+            {
+              "id": "smallvec 1.16.5",
               "target": "smallvec"
             },
             {
@@ -2440,6 +2569,52 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "either 1.19.0": {
+      "name": "either",
+      "version": "1.19.0",
+      "package_url": "https://github.com/rayon-rs/either",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/either/1.19.0/download",
+          "sha256": "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "either",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "either",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "std",
+            "use_std"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.19.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "env_logger 0.8.4": {
       "name": "env_logger",
       "version": "0.8.4",
@@ -2514,6 +2689,45 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "equivalent 1.0.3": {
+      "name": "equivalent",
+      "version": "1.0.3",
+      "package_url": "https://github.com/indexmap-rs/equivalent",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/equivalent/1.0.3/download",
+          "sha256": "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "equivalent",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "equivalent",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2015",
+        "version": "1.0.3"
+      },
+      "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "errno 0.3.15": {
       "name": "errno",
       "version": "0.3.15",
@@ -2573,7 +2787,7 @@
             ],
             "cfg(windows)": [
               {
-                "id": "windows-sys 0.52.0",
+                "id": "windows-sys 0.61.2",
                 "target": "windows_sys"
               }
             ]
@@ -2966,6 +3180,7 @@
         ],
         "crate_features": {
           "common": [
+            "default",
             "std"
           ],
           "selects": {}
@@ -3270,6 +3485,7 @@
             "async-await",
             "async-await-macro",
             "channel",
+            "default",
             "futures-channel",
             "futures-io",
             "futures-macro",
@@ -3309,7 +3525,7 @@
               "target": "build_script_build"
             },
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             },
             {
@@ -3649,6 +3865,298 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "gio-sys 0.21.5": {
+      "name": "gio-sys",
+      "version": "0.21.5",
+      "package_url": "https://github.com/gtk-rs/gtk-rs-core",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gio-sys/0.21.5/download",
+          "sha256": "0071fe88dba8e40086c8ff9bbb62622999f49628344b1d1bf490a48a29d80f22"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gio_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gio_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gobject-sys 0.21.5",
+              "target": "gobject_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {
+            "cfg(windows)": [
+              {
+                "id": "windows-sys 0.61.2",
+                "target": "windows_sys"
+              }
+            ]
+          }
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gio-2.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.21.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "glib 0.21.5": {
+      "name": "glib",
+      "version": "0.21.5",
+      "package_url": "https://github.com/gtk-rs/gtk-rs-core",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/glib/0.21.5/download",
+          "sha256": "16de123c2e6c90ce3b573b7330de19be649080ec612033d397d72da265f1bd8b"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "glib",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "glib",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "gio",
+            "gio-sys"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "bitflags 2.13.2",
+              "target": "bitflags"
+            },
+            {
+              "id": "futures-channel 0.3.28",
+              "target": "futures_channel"
+            },
+            {
+              "id": "futures-core 0.3.28",
+              "target": "futures_core"
+            },
+            {
+              "id": "futures-executor 0.3.28",
+              "target": "futures_executor"
+            },
+            {
+              "id": "futures-task 0.3.28",
+              "target": "futures_task"
+            },
+            {
+              "id": "futures-util 0.3.28",
+              "target": "futures_util"
+            },
+            {
+              "id": "gio-sys 0.21.5",
+              "target": "gio_sys"
+            },
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gobject-sys 0.21.5",
+              "target": "gobject_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            },
+            {
+              "id": "memchr 2.8.3",
+              "target": "memchr"
+            },
+            {
+              "id": "smallvec 1.16.5",
+              "target": "smallvec"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "glib-macros 0.21.5",
+              "target": "glib_macros"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "0.21.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "glib-macros 0.21.5": {
+      "name": "glib-macros",
+      "version": "0.21.5",
+      "package_url": "https://github.com/gtk-rs/gtk-rs-core",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/glib-macros/0.21.5/download",
+          "sha256": "cf59b675301228a696fe01c3073974643365080a76cc3ed5bc2cbc466ad87f17"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "glib_macros",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "glib_macros",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "heck 0.5.0",
+              "target": "heck"
+            },
+            {
+              "id": "proc-macro-crate 3.5.0",
+              "target": "proc_macro_crate"
+            },
+            {
+              "id": "proc-macro2 1.0.107",
+              "target": "proc_macro2"
+            },
+            {
+              "id": "quote 1.0.47",
+              "target": "quote"
+            },
+            {
+              "id": "syn 2.0.119",
+              "target": "syn"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.21.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "glib-sys 0.21.5": {
+      "name": "glib-sys",
+      "version": "0.21.5",
+      "package_url": "https://github.com/gtk-rs/gtk-rs-core",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/glib-sys/0.21.5/download",
+          "sha256": "2d95e1a3a19ae464a7286e14af9a90683c64d70c02532d88d87ce95056af3e6c"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "glib_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "glib_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:glib-2.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.21.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
     "glob 0.3.1": {
       "name": "glob",
       "version": "0.3.1",
@@ -3680,6 +4188,1075 @@
         ],
         "edition": "2015",
         "version": "0.3.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gobject-sys 0.21.5": {
+      "name": "gobject-sys",
+      "version": "0.21.5",
+      "package_url": "https://github.com/gtk-rs/gtk-rs-core",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gobject-sys/0.21.5/download",
+          "sha256": "2dca35da0d19a18f4575f3cb99fe1c9e029a2941af5662f326f738a21edaf294"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gobject_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gobject_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gobject-2.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.21.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "gstreamer 0.24.5": {
+      "name": "gstreamer",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer/0.24.5/download",
+          "sha256": "1e8251db223ca38d9aefaf3d19f6f11581a9123cd12dacebd8b9e182da965023"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "cfg-if 1.0.0",
+              "target": "cfg_if"
+            },
+            {
+              "id": "futures-channel 0.3.28",
+              "target": "futures_channel"
+            },
+            {
+              "id": "futures-core 0.3.28",
+              "target": "futures_core"
+            },
+            {
+              "id": "futures-util 0.3.28",
+              "target": "futures_util"
+            },
+            {
+              "id": "glib 0.21.5",
+              "target": "glib"
+            },
+            {
+              "id": "gstreamer-sys 0.24.5",
+              "target": "gstreamer_sys"
+            },
+            {
+              "id": "itertools 0.14.0",
+              "target": "itertools"
+            },
+            {
+              "id": "kstring 2.0.5",
+              "target": "kstring"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            },
+            {
+              "id": "muldiv 1.0.1",
+              "target": "muldiv"
+            },
+            {
+              "id": "num-integer 0.1.47",
+              "target": "num_integer"
+            },
+            {
+              "id": "num-rational 0.4.2",
+              "target": "num_rational"
+            },
+            {
+              "id": "option-operations 0.6.1",
+              "target": "option_operations",
+              "alias": "opt_ops"
+            },
+            {
+              "id": "pin-project-lite 0.2.17",
+              "target": "pin_project_lite"
+            },
+            {
+              "id": "smallvec 1.16.5",
+              "target": "smallvec"
+            },
+            {
+              "id": "thiserror 2.0.21",
+              "target": "thiserror"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "pastey 0.2.3",
+              "target": "pastey"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "0.24.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gstreamer-app 0.24.5": {
+      "name": "gstreamer-app",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-app/0.24.5/download",
+          "sha256": "3da7017b2a2fa5cdf9123b1603947ea24174f6d8cea0ea673411df824c811921"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_app",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_app",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "futures-core 0.3.28",
+              "target": "futures_core"
+            },
+            {
+              "id": "futures-sink 0.3.28",
+              "target": "futures_sink"
+            },
+            {
+              "id": "glib 0.21.5",
+              "target": "glib"
+            },
+            {
+              "id": "gstreamer 0.24.5",
+              "target": "gstreamer",
+              "alias": "gst"
+            },
+            {
+              "id": "gstreamer-app-sys 0.24.5",
+              "target": "gstreamer_app_sys"
+            },
+            {
+              "id": "gstreamer-base 0.24.5",
+              "target": "gstreamer_base",
+              "alias": "gst_base"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gstreamer-app-sys 0.24.5": {
+      "name": "gstreamer-app-sys",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-app-sys/0.24.5/download",
+          "sha256": "4fa9f1b12b546aea543c15a0fdbc5a53617902a74f6d357a32b6a9fb4bc4725c"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_app_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_app_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gstreamer-base-sys 0.24.5",
+              "target": "gstreamer_base_sys"
+            },
+            {
+              "id": "gstreamer-sys 0.24.5",
+              "target": "gstreamer_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gstreamer-app-1.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "gstreamer-base 0.24.5": {
+      "name": "gstreamer-base",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-base/0.24.5/download",
+          "sha256": "9375f9a12120a8ee17b765c816c9b23861ce258def77b0ee40a05acb00c74972"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_base",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_base",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "v1_14_1",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "atomic_refcell 0.1.14",
+              "target": "atomic_refcell"
+            },
+            {
+              "id": "cfg-if 1.0.0",
+              "target": "cfg_if"
+            },
+            {
+              "id": "glib 0.21.5",
+              "target": "glib"
+            },
+            {
+              "id": "gstreamer 0.24.5",
+              "target": "gstreamer",
+              "alias": "gst"
+            },
+            {
+              "id": "gstreamer-base-sys 0.24.5",
+              "target": "gstreamer_base_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gstreamer-base-sys 0.24.5": {
+      "name": "gstreamer-base-sys",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-base-sys/0.24.5/download",
+          "sha256": "1b844f3559b6ab0379b4b771261643783ae4e0ffa71d5f5f46e33b7acf66b752"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_base_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_base_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "v1_14_1",
+            "v1_14_3",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gobject-sys 0.21.5",
+              "target": "gobject_sys"
+            },
+            {
+              "id": "gstreamer-sys 0.24.5",
+              "target": "gstreamer_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gstreamer-base-1.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "gstreamer-sdp 0.24.5": {
+      "name": "gstreamer-sdp",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-sdp/0.24.5/download",
+          "sha256": "50baa076d2527998da6f496f8191d482542c65b2d46f3f5ad080f6d4bec38e68"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_sdp",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_sdp",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib 0.21.5",
+              "target": "glib"
+            },
+            {
+              "id": "gstreamer 0.24.5",
+              "target": "gstreamer",
+              "alias": "gst"
+            },
+            {
+              "id": "gstreamer-sdp-sys 0.24.5",
+              "target": "gstreamer_sdp_sys"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gstreamer-sdp-sys 0.24.5": {
+      "name": "gstreamer-sdp-sys",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-sdp-sys/0.24.5/download",
+          "sha256": "1c85463e73afed803cf41395ebe534438e0a7ab9142a2cae2bb419b6a56f9387"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_sdp_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_sdp_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gstreamer-sys 0.24.5",
+              "target": "gstreamer_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gstreamer-sdp-1.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "gstreamer-sys 0.24.5": {
+      "name": "gstreamer-sys",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-sys/0.24.5/download",
+          "sha256": "b5d37c1a599ae57b8186948bd5699f2dbfc044baea9d400228b489a85bcf2759"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "v1_16",
+            "v1_18",
+            "v1_18_3",
+            "v1_20",
+            "v1_20_4",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "cfg-if 1.0.0",
+              "target": "cfg_if"
+            },
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gobject-sys 0.21.5",
+              "target": "gobject_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gstreamer-1.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "gstreamer-video 0.24.5": {
+      "name": "gstreamer-video",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-video/0.24.5/download",
+          "sha256": "72d9ba5295b206563a990a087c6541d57f650dcd4be4ca8a5a149a758e8df8a0"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_video",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_video",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "cfg-if 1.0.0",
+              "target": "cfg_if"
+            },
+            {
+              "id": "futures-channel 0.3.28",
+              "target": "futures_channel"
+            },
+            {
+              "id": "glib 0.21.5",
+              "target": "glib"
+            },
+            {
+              "id": "gstreamer 0.24.5",
+              "target": "gstreamer",
+              "alias": "gst"
+            },
+            {
+              "id": "gstreamer-base 0.24.5",
+              "target": "gstreamer_base",
+              "alias": "gst_base"
+            },
+            {
+              "id": "gstreamer-video-sys 0.24.5",
+              "target": "gstreamer_video_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            },
+            {
+              "id": "thiserror 2.0.21",
+              "target": "thiserror"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gstreamer-video-sys 0.24.5": {
+      "name": "gstreamer-video-sys",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-video-sys/0.24.5/download",
+          "sha256": "20236fa412d7a50e59aa234b46828a99e3e5f06c4f80d271a49ecd2a1d3bfcbe"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_video_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_video_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gobject-sys 0.21.5",
+              "target": "gobject_sys"
+            },
+            {
+              "id": "gstreamer-base-sys 0.24.5",
+              "target": "gstreamer_base_sys"
+            },
+            {
+              "id": "gstreamer-sys 0.24.5",
+              "target": "gstreamer_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gstreamer-video-1.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "gstreamer-webrtc 0.24.5": {
+      "name": "gstreamer-webrtc",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-webrtc/0.24.5/download",
+          "sha256": "a31f0b39b7095da0edbba25479f89ffa57da4801bc1108d3f82e3d03e2885037"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_webrtc",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_webrtc",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "v1_14_1",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib 0.21.5",
+              "target": "glib"
+            },
+            {
+              "id": "gstreamer 0.24.5",
+              "target": "gstreamer",
+              "alias": "gst"
+            },
+            {
+              "id": "gstreamer-sdp 0.24.5",
+              "target": "gstreamer_sdp",
+              "alias": "gst_sdp"
+            },
+            {
+              "id": "gstreamer-webrtc-sys 0.24.5",
+              "target": "gstreamer_webrtc_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "gstreamer-webrtc-sys 0.24.5": {
+      "name": "gstreamer-webrtc-sys",
+      "version": "0.24.5",
+      "package_url": "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/gstreamer-webrtc-sys/0.24.5/download",
+          "sha256": "568dff5d70741f8a3ae651bd415f05ada3e7cb994600010b31fede09d7ea36b0"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "gstreamer_webrtc_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "gstreamer_webrtc_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "v1_14_1",
+            "v1_16",
+            "v1_18",
+            "v1_20",
+            "v1_22"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "glib-sys 0.21.5",
+              "target": "glib_sys"
+            },
+            {
+              "id": "gstreamer-sdp-sys 0.24.5",
+              "target": "gstreamer_sdp_sys"
+            },
+            {
+              "id": "gstreamer-sys 0.24.5",
+              "target": "gstreamer_sys"
+            },
+            {
+              "id": "libc 0.2.191",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@//third_party/gstreamer:gstreamer-webrtc-1.0"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.24.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
+    "hashbrown 0.17.1": {
+      "name": "hashbrown",
+      "version": "0.17.1",
+      "package_url": "https://github.com/rust-lang/hashbrown",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/hashbrown/0.17.1/download",
+          "sha256": "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "hashbrown",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "hashbrown",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2024",
+        "version": "0.17.1"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -3725,6 +5302,45 @@
         },
         "edition": "2018",
         "version": "0.4.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "heck 0.5.0": {
+      "name": "heck",
+      "version": "0.5.0",
+      "package_url": "https://github.com/withoutboats/heck",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/heck/0.5.0/download",
+          "sha256": "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "heck",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "heck",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2021",
+        "version": "0.5.0"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -4338,6 +5954,121 @@
       ],
       "license_file": "LICENSE"
     },
+    "indexmap 2.14.2": {
+      "name": "indexmap",
+      "version": "2.14.2",
+      "package_url": "https://github.com/indexmap-rs/indexmap",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/indexmap/2.14.2/download",
+          "sha256": "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "indexmap",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "indexmap",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "equivalent 1.0.3",
+              "target": "equivalent"
+            },
+            {
+              "id": "hashbrown 0.17.1",
+              "target": "hashbrown"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "2.14.2"
+      },
+      "license": "Apache-2.0 OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "itertools 0.14.0": {
+      "name": "itertools",
+      "version": "0.14.0",
+      "package_url": "https://github.com/rust-itertools/itertools",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/itertools/0.14.0/download",
+          "sha256": "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "itertools",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "itertools",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "use_alloc",
+            "use_std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "either 1.19.0",
+              "target": "either"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.14.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "itoa 1.0.19": {
       "name": "itoa",
       "version": "1.0.19",
@@ -4369,6 +6100,62 @@
         ],
         "edition": "2021",
         "version": "1.0.19"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "kstring 2.0.5": {
+      "name": "kstring",
+      "version": "2.0.5",
+      "package_url": "https://github.com/cobalt-org/kstring",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/kstring/2.0.5/download",
+          "sha256": "7a09b82a7f771ed02dc0dd9b27130a0fa5499fa15ed3027116c1e5e4e591bd9e"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "kstring",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "kstring",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std",
+            "unsafe"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "static_assertions 1.1.0",
+              "target": "static_assertions"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "2.0.5"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -4855,14 +6642,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "memchr 2.5.0": {
+    "memchr 2.8.3": {
       "name": "memchr",
-      "version": "2.5.0",
+      "version": "2.8.3",
       "package_url": "https://github.com/BurntSushi/memchr",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/memchr/2.5.0/download",
-          "sha256": "2dffe52ecf27772e601905b7522cb4ef790d2cc203488bbd0e2fe85fcb74566d"
+          "url": "https://static.crates.io/crates/memchr/2.8.3/download",
+          "sha256": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
         }
       },
       "targets": [
@@ -4870,18 +6657,6 @@
           "Library": {
             "crate_name": "memchr",
             "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        },
-        {
-          "BuildScript": {
-            "crate_name": "build_script_build",
-            "crate_root": "build.rs",
             "srcs": {
               "allow_empty": true,
               "include": [
@@ -4898,36 +6673,17 @@
         ],
         "crate_features": {
           "common": [
+            "alloc",
             "default",
             "std",
             "use_std"
           ],
           "selects": {}
         },
-        "deps": {
-          "common": [
-            {
-              "id": "memchr 2.5.0",
-              "target": "build_script_build"
-            }
-          ],
-          "selects": {}
-        },
-        "edition": "2018",
-        "version": "2.5.0"
+        "edition": "2021",
+        "version": "2.8.3"
       },
-      "build_script_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "compile_data_glob_excludes": [
-          "**/*.rs"
-        ],
-        "data_glob": [
-          "**"
-        ]
-      },
-      "license": "Unlicense/MIT",
+      "license": "Unlicense OR MIT",
       "license_ids": [
         "MIT",
         "Unlicense"
@@ -5129,6 +6885,44 @@
       ],
       "license_file": "LICENSE"
     },
+    "muldiv 1.0.1": {
+      "name": "muldiv",
+      "version": "1.0.1",
+      "package_url": "https://github.com/sdroege/rust-muldiv",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/muldiv/1.0.1/download",
+          "sha256": "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "muldiv",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "muldiv",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2018",
+        "version": "1.0.1"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
+    },
     "nom 5.1.3": {
       "name": "nom",
       "version": "5.1.3",
@@ -5180,7 +6974,7 @@
         "deps": {
           "common": [
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             },
             {
@@ -5218,6 +7012,198 @@
         "MIT"
       ],
       "license_file": "LICENSE"
+    },
+    "num-integer 0.1.47": {
+      "name": "num-integer",
+      "version": "0.1.47",
+      "package_url": "https://github.com/rust-num/num-integer",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/num-integer/0.1.47/download",
+          "sha256": "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "num_integer",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "num_integer",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "i128"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.1.47"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "num-rational 0.4.2": {
+      "name": "num-rational",
+      "version": "0.4.2",
+      "package_url": "https://github.com/rust-num/num-rational",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/num-rational/0.4.2/download",
+          "sha256": "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "num_rational",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "num_rational",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "num-integer 0.1.47",
+              "target": "num_integer"
+            },
+            {
+              "id": "num-traits 0.2.19",
+              "target": "num_traits"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.4.2"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "num-traits 0.2.19": {
+      "name": "num-traits",
+      "version": "0.2.19",
+      "package_url": "https://github.com/rust-num/num-traits",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/num-traits/0.2.19/download",
+          "sha256": "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "num_traits",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "num_traits",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "i128"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "num-traits 0.2.19",
+              "target": "build_script_build"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.2.19"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "autocfg 1.1.0",
+              "target": "autocfg"
+            }
+          ],
+          "selects": {}
+        }
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
     },
     "once_cell 1.18.0": {
       "name": "once_cell",
@@ -5259,6 +7245,100 @@
         },
         "edition": "2021",
         "version": "1.18.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "option-operations 0.6.1": {
+      "name": "option-operations",
+      "version": "0.6.1",
+      "package_url": "https://github.com/fengalin/option-operations",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/option-operations/0.6.1/download",
+          "sha256": "aca39cf52b03268400c16eeb9b56382ea3c3353409309b63f5c8f0b1faf42754"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "option_operations",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "option_operations",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "pastey 0.2.3",
+              "target": "pastey"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "0.6.1"
+      },
+      "license": "MIT/Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pastey 0.2.3": {
+      "name": "pastey",
+      "version": "0.2.3",
+      "package_url": "https://github.com/as1100k/pastey",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pastey/0.2.3/download",
+          "sha256": "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "pastey",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pastey",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2018",
+        "version": "0.2.3"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -5535,6 +7615,45 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "pkg-config 0.3.34": {
+      "name": "pkg-config",
+      "version": "0.3.34",
+      "package_url": "https://github.com/rust-lang/pkg-config-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pkg-config/0.3.34/download",
+          "sha256": "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pkg_config",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pkg_config",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2021",
+        "version": "0.3.34"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "ppv-lite86 0.2.21": {
       "name": "ppv-lite86",
       "version": "0.2.21",
@@ -5582,6 +7701,54 @@
         },
         "edition": "2021",
         "version": "0.2.21"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "proc-macro-crate 3.5.0": {
+      "name": "proc-macro-crate",
+      "version": "3.5.0",
+      "package_url": "https://github.com/bkchr/proc-macro-crate",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/proc-macro-crate/3.5.0/download",
+          "sha256": "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "proc_macro_crate",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "proc_macro_crate",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "toml_edit 0.25.19+spec-1.1.0",
+              "target": "toml_edit"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "3.5.0"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -6028,7 +8195,7 @@
               "target": "aho_corasick"
             },
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             },
             {
@@ -6115,7 +8282,7 @@
               "target": "aho_corasick"
             },
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             },
             {
@@ -6924,7 +9091,7 @@
               "target": "itoa"
             },
             {
-              "id": "memchr 2.5.0",
+              "id": "memchr 2.8.3",
               "target": "memchr"
             },
             {
@@ -7021,6 +9188,52 @@
         },
         "edition": "2021",
         "version": "0.1.20"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "serde_spanned 1.1.3": {
+      "name": "serde_spanned",
+      "version": "1.1.3",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/serde_spanned/1.1.3/download",
+          "sha256": "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "serde_spanned",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "serde_spanned",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "1.1.3"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -7385,14 +9598,14 @@
       ],
       "license_file": "LICENSE"
     },
-    "smallvec 1.10.0": {
+    "smallvec 1.16.5": {
       "name": "smallvec",
-      "version": "1.10.0",
+      "version": "1.16.5",
       "package_url": "https://github.com/servo/rust-smallvec",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/smallvec/1.10.0/download",
-          "sha256": "a507befe795404456341dfab10cef66ead4c041f62b8b11bbb92bffe5d0953e0"
+          "url": "https://static.crates.io/crates/smallvec/1.16.5/download",
+          "sha256": "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
         }
       },
       "targets": [
@@ -7414,8 +9627,17 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "const_generics",
+            "const_new",
+            "union",
+            "write"
+          ],
+          "selects": {}
+        },
         "edition": "2018",
-        "version": "1.10.0"
+        "version": "1.16.5"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -7540,6 +9762,45 @@
         },
         "edition": "2021",
         "version": "0.6.5"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "static_assertions 1.1.0": {
+      "name": "static_assertions",
+      "version": "1.1.0",
+      "package_url": "https://github.com/nvzqz/static-assertions-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/static_assertions/1.1.0/download",
+          "sha256": "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "static_assertions",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "static_assertions",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2015",
+        "version": "1.1.0"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -7832,6 +10093,146 @@
         "version": "1.0.2"
       },
       "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "system-deps 7.0.8": {
+      "name": "system-deps",
+      "version": "7.0.8",
+      "package_url": "https://github.com/gdesmott/system-deps",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/system-deps/7.0.8/download",
+          "sha256": "396a35feb67335377e0251fcbc1092fc85c484bd4e3a7a54319399da127796e7"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "system_deps",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "system_deps",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "cfg-expr 0.20.11",
+              "target": "cfg_expr"
+            },
+            {
+              "id": "heck 0.5.0",
+              "target": "heck"
+            },
+            {
+              "id": "pkg-config 0.3.34",
+              "target": "pkg_config"
+            },
+            {
+              "id": "toml 1.2.1+spec-1.1.0",
+              "target": "toml"
+            },
+            {
+              "id": "version-compare 0.2.1",
+              "target": "version_compare"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "7.0.8"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "target-lexicon 0.13.5": {
+      "name": "target-lexicon",
+      "version": "0.13.5",
+      "package_url": "https://github.com/bytecodealliance/target-lexicon",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/target-lexicon/0.13.5/download",
+          "sha256": "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "target_lexicon",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "target_lexicon",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "target-lexicon 0.13.5",
+              "target": "build_script_build"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.13.5"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ]
+      },
+      "license": "Apache-2.0 WITH LLVM-exception",
       "license_ids": [
         "Apache-2.0"
       ],
@@ -8612,6 +11013,281 @@
         "version": "0.5.11"
       },
       "license": "MIT/Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "toml 1.2.1+spec-1.1.0": {
+      "name": "toml",
+      "version": "1.2.1+spec-1.1.0",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/toml/1.2.1+spec-1.1.0/download",
+          "sha256": "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "toml",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "parse",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "serde_spanned 1.1.3",
+              "target": "serde_spanned"
+            },
+            {
+              "id": "toml_datetime 1.1.3+spec-1.1.0",
+              "target": "toml_datetime"
+            },
+            {
+              "id": "toml_parser 1.1.5+spec-1.1.0",
+              "target": "toml_parser"
+            },
+            {
+              "id": "winnow 1.0.5",
+              "target": "winnow"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "1.2.1+spec-1.1.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "toml_datetime 1.1.3+spec-1.1.0": {
+      "name": "toml_datetime",
+      "version": "1.1.3+spec-1.1.0",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/toml_datetime/1.1.3+spec-1.1.0/download",
+          "sha256": "173f25c883cd2176a2d8212155638c0a60d484a9d84546d270866f40f56b6e49"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_datetime",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "toml_datetime",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "1.1.3+spec-1.1.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "toml_edit 0.25.19+spec-1.1.0": {
+      "name": "toml_edit",
+      "version": "0.25.19+spec-1.1.0",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/toml_edit/0.25.19+spec-1.1.0/download",
+          "sha256": "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_edit",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "toml_edit",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "parse"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "indexmap 2.14.2",
+              "target": "indexmap"
+            },
+            {
+              "id": "toml_datetime 1.1.3+spec-1.1.0",
+              "target": "toml_datetime"
+            },
+            {
+              "id": "toml_parser 1.1.5+spec-1.1.0",
+              "target": "toml_parser"
+            },
+            {
+              "id": "winnow 1.0.5",
+              "target": "winnow"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.25.19+spec-1.1.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "toml_parser 1.1.5+spec-1.1.0": {
+      "name": "toml_parser",
+      "version": "1.1.5+spec-1.1.0",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/toml_parser/1.1.5+spec-1.1.0/download",
+          "sha256": "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_parser",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "toml_parser",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "winnow 1.0.5",
+              "target": "winnow"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "1.1.5+spec-1.1.0"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "toml_writer 1.2.0+spec-1.1.0": {
+      "name": "toml_writer",
+      "version": "1.2.0+spec-1.1.0",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/toml_writer/1.2.0+spec-1.1.0/download",
+          "sha256": "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_writer",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "toml_writer",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2024",
+        "version": "1.2.0+spec-1.1.0"
+      },
+      "license": "MIT OR Apache-2.0",
       "license_ids": [
         "Apache-2.0",
         "MIT"
@@ -9526,6 +12202,44 @@
         "MIT"
       ],
       "license_file": "LICENSE-APACHE"
+    },
+    "version-compare 0.2.1": {
+      "name": "version-compare",
+      "version": "0.2.1",
+      "package_url": "https://gitlab.com/timvisee/version-compare",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/version-compare/0.2.1/download",
+          "sha256": "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "version_compare",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "version_compare",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "edition": "2021",
+        "version": "0.2.1"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE"
     },
     "version_check 0.9.4": {
       "name": "version_check",
@@ -10694,6 +13408,55 @@
       ],
       "license_file": "license-apache-2.0"
     },
+    "winnow 1.0.5": {
+      "name": "winnow",
+      "version": "1.0.5",
+      "package_url": "https://github.com/winnow-rs/winnow",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/winnow/1.0.5/download",
+          "sha256": "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "winnow",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "winnow",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc",
+            "ascii",
+            "binary",
+            "default",
+            "parser",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.0.5"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE-MIT"
+    },
     "wit-bindgen 0.57.1": {
       "name": "wit-bindgen",
       "version": "0.57.1",
@@ -11123,6 +13886,11 @@
     "cxxbridge-macro 1.0.97",
     "env_logger 0.8.4",
     "futures 0.3.28",
+    "gstreamer 0.24.5",
+    "gstreamer-app 0.24.5",
+    "gstreamer-sdp 0.24.5",
+    "gstreamer-video 0.24.5",
+    "gstreamer-webrtc 0.24.5",
     "hyper 1.1.0",
     "hyper-util 0.1.3",
     "libc 0.2.191",
@@ -11132,7 +13900,8 @@
     "once_cell 1.18.0",
     "rustls 0.23.46",
     "rustls-pki-types 1.16.0",
-    "smallvec 1.10.0",
+    "serde_json 1.0.154",
+    "smallvec 1.16.5",
     "thiserror 1.0.40",
     "tokio 1.54.1",
     "tokio-rustls 0.26.6",
