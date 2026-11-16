@@ -38,3 +38,10 @@
   <span *ngFor="let d of calibration.dist">{{ d | number: '1.4-4' }}</span>
   <span *ngIf="calibration.dist.length === 0">none</span>
 </p>
+<h3>How far undistorting moves each pixel ({{ width }}×{{ height }})</h3>
+<distortion-map
+  [lens]="calibration"
+  [width]="width"
+  [height]="height"
+  [scaleMax]="distortionScale"
+></distortion-map>

@@ -8,6 +8,7 @@ package(default_visibility = ["//frc/vision/streamer/page:__subpackages__"])
 
 LIB_SRCS = [
     "format.ts",
+    "distortion.ts",
     "intrinsics.ts",
     "rates.ts",
     "signalling.ts",
