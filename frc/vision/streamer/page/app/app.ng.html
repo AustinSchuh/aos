@@ -54,6 +54,9 @@
   <intrinsics-card
     *ngFor="let calibration of robot.calibrations"
     [calibration]="calibration"
+    [imageWidth]="robot.settings?.imageWidth ?? null"
+    [imageHeight]="robot.settings?.imageHeight ?? null"
+    [distortionScale]="distortionScale"
   ></intrinsics-card>
   <p *ngIf="robot.calibrations.length === 0">
     No calibrations for node {{ node }} in /constants yet.

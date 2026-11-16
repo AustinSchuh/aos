@@ -8,6 +8,7 @@ import {
   streamSizeText,
   tileLine,
 } from '../lib/format.js';
+import {sharedMax} from '../lib/distortion.js';
 import {NODE, Robot} from './robot';
 import {CameraStreams} from './streams';
 
@@ -21,6 +22,8 @@ type Tab = 'feeds' | 'settings';
 export class App implements OnInit {
   tab: Tab = 'feeds';
   readonly node = NODE;
+  private distortionKey = '';
+  private distortionMax = 0;
 
   constructor(
     readonly streams: CameraStreams,
@@ -53,6 +56,23 @@ export class App implements OnInit {
 
   get size(): string {
     return sizeText(this.robot.settings);
+  }
+
+  /** One scale for every camera's distortion map, so they can be compared. */
+  get distortionScale(): number {
+    const width = this.robot.settings?.imageWidth ?? null;
+    const height = this.robot.settings?.imageHeight ?? null;
+    const lenses = this.robot.calibrations;
+    const key = JSON.stringify([
+      width,
+      height,
+      lenses.map((c) => [c.k, c.dist]),
+    ]);
+    if (key !== this.distortionKey) {
+      this.distortionKey = key;
+      this.distortionMax = sharedMax(lenses, width, height);
+    }
+    return this.distortionMax;
   }
 
   get exposure(): string {
