@@ -16,6 +16,7 @@
 #include "aos/flatbuffers.h"
 #include "aos/network/team_number.h"
 #include "frc/control_loops/quaternion_utils.h"
+#include "frc/vision/util/corner_refinement.h"
 #include "frc/vision/vision_generated.h"
 
 ABSL_FLAG(std::string, board_template_path, "",
@@ -511,13 +512,15 @@ void CharucoExtractor::ProcessImage(
         cv::aruco::interpolateCornersCharuco(marker_corners, marker_ids,
                                              rgb_image, board_, charuco_corners,
                                              charuco_ids);
+        // OpenCV 4.6 leaves them half a pixel off: see corner_refinement.h.
+        RefineCharucoCorners(board_, rgb_image, charuco_corners);
 
         std::vector<cv::Point2f> charuco_corners_with_calibration;
         std::vector<int> charuco_ids_with_calibration;
         const CameraLens &lens = calibration_.Lens();
         if (lens.kannala_brandt) {
           // OpenCV's ChArUco functions take only its pinhole models: fit the
-          // pose to the corners, undistorted.
+          // pose to the refined corners, undistorted.
           charuco_corners_with_calibration = lens.Undistort(charuco_corners);
           charuco_ids_with_calibration = charuco_ids;
         } else {
@@ -527,6 +530,8 @@ void CharucoExtractor::ProcessImage(
               marker_corners, marker_ids, rgb_image, board_,
               charuco_corners_with_calibration, charuco_ids_with_calibration,
               calibration_.CameraIntrinsics(), calibration_.CameraDistCoeffs());
+          RefineCharucoCorners(board_, rgb_image,
+                               charuco_corners_with_calibration);
         }
 
         if (charuco_ids.size() >= absl::GetFlag(FLAGS_min_charucos)) {
