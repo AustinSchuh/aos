@@ -1,4 +1,5 @@
 load("@aos//aos:flatbuffers.bzl", "cc_static_flatbuffer")
+load("@aos//aos/flatbuffers:build_defs.bzl", "flatbuffer_rust_module_library")
 load("@aos//aos/flatbuffers:defs.bzl", "DEFAULT_FLATC_ARGS")
 load("@aos//aos/flatbuffers:generate.bzl", "static_flatbuffer")
 load("@bazel_lib//lib:copy_file.bzl", "copy_file")
@@ -63,3 +64,13 @@ static_flatbuffer(
     target = ":non_table_schemas_reflection_out",
     visibility = ["//visibility:public"],
 ) for filename in NON_TABLE_SCHEMAS]
+
+# Rust for ImageAnnotations and the schemas it includes, for camera_streamer to
+# draw calibration_server's corners.
+flatbuffer_rust_module_library(
+    name = "ImageAnnotations_rust_fbs",
+    srcs = ["ImageAnnotations.fbs"],
+    crate_name = "foxglove_image_annotations_rust_fbs",
+    includes = [f for f in SCHEMAS if f != "ImageAnnotations.fbs"],
+    visibility = ["//visibility:public"],
+)
