@@ -6,6 +6,20 @@ table TransformationMatrix {
   data:[float] (id: 0);
 }
 
+// How a calibration's dist_coeffs distort.
+enum DistortionModel : ubyte {
+  // OpenCV's pinhole model: k1, k2, p1, p2[, k3[, k4, k5, k6[, s1, s2, s3,
+  // s4[, tau_x, tau_y]]]], the radial part a polynomial (or for 8 or more, a
+  // ratio of polynomials) in the radius squared.
+  OPENCV = 0,
+  // Kannala-Brandt, as OpenCV's fisheye module has it: k1, k2, k3, k4, the
+  // distorted angle from the optical axis a polynomial in the angle,
+  // theta_d = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8).
+  // Wide lenses are near-linear in the angle, where the pinhole plane's
+  // radius, tan(theta), runs away.
+  KANNALA_BRANDT = 1,
+}
+
 // A ChArUco board, as a calibration is made with.
 table BoardSpec {
   // The squares across and down.
@@ -52,7 +66,7 @@ table CameraCalibration {
   //   turret_extrinsics
   turret_extrinsics:TransformationMatrix (id: 4);
 
-  // This is the standard OpenCV 5 parameter distortion coefficients
+  // The distortion coefficients, as distortion_model has them.
   dist_coeffs:[float] (id: 5);
 
   // Timestamp for when the calibration was taken on the realtime clock.
@@ -70,6 +84,9 @@ table CameraCalibration {
 
   // The board the intrinsics were calibrated with, if recorded.
   board:BoardSpec (id: 10);
+
+  // How dist_coeffs distort.
+  distortion_model:DistortionModel (id: 11);
 }
 
 // Calibration information for all the cameras we know about.

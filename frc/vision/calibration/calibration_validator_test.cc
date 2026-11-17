@@ -23,14 +23,15 @@ using aos::testing::ArtifactPath;
 using calibration::CameraCalibration;
 
 aos::FlatbufferDetachedBuffer<CameraCalibration> MakeCalibration(
-    const std::vector<float> &intrinsics,
-    const std::vector<float> &dist_coeffs) {
+    const std::vector<float> &intrinsics, const std::vector<float> &dist_coeffs,
+    calibration::DistortionModel model = calibration::DistortionModel::OPENCV) {
   flatbuffers::FlatBufferBuilder fbb;
   const auto intrinsics_offset = fbb.CreateVector(intrinsics);
   const auto dist_coeffs_offset = fbb.CreateVector(dist_coeffs);
   CameraCalibration::Builder builder(fbb);
   builder.add_intrinsics(intrinsics_offset);
   builder.add_dist_coeffs(dist_coeffs_offset);
+  builder.add_distortion_model(model);
   fbb.Finish(builder.Finish());
   return aos::FlatbufferDetachedBuffer<CameraCalibration>(fbb.Release());
 }
@@ -257,6 +258,52 @@ TEST(CalibrationValidatorTest, ZeroDistortion) {
   EXPECT_EQ(report.pixels_checked, 1602 * 1306);
   EXPECT_STREQ(report.limit_reason, "where the scan stopped");
   EXPECT_GE(report.limit_radius, 2 * report.max_distorted_radius);
+}
+
+// The Kannala-Brandt fit of intrinsics_calibration_test's wide lens (about 97
+// degrees across, its corners 75 degrees off the axis): the rational model's
+// fits of it fold, but this doesn't, and every pixel undistorts.
+TEST(CalibrationValidatorTest, KannalaBrandtWideLens) {
+  CalibrationReport report;
+  const absl::Status status = ValidateCalibration(
+      MakeCalibration({647.589, 0, 766.262, 0, 647.782, 557.491, 0, 0, 1},
+                      {0.0251741, 0.0010348, 0.00410866, -0.00186165},
+                      calibration::DistortionModel::KANNALA_BRANDT)
+          .message(),
+      1456, 1088, &report);
+  EXPECT_TRUE(status.ok()) << status << "\n" << report;
+  EXPECT_STREQ(report.limit_reason, "90 degrees off the axis");
+  // Newton's method on the angle converges in a few steps.
+  EXPECT_LT(report.max_iterations, 10);
+  EXPECT_EQ(report.pixels_checked, 1458 * 1090);
+}
+
+// A Kannala-Brandt model whose distorted angle turns back before the image's
+// corners is refused.
+TEST(CalibrationValidatorTest, KannalaBrandtFold) {
+  CalibrationReport report;
+  EXPECT_FALSE(
+      ValidateCalibration(
+          MakeCalibration({647.589, 0, 766.262, 0, 647.782, 557.491, 0, 0, 1},
+                          {-0.4, 0, 0, 0},
+                          calibration::DistortionModel::KANNALA_BRANDT)
+              .message(),
+          1456, 1088, &report)
+          .ok());
+  EXPECT_EQ(report.failed_check, CalibrationCheck::kRadialModel);
+  EXPECT_STREQ(report.limit_reason, "fold, theta_d' <= 0");
+}
+
+TEST(CalibrationValidatorTest, KannalaBrandtHasFourCoefficients) {
+  CalibrationReport report;
+  EXPECT_FALSE(ValidateCalibration(
+                   MakeCalibration({1000, 0, 800, 0, 1000, 652, 0, 0, 1},
+                                   {0, 0, 0, 0, 0},
+                                   calibration::DistortionModel::KANNALA_BRANDT)
+                       .message(),
+                   1600, 1304, &report)
+                   .ok());
+  EXPECT_EQ(report.failed_check, CalibrationCheck::kSanity);
 }
 
 // Each malformed calibration fails the sanity check, before anything
