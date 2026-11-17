@@ -16,7 +16,7 @@ import {
 } from '../lib/distortion.js';
 
 /** The blue ramp, from near the panel (no move) to light (the largest move). */
-const RAMP = [
+export const RAMP = [
   '#0d366b',
   '#184f95',
   '#256abf',
@@ -27,7 +27,7 @@ const RAMP = [
 ].map((hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)));
 
 /** `t` in [0, 1] along RAMP. */
-function rampColor(t: number): number[] {
+export function rampColor(t: number): number[] {
   const position = Math.min(Math.max(t, 0), 1) * (RAMP.length - 1);
   const i = Math.min(Math.floor(position), RAMP.length - 2);
   const f = position - i;

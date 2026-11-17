@@ -12,6 +12,8 @@ import {
   sameBoard,
   SavedBoard,
   Session,
+  ValidationCheck,
+  validationRows,
 } from '../lib/calibration.js';
 import {sharedMax} from '../lib/distortion.js';
 import {CalibrationSession} from './calibration';
@@ -73,6 +75,26 @@ export class CalibratePanel {
   selected: number | null = null;
   readonly dropping = new Set<number>();
   force = false;
+  /** The checks to make, and whether to check the solved calibration too. */
+  readonly checks = new Set<ValidationCheck>(['STRAIGHTNESS', 'RIGIDITY']);
+  validateSolved = true;
+  readonly checkNames: [ValidationCheck, string, string][] = [
+    [
+      'STRAIGHTNESS',
+      'Straightness',
+      "Fit the whole board; its corners' leftover error shows distortion modelled wrong.",
+    ],
+    [
+      'RIGIDITY',
+      'Rigidity',
+      'Fit each half of the board alone; how far apart the halves land is the drift between small targets.',
+    ],
+    [
+      'TWO_TAG',
+      'Two-tag rig',
+      "Fit each of a rigid pair of AprilTags alone; their distance shouldn't change across the image.",
+    ],
+  ];
 
   constructor(
     readonly calibration: CalibrationSession,
@@ -198,6 +220,41 @@ export class CalibratePanel {
       session?.imageWidth || null,
       session?.imageHeight || null,
     );
+  }
+
+  toggleCheck(check: ValidationCheck): void {
+    if (this.checks.has(check)) {
+      this.checks.delete(check);
+    } else {
+      this.checks.add(check);
+    }
+  }
+
+  validate(): void {
+    void this.calibration.send({
+      action: 'VALIDATE',
+      checks: [...this.checks],
+      validate_solved: this.validateSolved && this.solveCurrent,
+    });
+  }
+
+  stopValidating(): void {
+    void this.calibration.send({action: 'STOP_VALIDATING'});
+  }
+
+  get validationRows() {
+    return validationRows(this.session?.validation ?? []);
+  }
+
+  /** One scale for a measure's grids: its largest cell. */
+  gridScale(byLens: ({means: number[]} | null)[]): number {
+    let max = 0;
+    for (const result of byLens) {
+      for (const mean of result?.means ?? []) {
+        max = Math.max(max, mean);
+      }
+    }
+    return max;
   }
 
   async start(): Promise<void> {

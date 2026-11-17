@@ -354,4 +354,102 @@
       </p>
     </ng-container>
   </section>
+
+  <section class="card calibrate-validate" *ngIf="session as session">
+    <h2>Validate</h2>
+    <p class="source">
+      On new frames, not the captures: move the board (or the two-tag rig) all
+      around the image, near and far. Each check runs on its own, on the
+      camera's current calibration and the solved one.
+    </p>
+    <ul class="check-list">
+      <li *ngFor="let entry of checkNames">
+        <label>
+          <span>
+            <input
+              type="checkbox"
+              [checked]="checks.has(entry[0])"
+              (change)="toggleCheck(entry[0])"
+              [disabled]="status.state === 'VALIDATING'"
+            />
+            {{ entry[1] }}
+          </span>
+          <span class="source">{{ entry[2] }}</span>
+        </label>
+      </li>
+    </ul>
+    <div class="row">
+      <label *ngIf="solveCurrent">
+        <span>
+          <input
+            type="checkbox"
+            [(ngModel)]="validateSolved"
+            [disabled]="status.state === 'VALIDATING'"
+          />
+          Also the solved calibration
+        </span>
+      </label>
+      <span class="spacer"></span>
+      <button
+        type="button"
+        class="primary"
+        *ngIf="status.state !== 'VALIDATING'"
+        (click)="validate()"
+        [disabled]="calibration.busy || checks.size === 0 || status.state === 'SOLVING'"
+      >
+        Start validating
+      </button>
+      <button
+        type="button"
+        *ngIf="status.state === 'VALIDATING'"
+        (click)="stopValidating()"
+        [disabled]="calibration.busy"
+      >
+        Stop
+      </button>
+    </div>
+    <ng-container *ngIf="session.validation.length > 0">
+      <table class="validation-table">
+        <tr>
+          <th></th>
+          <th *ngFor="let lens of session.validation">{{ lens.name }}</th>
+        </tr>
+        <ng-container *ngFor="let row of validationRows">
+          <tr>
+            <th>{{ row.measure }}</th>
+            <td *ngFor="let result of row.byLens">
+              <ng-container *ngIf="result && result.frames > 0; else none">
+                median {{ result.median | number: '1.2-2' }}, worst {{
+                result.worst | number: '1.2-2' }}
+                <span class="source">({{ result.frames }})</span>
+              </ng-container>
+              <ng-template #none>
+                <span class="source">nothing yet</span>
+              </ng-template>
+            </td>
+          </tr>
+          <tr>
+            <th></th>
+            <td *ngFor="let result of row.byLens">
+              <validation-grid
+                *ngIf="result && result.frames > 0"
+                [result]="result"
+                [scale]="gridScale(row.byLens)"
+                [aspect]="session.imageWidth / session.imageHeight"
+              ></validation-grid>
+            </td>
+          </tr>
+        </ng-container>
+      </table>
+      <p class="source" *ngIf="session.validation[0]?.tagIds?.length">
+        Tags {{ session.validation[0]!.tagIds.join(' and ') }}, {{
+        session.validation[0]!.tagDistanceM * 1000 | number: '1.0-0' }} mm apart
+        (median).
+      </p>
+      <p class="source">
+        Each grid shows where in the image the measure was large: dark is none,
+        light is the largest of any grid in its row, and gray is unmeasured.
+      </p>
+    </ng-container>
+  </section>
 </ng-container>

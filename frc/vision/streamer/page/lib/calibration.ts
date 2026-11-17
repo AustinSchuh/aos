@@ -4,7 +4,31 @@
 
 import {Calibration, parseCalibration} from './intrinsics.js';
 
-export type SessionState = 'IDLE' | 'COLLECTING' | 'SOLVING' | 'SOLVED';
+export type SessionState =
+  'IDLE' | 'COLLECTING' | 'SOLVING' | 'SOLVED' | 'VALIDATING';
+
+export type ValidationCheck = 'STRAIGHTNESS' | 'RIGIDITY' | 'TWO_TAG';
+
+/** One measure of one check, over the frames looked at. */
+export interface CheckResult {
+  check: ValidationCheck;
+  measure: string;
+  frames: number;
+  median: number;
+  worst: number;
+  columns: number;
+  rows: number;
+  /** Each cell's mean, row-major; negative where nothing was measured. */
+  means: number[];
+}
+
+/** A calibration's checks. */
+export interface LensValidation {
+  name: string;
+  results: CheckResult[];
+  tagIds: number[];
+  tagDistanceM: number;
+}
 
 export type FrameVerdict =
   | 'NO_IMAGE'
@@ -97,6 +121,8 @@ export interface Session {
   /** The camera's calibration when the session started. */
   current: Calibration | null;
   solve: Solve | null;
+  validation: LensValidation[];
+  checks: ValidationCheck[];
 }
 
 type Json = Record<string, unknown>;
@@ -119,7 +145,13 @@ function list(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-const STATES: SessionState[] = ['IDLE', 'COLLECTING', 'SOLVING', 'SOLVED'];
+const STATES: SessionState[] = [
+  'IDLE',
+  'COLLECTING',
+  'SOLVING',
+  'SOLVED',
+  'VALIDATING',
+];
 
 function state(value: unknown): SessionState {
   return STATES.includes(value as SessionState)
@@ -237,7 +269,58 @@ export function parseSession(message: unknown): Session | null {
     }),
     current: parseCalibration(m['current']),
     solve: parseSolve(m['solve']),
+    validation: list(m['validation']).map((entry) => {
+      const v = object(entry);
+      return {
+        name: str(v?.['name']),
+        results: list(v?.['results']).map((result) => {
+          const r = object(result);
+          return {
+            check: str(r?.['check']) as ValidationCheck,
+            measure: str(r?.['measure']),
+            frames: num(r?.['frames']),
+            median: num(r?.['median']),
+            worst: num(r?.['worst']),
+            columns: num(r?.['columns']),
+            rows: num(r?.['rows']),
+            means: list(r?.['means']).map((mean) => num(mean, -1)),
+          };
+        }),
+        tagIds: list(v?.['tag_ids']).map((id) => num(id)),
+        tagDistanceM: num(v?.['tag_distance_m']),
+      };
+    }),
+    checks: list(m['checks']).map((check) => str(check) as ValidationCheck),
   };
+}
+
+/**
+ * The measures validation made, each with every calibration's result for it side by side, in
+ * the order they came.
+ */
+export function validationRows(
+  validation: LensValidation[],
+): {measure: string; check: ValidationCheck; byLens: (CheckResult | null)[]}[] {
+  const rows: {
+    measure: string;
+    check: ValidationCheck;
+    byLens: (CheckResult | null)[];
+  }[] = [];
+  validation.forEach((lens, index) => {
+    for (const result of lens.results) {
+      let row = rows.find((r) => r.measure === result.measure);
+      if (!row) {
+        row = {
+          measure: result.measure,
+          check: result.check,
+          byLens: validation.map(() => null),
+        };
+        rows.push(row);
+      }
+      row.byLens[index] = result;
+    }
+  });
+  return rows;
 }
 
 /** What to tell the person holding the board, from the last frame. */
@@ -260,7 +343,11 @@ export function guidance(status: SessionStatus): string {
     case 'TARGET_REACHED':
       return `${status.captures} captures: solve, or capture more by hand.`;
     case 'NOT_COLLECTING':
-      return status.state === 'SOLVING' ? 'Solving…' : '';
+      return status.state === 'SOLVING'
+        ? 'Solving…'
+        : status.state === 'VALIDATING'
+          ? 'Validating: move the board all around the image, near and far, and tilted.'
+          : '';
   }
 }
 
@@ -384,6 +471,8 @@ export interface Command {
   drop?: number[];
   force?: boolean;
   camera_id?: string;
+  checks?: ValidationCheck[];
+  validate_solved?: boolean;
 }
 
 /** A new session's id. */
