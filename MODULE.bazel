@@ -654,6 +654,26 @@ use_repo(cypress, "cypress_toolchains")
 
 register_toolchains("@cypress_toolchains//:all")
 
+# Chromium, headless, for the pages' end-to-end tests: the revision
+# rules_cypress pins (see repositories.bzl).
+http_archive(
+    name = "chrome_linux",
+    build_file_content = """
+filegroup(
+    name = "all",
+    srcs = glob(["**"]),
+    visibility = ["//visibility:public"],
+)
+
+exports_files(["chrome"])
+""",
+    sha256 = "4de54f43b2fc4812b9fad4145e44df6ed3063969174a8883ea42ed4c1ee58301",
+    strip_prefix = "chrome-linux",
+    urls = [
+        "https://www.googleapis.com/download/storage/v1/b/chromium-browser-snapshots/o/Linux_x64%2F1264932%2Fchrome-linux.zip?alt=media",
+    ],
+)
+
 bazel_dep(name = "toolchains_llvm", version = "1.11.1", dev_dependency = True)
 
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm", dev_dependency = True)
