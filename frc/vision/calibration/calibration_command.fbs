@@ -1,4 +1,5 @@
 include "frc/vision/calibration.fbs";
+include "frc/vision/calibration/calibration_status.fbs";
 
 // The messages of a calibration session from the vision page: the page sends
 // /calibration Command through robot_server, and calibration_server answers
@@ -36,6 +37,12 @@ enum CommandAction : ubyte {
   // Names the physical camera `camera_id` (YY-NN), as a new calibration is
   // filed under.
   SET_CAMERA_ID = 12,
+  // Stops capturing and measures `checks` on new frames: of the camera's
+  // current calibration, and of the solved one too if `validate_solved`.
+  // Starts the measurements over.
+  VALIDATE = 13,
+  // Goes back to capturing; the measurements stay in the Session.
+  STOP_VALIDATING = 14,
 }
 
 table Command {
@@ -49,6 +56,8 @@ table Command {
   drop:[int] (id: 6);
   force:bool (id: 7);
   camera_id:string (id: 8);
+  checks:[ValidationCheck] (id: 9);
+  validate_solved:bool (id: 10);
 }
 
 root_type Command;

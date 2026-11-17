@@ -11,6 +11,20 @@ enum SessionState : ubyte {
   SOLVING = 2,
   // Solved: the captures can still change, and the solve be redone.
   SOLVED = 3,
+  // Measuring calibrations on new frames, not capturing.
+  VALIDATING = 4,
+}
+
+// The checks of a calibration, made on frames it wasn't solved from.
+enum ValidationCheck : ubyte {
+  // Fit the whole flat board, and measure the corners' leftover error, px.
+  STRAIGHTNESS = 0,
+  // Fit each half of the board alone, and measure how far apart the halves'
+  // poses put the board, mm, and its angle, degrees.
+  RIGIDITY = 1,
+  // Fit each of a rigid pair of AprilTags alone, and measure how their
+  // distance and angle change across the image, mm and degrees.
+  TWO_TAG = 2,
 }
 
 // What became of the last frame looked at.

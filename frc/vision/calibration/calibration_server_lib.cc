@@ -118,6 +118,19 @@ absl::Status CalibrationServer::Execute(const calibration::Command &command) {
                      ", not this one, ", session_id_));
   }
   const bool solving = state_ == SessionState::SOLVING;
+  if (state_ == SessionState::VALIDATING) {
+    switch (command.action()) {
+      case CommandAction::SET_BOARD:
+      case CommandAction::CAPTURE:
+      case CommandAction::UNDO:
+      case CommandAction::DROP:
+      case CommandAction::SOLVE:
+        return absl::FailedPreconditionError(
+            "Validating: stop validating to change the captures");
+      default:
+        break;
+    }
+  }
   switch (command.action()) {
     case CommandAction::START:
       break;
@@ -241,6 +254,19 @@ absl::Status CalibrationServer::Execute(const calibration::Command &command) {
       // robot_server stops this process; until then, stop collecting.
       state_ = SessionState::IDLE;
       return absl::OkStatus();
+    case CommandAction::VALIDATE:
+      if (solving) {
+        return absl::FailedPreconditionError("Solving");
+      }
+      return Validate(command);
+    case CommandAction::STOP_VALIDATING:
+      if (state_ == SessionState::VALIDATING) {
+        state_ = solved_.has_value() &&
+                         solved_->captures == static_cast<int>(captures_.size())
+                     ? SessionState::SOLVED
+                     : SessionState::COLLECTING;
+      }
+      return absl::OkStatus();
     case CommandAction::SET_CAMERA_ID: {
       const std::string camera_id =
           command.has_camera_id() ? command.camera_id()->str() : "";
@@ -274,6 +300,8 @@ absl::Status CalibrationServer::Start(const calibration::Command &command) {
   captures_.clear();
   gate_.set_last_capture(std::nullopt);
   capture_next_ = false;
+  checks_.clear();
+  validations_.clear();
   solved_.reset();
   solve_error_.clear();
   image_size_ = cv::Size();
@@ -441,6 +469,9 @@ void CalibrationServer::LookAtImage(const CameraImage &image) {
         6.0)));
   }
 
+  if (state_ == SessionState::VALIDATING) {
+    Measure(gray, detection);
+  }
   if (state_ == SessionState::SOLVING) {
     verdict_ = FrameVerdict::NOT_COLLECTING;
     return;
@@ -451,6 +482,10 @@ void CalibrationServer::LookAtImage(const CameraImage &image) {
   }
   if (!detection.pose_valid) {
     verdict_ = FrameVerdict::NO_POSE;
+    return;
+  }
+  if (state_ == SessionState::VALIDATING) {
+    verdict_ = FrameVerdict::NOT_COLLECTING;
     return;
   }
   const Eigen::Affine3d H_camera_board = Pose(detection.rvec, detection.tvec);
@@ -557,6 +592,154 @@ absl::Status CalibrationServer::Save(bool force) {
   }
   ABSL_LOG(INFO) << "Saved " << path;
   return absl::OkStatus();
+}
+
+absl::Status CalibrationServer::Validate(const calibration::Command &command) {
+  if (image_size_.width <= 0) {
+    return absl::FailedPreconditionError("No images from the camera yet");
+  }
+  if (!command.has_checks() || command.checks()->size() == 0) {
+    return absl::InvalidArgumentError("Pick a check to make");
+  }
+  if (command.validate_solved() && !solved_.has_value()) {
+    return absl::FailedPreconditionError("Nothing solved to validate");
+  }
+  constexpr int kGridColumns = 12;
+  const auto checks = [&](std::string name, Lens lens) {
+    return LensChecks{
+        .name = std::move(name),
+        .lens = std::move(lens),
+        .straightness_px = ValidationGrid(image_size_, kGridColumns),
+        .rigidity_mm = ValidationGrid(image_size_, kGridColumns),
+        .rigidity_deg = ValidationGrid(image_size_, kGridColumns),
+        .tags = TagPairTracker(image_size_, kGridColumns)};
+  };
+  checks_.assign(command.checks()->begin(), command.checks()->end());
+  validations_.clear();
+  validations_.push_back(
+      checks(current_.has_value() ? "current" : "starting guess",
+             Lens{guess_matrix_.clone(), guess_dist_.clone()}));
+  if (command.validate_solved()) {
+    validations_.push_back(
+        checks("solved", Lens{solved_->solution.camera_matrix.clone(),
+                              solved_->solution.dist_coeffs.clone()}));
+  }
+  capture_next_ = false;
+  state_ = SessionState::VALIDATING;
+  return absl::OkStatus();
+}
+
+bool CalibrationServer::Checking(calibration::ValidationCheck check) const {
+  return std::find(checks_.begin(), checks_.end(), check) != checks_.end();
+}
+
+void CalibrationServer::Measure(const cv::Mat &gray,
+                                const CharucoDetection &detection) {
+  using calibration::ValidationCheck;
+  std::vector<Tag> tags;
+  if (Checking(ValidationCheck::TWO_TAG)) {
+    tags = DetectAprilTags(gray);
+  }
+  for (LensChecks &checks : validations_) {
+    if (Checking(ValidationCheck::STRAIGHTNESS)) {
+      if (const auto residuals = StraightnessResiduals(
+              cv_board_, detection.ids, detection.corners, checks.lens)) {
+        for (size_t i = 0; i < residuals->size(); ++i) {
+          checks.straightness_px.Add(cv::norm((*residuals)[i]),
+                                     detection.corners[i]);
+        }
+      }
+    }
+    if (Checking(ValidationCheck::RIGIDITY)) {
+      for (bool across : {true, false}) {
+        if (const auto disagreement =
+                BoardRigidity(cv_board_, detection.ids, detection.corners,
+                              checks.lens, across)) {
+          checks.rigidity_mm.Add(disagreement->translation_m * 1000.0,
+                                 disagreement->where);
+          checks.rigidity_deg.Add(disagreement->rotation_rad * 180.0 / M_PI,
+                                  disagreement->where);
+        }
+      }
+    }
+    // A rig is two tags; more than a few is the field, not a rig.
+    if (tags.size() >= 2 && tags.size() <= 4) {
+      for (size_t i = 0; i < tags.size(); ++i) {
+        for (size_t j = i + 1; j < tags.size(); ++j) {
+          const Tag &a = tags[i].id < tags[j].id ? tags[i] : tags[j];
+          const Tag &b = tags[i].id < tags[j].id ? tags[j] : tags[i];
+          if (const auto pair = TagPair(a, b, options_.tag_size, checks.lens)) {
+            checks.tags.Add({a.id, b.id}, *pair);
+          }
+        }
+      }
+    }
+  }
+  session_dirty_ = true;
+}
+
+flatbuffers::Offset<
+    flatbuffers::Vector<flatbuffers::Offset<calibration::LensValidation>>>
+CalibrationServer::PackValidation(flatbuffers::FlatBufferBuilder *fbb) const {
+  using calibration::ValidationCheck;
+  const auto pack = [&](ValidationCheck check, std::string_view measure,
+                        const ValidationGrid &grid, double scale) {
+    std::vector<float> means = grid.Means();
+    for (float &mean : means) {
+      if (mean >= 0) {
+        mean *= scale;
+      }
+    }
+    const auto measure_offset = fbb->CreateString(measure);
+    const auto means_offset = fbb->CreateVector(means);
+    calibration::CheckResult::Builder result(*fbb);
+    result.add_check(check);
+    result.add_measure(measure_offset);
+    result.add_frames(grid.count());
+    result.add_median(grid.Median() * scale);
+    result.add_worst(grid.Worst() * scale);
+    result.add_columns(grid.columns());
+    result.add_rows(grid.rows());
+    result.add_means(means_offset);
+    return result.Finish();
+  };
+  std::vector<flatbuffers::Offset<calibration::LensValidation>> lenses;
+  for (const LensChecks &checks : validations_) {
+    std::vector<flatbuffers::Offset<calibration::CheckResult>> results;
+    if (Checking(ValidationCheck::STRAIGHTNESS)) {
+      results.push_back(pack(ValidationCheck::STRAIGHTNESS, "corner error, px",
+                             checks.straightness_px, 1.0));
+    }
+    if (Checking(ValidationCheck::RIGIDITY)) {
+      results.push_back(pack(ValidationCheck::RIGIDITY, "halves apart, mm",
+                             checks.rigidity_mm, 1.0));
+      results.push_back(pack(ValidationCheck::RIGIDITY,
+                             "halves' angle, degrees", checks.rigidity_deg,
+                             1.0));
+    }
+    std::vector<int> tag_ids;
+    if (Checking(ValidationCheck::TWO_TAG)) {
+      results.push_back(pack(ValidationCheck::TWO_TAG,
+                             "change in tags' distance, mm",
+                             checks.tags.DistanceGrid(), 1000.0));
+      results.push_back(pack(ValidationCheck::TWO_TAG,
+                             "change in tags' angle, degrees",
+                             checks.tags.AngleGrid(), 180.0 / M_PI));
+      if (const auto pair = checks.tags.pair()) {
+        tag_ids = {pair->first, pair->second};
+      }
+    }
+    const auto name = fbb->CreateString(checks.name);
+    const auto results_offset = fbb->CreateVector(results);
+    const auto tag_ids_offset = fbb->CreateVector(tag_ids);
+    calibration::LensValidation::Builder lens(*fbb);
+    lens.add_name(name);
+    lens.add_results(results_offset);
+    lens.add_tag_ids(tag_ids_offset);
+    lens.add_tag_distance_m(checks.tags.MedianDistance());
+    lenses.push_back(lens.Finish());
+  }
+  return fbb->CreateVector(lenses);
 }
 
 void CalibrationServer::SendStatus() {
@@ -711,6 +894,9 @@ flatbuffers::Offset<calibration::Session> CalibrationServer::PackSession(
     solve = builder.Finish();
   }
 
+  const auto validation = PackValidation(fbb);
+  const auto checks = fbb->CreateVector(checks_);
+
   calibration::Session::Builder session(*fbb);
   session.add_session_id(session_id);
   session.add_state(state_);
@@ -729,6 +915,8 @@ flatbuffers::Offset<calibration::Session> CalibrationServer::PackSession(
   if (!solve.IsNull()) {
     session.add_solve(solve);
   }
+  session.add_validation(validation);
+  session.add_checks(checks);
   return session.Finish();
 }
 

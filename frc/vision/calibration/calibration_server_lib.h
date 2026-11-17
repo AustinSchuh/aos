@@ -17,7 +17,9 @@
 #include "frc/vision/calibration/calibration_session_generated.h"
 #include "frc/vision/calibration/calibration_status_generated.h"
 #include "frc/vision/calibration/capture_gate.h"
+#include "frc/vision/calibration/charuco_detector.h"
 #include "frc/vision/calibration/intrinsics_solver.h"
+#include "frc/vision/calibration/validation.h"
 #include "frc/vision/camera_constants_generated.h"
 #include "frc/vision/util/charuco_board.h"
 #include "frc/vision/vision_generated.h"
@@ -48,6 +50,8 @@ class CalibrationServer {
     std::string board_store = "/home/pi/calibration/boards.json";
     // How often to look for the board.
     std::chrono::milliseconds period = std::chrono::milliseconds(100);
+    // The AprilTags' size for TWO_TAG, edge to edge of their black squares.
+    double tag_size = 6.5 * 0.0254;
   };
 
   CalibrationServer(aos::EventLoop *event_loop, Options options);
@@ -62,6 +66,16 @@ class CalibrationServer {
     CharucoCapture capture;
     cv::Vec3d rvec;
     cv::Vec3d tvec;
+  };
+
+  // One calibration's checks, over the frames looked at while validating.
+  struct LensChecks {
+    std::string name;
+    Lens lens;
+    ValidationGrid straightness_px;
+    ValidationGrid rigidity_mm;
+    ValidationGrid rigidity_deg;
+    TagPairTracker tags;
   };
 
   struct Solved {
@@ -85,6 +99,13 @@ class CalibrationServer {
   // Picks up a finished solve.
   void CollectSolve();
   void CapturesChanged();
+
+  absl::Status Validate(const calibration::Command &command);
+  void Measure(const cv::Mat &gray, const CharucoDetection &detection);
+  bool Checking(calibration::ValidationCheck check) const;
+  flatbuffers::Offset<
+      flatbuffers::Vector<flatbuffers::Offset<calibration::LensValidation>>>
+  PackValidation(flatbuffers::FlatBufferBuilder *fbb) const;
 
   void SendStatus();
   void MaybeSendSession();
@@ -144,6 +165,10 @@ class CalibrationServer {
   aos::monotonic_clock::time_point last_image_time_ =
       aos::monotonic_clock::min_time;
   int64_t last_image_timestamp_ns_ = -1;
+
+  // Validation: the checks asked for, and each calibration's measurements.
+  std::vector<calibration::ValidationCheck> checks_;
+  std::vector<LensChecks> validations_;
 
   std::string error_;
   int ticks_ = 0;
