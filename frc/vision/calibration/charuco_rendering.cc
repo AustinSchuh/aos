@@ -37,9 +37,11 @@ std::pair<cv::Mat, cv::Mat> Flat(const cv::Ptr<cv::aruco::CharucoBoard> &board,
   const double scale = pixels_per_square / board->getSquareLength();
   const CharucoDetection detection =
       DetectCharuco(board, flat,
-                    (cv::Mat_<double>(3, 3) << 1000, 0, size.width / 2.0, 0,
-                     1000, size.height / 2.0, 0, 0, 1),
-                    cv::Mat::zeros(5, 1, CV_64F));
+                    CameraLens{.camera_matrix = (cv::Mat_<double>(3, 3) << 1000,
+                                                 0, size.width / 2.0, 0, 1000,
+                                                 size.height / 2.0, 0, 0, 1),
+                               .dist_coeffs = cv::Mat::zeros(5, 1, CV_64F),
+                               .kannala_brandt = false});
   const std::vector<cv::Point3f> corners = Corners(board);
   cv::Mat best;
   double best_error = INFINITY;

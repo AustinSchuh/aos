@@ -31,8 +31,11 @@ Rendered Render(const cv::Ptr<cv::aruco::CharucoBoard> &board,
 // distance from them.
 std::pair<cv::Point2f, double> DetectionError(
     const cv::Ptr<cv::aruco::CharucoBoard> &board, const Rendered &rendered) {
-  const CharucoDetection detection = DetectCharuco(
-      board, rendered.image, CameraMatrix(), cv::Mat::zeros(5, 1, CV_64F));
+  const CharucoDetection detection =
+      DetectCharuco(board, rendered.image,
+                    CameraLens{.camera_matrix = CameraMatrix(),
+                               .dist_coeffs = cv::Mat::zeros(5, 1, CV_64F),
+                               .kannala_brandt = false});
   EXPECT_GT(detection.ids.size(), 30u);
   double sum = 0;
   cv::Point2f mean(0, 0);

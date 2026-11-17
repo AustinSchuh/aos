@@ -49,6 +49,12 @@ int16_t Hundredths(float pixels) {
       std::clamp(std::lround(pixels * 100.0f), -32767l, 32767l));
 }
 
+calibration::DistortionModel DistortionModelOf(LensModel model) {
+  return model == LensModel::kKannalaBrandt
+             ? calibration::DistortionModel::KANNALA_BRANDT
+             : calibration::DistortionModel::OPENCV;
+}
+
 Eigen::Affine3d Pose(const cv::Vec3d &rvec, const cv::Vec3d &tvec) {
   const Eigen::Vector3d r(rvec[0], rvec[1], rvec[2]);
   const double angle = r.norm();
@@ -238,13 +244,13 @@ absl::Status CalibrationServer::Execute(const calibration::Command &command) {
       solve_error_.clear();
       state_ = SessionState::SOLVING;
       // A second or so: off the event loop's thread, so it keeps reporting.
-      solving_ = std::async(std::launch::async, [board = cv_board_,
-                                                 captures = std::move(captures),
-                                                 image_size = image_size_,
-                                                 matrix = guess_matrix_.clone(),
-                                                 dist = guess_dist_.clone()]() {
-        return SolveIntrinsics(board, captures, image_size, matrix, dist, true);
-      });
+      solving_ =
+          std::async(std::launch::async,
+                     [board = cv_board_, captures = std::move(captures),
+                      image_size = image_size_, guess = guess_]() {
+                       return SolveIntrinsics(board, captures, image_size,
+                                              guess, SolveOptions{});
+                     });
       return absl::OkStatus();
     }
     case CommandAction::SAVE:
@@ -399,20 +405,22 @@ absl::Status CalibrationServer::UseBoard(const BoardSpec &board) {
 }
 
 void CalibrationServer::UpdateGuess() {
-  if (current_.has_value()) {
-    guess_matrix_ = CameraIntrinsics(&current_->message());
-    guess_matrix_.convertTo(guess_matrix_, CV_64F);
-    if (current_->message().has_dist_coeffs()) {
-      CameraDistCoeffs(&current_->message()).convertTo(guess_dist_, CV_64F);
-    } else {
-      guess_dist_ = cv::Mat::zeros(8, 1, CV_64F);
-    }
+  if (current_.has_value() && current_->message().has_dist_coeffs()) {
+    guess_ = CameraLens::FromCalibration(&current_->message());
+  } else if (current_.has_value()) {
+    guess_ = CameraLens{
+        .camera_matrix = CameraIntrinsics(&current_->message()).clone(),
+        .dist_coeffs = cv::Mat::zeros(5, 1, CV_64F),
+        .kannala_brandt = false};
+    guess_.camera_matrix.convertTo(guess_.camera_matrix, CV_64F);
   } else if (image_size_.width > 0) {
-    // A 60 degree field of view, centred.
+    // A 60 degree field of view, centred, and no distortion.
     const double f = image_size_.width * 0.87;
-    guess_matrix_ = (cv::Mat_<double>(3, 3) << f, 0, image_size_.width / 2.0, 0,
-                     f, image_size_.height / 2.0, 0, 0, 1);
-    guess_dist_ = cv::Mat::zeros(8, 1, CV_64F);
+    guess_ = CameraLens{.camera_matrix = (cv::Mat_<double>(3, 3) << f, 0,
+                                          image_size_.width / 2.0, 0, f,
+                                          image_size_.height / 2.0, 0, 0, 1),
+                        .dist_coeffs = cv::Mat::zeros(5, 1, CV_64F),
+                        .kannala_brandt = false};
   }
 }
 
@@ -448,13 +456,12 @@ void CalibrationServer::LookAtImage(const CameraImage &image) {
     UpdateGuess();
     session_dirty_ = true;
   }
-  if (guess_matrix_.empty()) {
+  if (guess_.camera_matrix.empty()) {
     return;
   }
   const cv::Mat gray(image.rows(), image.cols(), CV_8UC1,
                      const_cast<uint8_t *>(image.data()->data()));
-  const CharucoDetection detection =
-      DetectCharuco(cv_board_, gray, guess_matrix_, guess_dist_);
+  const CharucoDetection detection = DetectCharuco(cv_board_, gray, guess_);
   corners_ = detection.ids.size();
 
   {
@@ -546,7 +553,8 @@ void CalibrationServer::CollectSolve() {
           solution->camera_matrix, solution->dist_coeffs,
           event_loop_->realtime_now(), options_.node_name,
           absl::StrCat("/camera", camera_), camera_id_, options_.team_number,
-          solution->reprojection_error, board_);
+          solution->reprojection_error, board_,
+          DistortionModelOf(solution->model));
   const absl::Status validation = ValidateCalibration(
       calibration.message(), image_size_.width, image_size_.height);
   solved_.emplace(Solved{.solution = *std::move(solution),
@@ -574,7 +582,8 @@ absl::Status CalibrationServer::Save(bool force) {
   solved_->calibration = IntrinsicsCalibration::BuildCalibration(
       solved_->solution.camera_matrix, solved_->solution.dist_coeffs, now,
       options_.node_name, absl::StrCat("/camera", camera_), camera_id_,
-      options_.team_number, solved_->solution.reprojection_error, board_);
+      options_.team_number, solved_->solution.reprojection_error, board_,
+      DistortionModelOf(solved_->solution.model));
   std::stringstream time;
   time << now;
   const std::string path = CalibrationFilename(
@@ -617,12 +626,9 @@ absl::Status CalibrationServer::Validate(const calibration::Command &command) {
   checks_.assign(command.checks()->begin(), command.checks()->end());
   validations_.clear();
   validations_.push_back(
-      checks(current_.has_value() ? "current" : "starting guess",
-             Lens{guess_matrix_.clone(), guess_dist_.clone()}));
+      checks(current_.has_value() ? "current" : "starting guess", guess_));
   if (command.validate_solved()) {
-    validations_.push_back(
-        checks("solved", Lens{solved_->solution.camera_matrix.clone(),
-                              solved_->solution.dist_coeffs.clone()}));
+    validations_.push_back(checks("solved", SolutionLens(solved_->solution)));
   }
   capture_next_ = false;
   state_ = SessionState::VALIDATING;

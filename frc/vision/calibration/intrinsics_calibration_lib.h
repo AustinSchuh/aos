@@ -67,7 +67,9 @@ class IntrinsicsCalibration {
                    std::string_view node_name, std::string_view camera_channel,
                    std::string_view camera_id, uint16_t team_number,
                    double reprojection_error,
-                   std::optional<BoardSpec> board = std::nullopt);
+                   std::optional<BoardSpec> board = std::nullopt,
+                   calibration::DistortionModel distortion_model =
+                       calibration::DistortionModel::OPENCV);
 
   // Writes calibration to filename if it passes ValidateCalibration at
   // image_size, or --write_invalid_calibration says to write it anyway.

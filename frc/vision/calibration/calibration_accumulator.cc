@@ -240,11 +240,8 @@ void Calibration::HandleCharuco(
 
   if (absl::GetFlag(FLAGS_visualize)) {
     if (absl::GetFlag(FLAGS_display_undistorted)) {
-      const cv::Size image_size(rgb_image.cols, rgb_image.rows);
-      cv::Mat undistorted_rgb_image(image_size, CV_8UC3);
-      cv::undistort(rgb_image, undistorted_rgb_image,
-                    charuco_extractor_.camera_matrix(),
-                    charuco_extractor_.dist_coeffs());
+      const cv::Mat undistorted_rgb_image =
+          charuco_extractor_.lens().UndistortImage(rgb_image);
 
       cv::imshow("Display undist", undistorted_rgb_image);
     }

@@ -19,6 +19,7 @@
 #include "aos/network/message_bridge_server_generated.h"
 #include "frc/vision/calibration_generated.h"
 #include "frc/vision/util/charuco_board.h"
+#include "frc/vision/util/vision_util_lib.h"
 #include "frc/vision/vision_generated.h"
 
 ABSL_DECLARE_FLAG(bool, visualize);
@@ -38,10 +39,14 @@ class CameraCalibration {
   // Distortion coefficients for the located camera.
   cv::Mat CameraDistCoeffs() const { return dist_coeffs_; }
 
+  // The lens, to undistort, project and fit poses with whatever its model.
+  const CameraLens &Lens() const { return lens_; }
+
  private:
   const cv::Mat intrinsics_;
   const Eigen::Matrix3d intrinsics_eigen_;
   const cv::Mat dist_coeffs_;
+  const CameraLens lens_;
 };
 
 // Helper class to call a function with a CameraImage flatbuffer and age when an
@@ -174,6 +179,8 @@ class CharucoExtractor {
   }
   // Returns the distortion coefficients for this camera.
   const cv::Mat dist_coeffs() const { return calibration_.CameraDistCoeffs(); }
+  // Returns the lens, to undistort and project whatever its model.
+  const CameraLens &lens() const { return calibration_.Lens(); }
 
  private:
   // Creates the dictionary, board, and other parameters for the appropriate

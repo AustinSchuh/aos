@@ -7,6 +7,8 @@
 #include "opencv2/aruco/charuco.hpp"
 #include "opencv2/core.hpp"
 
+#include "frc/vision/util/vision_util_lib.h"
+
 namespace frc::vision {
 
 // How a lens bends light, as a solve models it.
@@ -73,6 +75,16 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
     const cv::Mat &camera_matrix, const cv::Mat &dist_coeffs,
     const SolveOptions &options);
 
+// As above, starting from `guess`, in either model: its distortion starts the
+// solve if it's in the model being solved, and its poses always do.
+absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
+    const cv::Ptr<cv::aruco::CharucoBoard> &board,
+    const std::vector<CharucoCapture> &captures, cv::Size image_size,
+    const CameraLens &guess, const SolveOptions &options);
+
+// The lens a solution describes, to undistort and project with.
+CameraLens SolutionLens(const IntrinsicsSolution &solution);
+
 // As above, with OpenCV's rational model if `rational_model`, else its 5.
 absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
     const cv::Ptr<cv::aruco::CharucoBoard> &board,
@@ -84,6 +96,18 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
 // fitted with the intrinsics held, then the RMS of every corner's error, in
 // pixels.  What a fit's own error can't show: a model fitting its captures'
 // noise.
+// Each corner of captures `solution` wasn't solved from, where it is in the
+// image, and its error (observed less projected), each board's pose fitted
+// with the intrinsics held.
+struct CornerResidual {
+  cv::Point2f corner;
+  cv::Point2f residual;
+};
+absl::StatusOr<std::vector<CornerResidual>> HeldOutResiduals(
+    const cv::Ptr<cv::aruco::CharucoBoard> &board,
+    const std::vector<CharucoCapture> &captures,
+    const IntrinsicsSolution &solution);
+
 absl::StatusOr<double> HeldOutError(
     const cv::Ptr<cv::aruco::CharucoBoard> &board,
     const std::vector<CharucoCapture> &captures,

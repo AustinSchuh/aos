@@ -174,13 +174,12 @@ absl::StatusOr<std::vector<cv::Point3f>> ObjectPoints(
   return points;
 }
 
-// A rough pose for a capture, from a camera matrix and OpenCV distortion
-// coefficients (empty for none).
+// A rough pose for a capture, through `lens`.
 std::optional<std::array<double, 6>> StartingPose(
     const std::vector<cv::Point3f> &object, const CharucoCapture &capture,
-    const cv::Mat &matrix, const cv::Mat &dist_coeffs) {
+    const CameraLens &lens) {
   cv::Vec3d rvec, tvec;
-  if (!cv::solvePnP(object, capture.corners, matrix, dist_coeffs, rvec, tvec)) {
+  if (!lens.SolvePnP(object, capture.corners, rvec, tvec)) {
     return std::nullopt;
   }
   return std::array<double, 6>{rvec[0], rvec[1], rvec[2],
@@ -227,11 +226,31 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
                    .denominator_sigma = 0.0});
 }
 
+CameraLens SolutionLens(const IntrinsicsSolution &solution) {
+  return CameraLens{
+      .camera_matrix = solution.camera_matrix,
+      .dist_coeffs = solution.dist_coeffs,
+      .kannala_brandt = solution.model == LensModel::kKannalaBrandt};
+}
+
 absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
     const cv::Ptr<cv::aruco::CharucoBoard> &board,
     const std::vector<CharucoCapture> &captures, cv::Size image_size,
     const cv::Mat &camera_matrix, const cv::Mat &dist_coeffs,
     const SolveOptions &solve_options) {
+  return SolveIntrinsics(board, captures, image_size,
+                         CameraLens{.camera_matrix = camera_matrix,
+                                    .dist_coeffs = dist_coeffs,
+                                    .kannala_brandt = false},
+                         solve_options);
+}
+
+absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
+    const cv::Ptr<cv::aruco::CharucoBoard> &board,
+    const std::vector<CharucoCapture> &captures, cv::Size image_size,
+    const CameraLens &guess, const SolveOptions &solve_options) {
+  const cv::Mat &camera_matrix = guess.camera_matrix;
+  const cv::Mat &dist_coeffs = guess.dist_coeffs;
   const LensModel model = solve_options.model;
   if (captures.size() < 4) {
     return absl::FailedPreconditionError(absl::StrCat(
@@ -258,7 +277,7 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
   // The guess's distortion only means something in the guess's model: start
   // other models from none.
   double distortion[kDistortionTerms] = {};
-  if (model != LensModel::kKannalaBrandt) {
+  if ((model == LensModel::kKannalaBrandt) == guess.kannala_brandt) {
     for (int i = 0; i < std::min<int>(guess_dist.total(), Terms(model)); ++i) {
       distortion[i] = guess_dist.at<double>(i);
     }
@@ -266,15 +285,18 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
 
   // Each board's pose from the guess, distortion and all, to start from:
   // whatever the model being solved, the guess's poses are close.
-  const cv::Mat start_matrix =
+  CameraLens start = guess;
+  start.camera_matrix =
       (cv::Mat_<double>(3, 3) << intrinsics[0], 0, intrinsics[2], 0,
        intrinsics[1], intrinsics[3], 0, 0, 1);
-  const cv::Mat start_dist =
-      guess_dist.total() == 4 || guess_dist.total() == 5 ||
-              guess_dist.total() == 8 || guess_dist.total() == 12 ||
-              guess_dist.total() == 14
-          ? guess_dist
-          : cv::Mat();
+  const size_t guess_terms = guess_dist.total();
+  if (guess.kannala_brandt
+          ? guess_terms != 4
+          : (guess_terms != 4 && guess_terms != 5 && guess_terms != 8 &&
+             guess_terms != 12 && guess_terms != 14)) {
+    start.dist_coeffs = cv::Mat();
+    start.kannala_brandt = false;
+  }
   std::vector<std::array<double, 6>> poses(captures.size());
   std::vector<std::vector<cv::Point3f>> object_points(captures.size());
   for (size_t i = 0; i < captures.size(); ++i) {
@@ -285,7 +307,7 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
     }
     object_points[i] = *std::move(points);
     const std::optional<std::array<double, 6>> pose =
-        StartingPose(object_points[i], captures[i], start_matrix, start_dist);
+        StartingPose(object_points[i], captures[i], start);
     if (!pose.has_value()) {
       return absl::FailedPreconditionError(
           absl::StrCat("Couldn't find the board's pose in capture ", i));
@@ -377,7 +399,7 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
   return solution;
 }
 
-absl::StatusOr<double> HeldOutError(
+absl::StatusOr<std::vector<CornerResidual>> HeldOutResiduals(
     const cv::Ptr<cv::aruco::CharucoBoard> &board,
     const std::vector<CharucoCapture> &captures,
     const IntrinsicsSolution &solution) {
@@ -391,20 +413,15 @@ absl::StatusOr<double> HeldOutError(
        i < std::min<int>(solution.dist_coeffs.total(), kDistortionTerms); ++i) {
     distortion[i] = solution.dist_coeffs.at<double>(i);
   }
-  double total_squared = 0.0;
-  size_t total_corners = 0;
+  std::vector<CornerResidual> residuals;
   for (size_t i = 0; i < captures.size(); ++i) {
     absl::StatusOr<std::vector<cv::Point3f>> points =
         ObjectPoints(board_corners, captures[i], i);
     if (!points.ok()) {
       return points.status();
     }
-    // OpenCV can start from the OpenCV models' coefficients; Kannala-Brandt
-    // starts from none, and the fit below takes it from there.
-    std::optional<std::array<double, 6>> pose = StartingPose(
-        *points, captures[i], solution.camera_matrix,
-        solution.model == LensModel::kKannalaBrandt ? cv::Mat()
-                                                    : solution.dist_coeffs);
+    std::optional<std::array<double, 6>> pose =
+        StartingPose(*points, captures[i], SolutionLens(solution));
     if (!pose.has_value()) {
       return absl::FailedPreconditionError(
           absl::StrCat("Couldn't find the board's pose in capture ", i));
@@ -426,15 +443,30 @@ absl::StatusOr<double> HeldOutError(
       double u, v;
       Project(solution.model, intrinsics, distortion, pose->data(),
               (*points)[j], &u, &v);
-      const cv::Point2f residual = captures[i].corners[j] - cv::Point2f(u, v);
-      total_squared += residual.dot(residual);
+      residuals.push_back(
+          {captures[i].corners[j], captures[i].corners[j] - cv::Point2f(u, v)});
     }
-    total_corners += points->size();
   }
-  if (total_corners == 0) {
+  return residuals;
+}
+
+absl::StatusOr<double> HeldOutError(
+    const cv::Ptr<cv::aruco::CharucoBoard> &board,
+    const std::vector<CharucoCapture> &captures,
+    const IntrinsicsSolution &solution) {
+  absl::StatusOr<std::vector<CornerResidual>> residuals =
+      HeldOutResiduals(board, captures, solution);
+  if (!residuals.ok()) {
+    return residuals.status();
+  }
+  if (residuals->empty()) {
     return absl::InvalidArgumentError("No captures to measure against");
   }
-  return std::sqrt(total_squared / total_corners);
+  double total_squared = 0.0;
+  for (const CornerResidual &r : *residuals) {
+    total_squared += r.residual.dot(r.residual);
+  }
+  return std::sqrt(total_squared / residuals->size());
 }
 
 }  // namespace frc::vision

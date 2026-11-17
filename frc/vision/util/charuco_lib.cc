@@ -83,7 +83,8 @@ CameraCalibration::CameraCalibration(
                                  calibration->dist_coeffs()->data())));
         ABSL_CHECK_EQ(result.total(), calibration->dist_coeffs()->size());
         return result;
-      }()) {}
+      }()),
+      lens_(CameraLens::FromCalibration(calibration)) {}
 
 CameraImageCallback::CameraImageCallback(
     aos::EventLoop *event_loop, std::string_view channel,
@@ -359,16 +360,11 @@ void CharucoExtractor::DrawTargetPoses(cv::Mat rgb_image,
       ABSL_LOG(INFO) << "Skipping, due to z value too small: " << result.z();
     } else if (absl::GetFlag(FLAGS_draw_axes) == true) {
       result /= result.z();
-      if (target_type_ == TargetType::kCharuco ||
-          target_type_ == TargetType::kAprilTag) {
-        cv::drawFrameAxes(rgb_image, calibration_.CameraIntrinsics(),
-                          calibration_.CameraDistCoeffs(), rvecs[i], tvecs[i],
-                          square_length_);
-      } else {
-        cv::drawFrameAxes(rgb_image, calibration_.CameraIntrinsics(),
-                          calibration_.CameraDistCoeffs(), rvecs[i], tvecs[i],
-                          square_length_);
-      }
+      // Drawn without Kannala-Brandt's distortion, which drawFrameAxes
+      // doesn't take: near enough for a picture.
+      cv::drawFrameAxes(rgb_image, calibration_.Lens().camera_matrix,
+                        calibration_.Lens().PinholeDistCoeffs(), rvecs[i],
+                        tvecs[i], square_length_);
     }
     std::stringstream ss;
     ss << "tvec[" << i << "] = " << tvecs[i];
@@ -518,13 +514,20 @@ void CharucoExtractor::ProcessImage(
 
         std::vector<cv::Point2f> charuco_corners_with_calibration;
         std::vector<int> charuco_ids_with_calibration;
-
-        // This call uses a previous intrinsic calibration to get more
-        // accurate marker locations, for a better pose estimate
-        cv::aruco::interpolateCornersCharuco(
-            marker_corners, marker_ids, rgb_image, board_,
-            charuco_corners_with_calibration, charuco_ids_with_calibration,
-            calibration_.CameraIntrinsics(), calibration_.CameraDistCoeffs());
+        const CameraLens &lens = calibration_.Lens();
+        if (lens.kannala_brandt) {
+          // OpenCV's ChArUco functions take only its pinhole models: fit the
+          // pose to the corners, undistorted.
+          charuco_corners_with_calibration = lens.Undistort(charuco_corners);
+          charuco_ids_with_calibration = charuco_ids;
+        } else {
+          // This call uses a previous intrinsic calibration to get more
+          // accurate marker locations, for a better pose estimate
+          cv::aruco::interpolateCornersCharuco(
+              marker_corners, marker_ids, rgb_image, board_,
+              charuco_corners_with_calibration, charuco_ids_with_calibration,
+              calibration_.CameraIntrinsics(), calibration_.CameraDistCoeffs());
+        }
 
         if (charuco_ids.size() >= absl::GetFlag(FLAGS_min_charucos)) {
           if (absl::GetFlag(FLAGS_draw_axes)) {
@@ -535,8 +538,7 @@ void CharucoExtractor::ProcessImage(
           cv::Vec3d rvec, tvec;
           valid = cv::aruco::estimatePoseCharucoBoard(
               charuco_corners_with_calibration, charuco_ids_with_calibration,
-              board_, calibration_.CameraIntrinsics(),
-              calibration_.CameraDistCoeffs(), rvec, tvec);
+              board_, lens.camera_matrix, lens.PinholeDistCoeffs(), rvec, tvec);
 
           // if charuco pose is valid, return pose, with ids and corners
           if (valid) {
@@ -572,9 +574,15 @@ void CharucoExtractor::ProcessImage(
       // estimate pose for arucos doesn't return valid, so marking true
       valid = true;
       std::vector<cv::Vec3d> rvecs, tvecs;
+      const CameraLens &lens = calibration_.Lens();
+      std::vector<std::vector<cv::Point2f>> pose_corners;
+      for (const std::vector<cv::Point2f> &corners : marker_corners) {
+        pose_corners.push_back(lens.kannala_brandt ? lens.Undistort(corners)
+                                                   : corners);
+      }
       cv::aruco::estimatePoseSingleMarkers(
-          marker_corners, square_length_, calibration_.CameraIntrinsics(),
-          calibration_.CameraDistCoeffs(), rvecs, tvecs);
+          pose_corners, square_length_, lens.camera_matrix,
+          lens.PinholeDistCoeffs(), rvecs, tvecs);
       DrawTargetPoses(rgb_image, rvecs, tvecs);
       PackPoseResults(rvecs, tvecs, &rvecs_eigen, &tvecs_eigen);
 
@@ -616,9 +624,15 @@ void CharucoExtractor::ProcessImage(
           // true
           valid = true;
           std::vector<cv::Vec3d> rvecs, tvecs;
+          const CameraLens &lens = calibration_.Lens();
+          std::vector<std::vector<cv::Point2f>> pose_corners;
+          for (const std::vector<cv::Point2f> &corners : diamond_corners) {
+            pose_corners.push_back(lens.kannala_brandt ? lens.Undistort(corners)
+                                                       : corners);
+          }
           cv::aruco::estimatePoseSingleMarkers(
-              diamond_corners, square_length_, calibration_.CameraIntrinsics(),
-              calibration_.CameraDistCoeffs(), rvecs, tvecs);
+              pose_corners, square_length_, lens.camera_matrix,
+              lens.PinholeDistCoeffs(), rvecs, tvecs);
 
           DrawTargetPoses(rgb_image, rvecs, tvecs);
           PackPoseResults(rvecs, tvecs, &rvecs_eigen, &tvecs_eigen);
