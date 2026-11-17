@@ -93,6 +93,10 @@ TEST(CalibrationValidatorTest, RepoCalibrations) {
   for (const std::filesystem::directory_entry &file :
        std::filesystem::directory_iterator(
            ArtifactPath("frc/vision/constants"))) {
+    // Each robot's camera settings live beside its calibrations.
+    if (file.path().filename().string().starts_with("camera_settings_")) {
+      continue;
+    }
     const aos::FlatbufferDetachedBuffer<CameraCalibration> calibration =
         aos::JsonFileToFlatbuffer<CameraCalibration>(file.path().string());
     const auto size = team_sizes.find(calibration.message().team_number());

@@ -14,7 +14,9 @@ The code is grouped by what it does:
 - `util/`: libraries the rest share (ChArUco, geometry, `vision_util_lib`,
   `visualize_robot`).
 - `templates/`: the jinja2 template `constants.jinja2.json` is built from.
-- `constants/` and `test_calib_files/`: camera calibration JSON.
+- `constants/` and `test_calib_files/`: camera calibration JSON, and each
+  robot's camera settings (`camera_settings_<team>-<robot>.json`: image size,
+  exposure and gain).
 - `ceres/`: the pose graph solver.
 
 The flatbuffer schemas, the AOS config, `constants.json` and the deploy rule
