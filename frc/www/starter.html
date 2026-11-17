@@ -1,11 +1,131 @@
+<!doctype html>
 <html>
   <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Starter status</title>
     <script src="starter_main_bundle.min.js" defer></script>
-    <link rel="stylesheet" href="styles.css" />
+    <style>
+      /* Dark, as the vision page that embeds it.  Fixed column widths, so a
+         restarting app's state changing length moves nothing. */
+      :root {
+        --bg: #111418;
+        --panel: #1b2027;
+        --line: #2c333d;
+        --text: #e6e9ee;
+        --muted: #9aa4b2;
+        --ok: #3ccf6e;
+        --warn: #f0b429;
+        --bad: #e25c5c;
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 12px 16px;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.4 system-ui,
+          sans-serif;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      table {
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 100%;
+        min-width: 900px;
+      }
+      th,
+      td {
+        padding: 5px 10px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      th {
+        position: sticky;
+        top: 0;
+        background: var(--panel);
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      td.number {
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+      }
+      th.number {
+        text-align: right;
+      }
+      tbody tr:hover {
+        background: var(--panel);
+      }
+      .pill {
+        display: inline-block;
+        min-width: 7.5em;
+        padding: 1px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 600;
+        text-align: center;
+        border: 1px solid currentColor;
+      }
+      .ok {
+        color: var(--ok);
+        background: color-mix(in srgb, var(--ok) 14%, transparent);
+      }
+      .warn {
+        color: var(--warn);
+        background: color-mix(in srgb, var(--warn) 14%, transparent);
+      }
+      .bad {
+        color: var(--bad);
+        background: color-mix(in srgb, var(--bad) 14%, transparent);
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .empty {
+        color: var(--muted);
+        padding: 16px 0;
+      }
+    </style>
   </head>
   <body>
-    <div>
-      <div id="status_list"></div>
+    <div class="table-wrap">
+      <table>
+        <colgroup>
+          <col style="width: 24%" />
+          <col style="width: 8%" />
+          <col style="width: 11em" />
+          <col style="width: 8em" />
+          <col style="width: 7em" />
+          <col style="width: 10em" />
+          <col />
+          <col style="width: 13em" />
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Node</th>
+            <th>State</th>
+            <th class="number">Exit code</th>
+            <th class="number">PID</th>
+            <th class="number">Last start</th>
+            <th>Last stop reason</th>
+            <th>Binary</th>
+          </tr>
+        </thead>
+        <tbody id="status_list"></tbody>
+      </table>
     </div>
+    <p class="empty" id="empty">Waiting for starter's status…</p>
   </body>
 </html>
