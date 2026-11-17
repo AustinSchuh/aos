@@ -1,5 +1,6 @@
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
 
 #include "aos/events/shm_event_loop.h"
 #include "aos/init.h"
@@ -43,6 +44,7 @@ void CameraReaderMain() {
   // If the exposure flag is set to override the constants, use it.
   const int32_t exposure_flag = absl::GetFlag(FLAGS_exposure);
   if (exposure_flag >= 0) {
+    last_exposure = exposure_flag;
     if (exposure_flag > 0) {
       ABSL_LOG(INFO)
           << "Setting camera to Manual Exposure mode with exposure = "
@@ -59,7 +61,15 @@ void CameraReaderMain() {
                                         const CameraStreamSettings &settings) {
     if (settings.has_exposure_100us() &&
         settings.exposure_100us() != last_exposure) {
-      v4l2_reader.SetExposure(settings.exposure_100us());
+      // 0 is auto exposure, as in the constants.
+      if (settings.exposure_100us() == 0) {
+        ABSL_LOG(INFO) << "Switching to auto exposure";
+        v4l2_reader.UseAutoExposure();
+      } else {
+        ABSL_LOG(INFO) << "Setting exposure to "
+                       << settings.exposure_100us() / 10.0 << " ms";
+        v4l2_reader.SetExposure(settings.exposure_100us());
+      }
       last_exposure = settings.exposure_100us();
     }
 
