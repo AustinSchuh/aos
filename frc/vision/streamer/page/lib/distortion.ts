@@ -7,17 +7,36 @@ export interface Lens {
   fy: number;
   cx: number;
   cy: number;
-  /** k1, k2, p1, p2[, k3[, k4, k5, k6[, s1, s2, s3, s4[, τx, τy]]]]; τx and τy are ignored. */
+  /**
+   * OpenCV's k1, k2, p1, p2[, k3[, k4, k5, k6[, s1, s2, s3, s4[, τx, τy]]]] (τx and τy are
+   * ignored), or with `kannalaBrandt`, Kannala-Brandt's k1..k4.
+   */
   dist: number[];
+  kannalaBrandt?: boolean;
 }
 
-/** Where OpenCV's model puts the normalized, undistorted point (x, y) in the distorted image. */
+/**
+ * Where the model puts the normalized, undistorted point (x, y) in the distorted image: OpenCV's,
+ * or Kannala-Brandt's, whose distorted radius is a polynomial in the angle from the axis.
+ */
 export function distort(
   dist: number[],
   x: number,
   y: number,
+  kannalaBrandt = false,
 ): [number, number] {
   const c = (i: number) => dist[i] ?? 0;
+  if (kannalaBrandt) {
+    const r = Math.hypot(x, y);
+    if (r < 1e-12) {
+      return [x, y];
+    }
+    const theta = Math.atan(r);
+    const t2 = theta * theta;
+    const scale =
+      (theta * (1 + t2 * (c(0) + t2 * (c(1) + t2 * (c(2) + t2 * c(3)))))) / r;
+    return [x * scale, y * scale];
+  }
   const r2 = x * x + y * y;
   const r4 = r2 * r2;
   const r6 = r4 * r2;
@@ -44,18 +63,19 @@ export function undistort(
   dist: number[],
   xd: number,
   yd: number,
+  kannalaBrandt = false,
 ): [number, number] | null {
   let [x, y] = [xd, yd];
   const h = 1e-7;
   for (let i = 0; i < 30; ++i) {
-    const [fx, fy] = distort(dist, x, y);
+    const [fx, fy] = distort(dist, x, y, kannalaBrandt);
     const [ex, ey] = [fx - xd, fy - yd];
     if (Math.hypot(ex, ey) < 1e-10) {
       return [x, y];
     }
     // The Jacobian, by finite differences.
-    const [ax, ay] = distort(dist, x + h, y);
-    const [bx, by] = distort(dist, x, y + h);
+    const [ax, ay] = distort(dist, x + h, y, kannalaBrandt);
+    const [bx, by] = distort(dist, x, y + h, kannalaBrandt);
     const [j00, j10, j01, j11] = [
       (ax - fx) / h,
       (ay - fy) / h,
@@ -72,7 +92,7 @@ export function undistort(
       return null;
     }
   }
-  const [fx, fy] = distort(dist, x, y);
+  const [fx, fy] = distort(dist, x, y, kannalaBrandt);
   return Math.hypot(fx - xd, fy - yd) < 1e-6 ? [x, y] : null;
 }
 
@@ -89,6 +109,7 @@ export function displacement(
     lens.dist,
     (u - lens.cx) / lens.fx,
     (v - lens.cy) / lens.fy,
+    lens.kannalaBrandt ?? false,
   );
   if (point === null) {
     return null;
