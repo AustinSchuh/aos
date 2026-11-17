@@ -396,7 +396,10 @@ cc_library(
     hdrs = ["charuco_detector.h"],
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
-    deps = ["//third_party:opencv"],
+    deps = [
+        "//frc/vision/util:corner_refinement",
+        "//third_party:opencv",
+    ],
 )
 
 cc_library(
@@ -472,11 +475,24 @@ cc_test(
     deps = [
         ":calibration_server_lib",
         ":charuco_detector",
+        ":charuco_rendering",
         "//aos/events:simulated_event_loop",
         "//aos/testing:googletest",
         "//aos/testing:path",
         "//aos/testing:tmpdir",
         "//frc/vision/util:charuco_board",
+        "//third_party:opencv",
+    ],
+)
+
+cc_library(
+    name = "charuco_rendering",
+    testonly = True,
+    srcs = ["charuco_rendering.cc"],
+    hdrs = ["charuco_rendering.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":charuco_detector",
         "//third_party:opencv",
     ],
 )
@@ -487,6 +503,7 @@ cc_test(
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":charuco_detector",
+        ":charuco_rendering",
         "//aos/testing:googletest",
         "//frc/vision/util:charuco_board",
         "//third_party:opencv",

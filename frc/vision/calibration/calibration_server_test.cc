@@ -10,6 +10,7 @@
 #include "aos/testing/tmpdir.h"
 #include "frc/vision/calibration/calibration_server_lib.h"
 #include "frc/vision/calibration/charuco_detector.h"
+#include "frc/vision/calibration/charuco_rendering.h"
 
 namespace frc::vision::testing {
 namespace {
@@ -68,55 +69,21 @@ struct Args {
   }
 };
 
-// Draws a board, and maps its picture's pixels to the board's plane.
+// Draws a board as the true camera sees it.
 class BoardRenderer {
  public:
   explicit BoardRenderer(const BoardSpec &spec)
-      : board_(MakeCharucoBoard(spec)) {
-    const cv::Size size(spec.squares_x * 100, spec.squares_y * 100);
-#if CV_VERSION_MINOR >= 9
-    board_->generateImage(size, flat_, 0, 1);
-#else
-    board_->draw(size, flat_, 0, 1);
-#endif
-    // Find the corners in the flat picture to learn its mapping, whatever
-    // OpenCV's conventions.
-    const cv::Mat identity =
-        (cv::Mat_<double>(3, 3) << 1000, 0, size.width / 2.0, 0, 1000,
-         size.height / 2.0, 0, 0, 1);
-    const CharucoDetection detection =
-        DetectCharuco(board_, flat_, identity, cv::Mat::zeros(5, 1, CV_64F));
-#if CV_VERSION_MINOR >= 9
-    const std::vector<cv::Point3f> corners = board_->getChessboardCorners();
-#else
-    const std::vector<cv::Point3f> &corners = board_->chessboardCorners;
-#endif
-    std::vector<cv::Point2f> plane;
-    for (int id : detection.ids) {
-      plane.emplace_back(corners[id].x, corners[id].y);
-    }
-    flat_to_plane_ = cv::findHomography(detection.corners, plane);
-  }
+      : board_(MakeCharucoBoard(spec)) {}
 
-  // The board at a pose, board to camera, as the true camera sees it.
+  // The board at a pose, board to camera.
   cv::Mat Render(const cv::Vec3d &rvec, const cv::Vec3d &tvec) const {
-    cv::Mat R;
-    cv::Rodrigues(rvec, R);
-    cv::Mat plane_to_camera(3, 3, CV_64F);
-    R.col(0).copyTo(plane_to_camera.col(0));
-    R.col(1).copyTo(plane_to_camera.col(1));
-    cv::Mat(tvec).copyTo(plane_to_camera.col(2));
-    const cv::Mat H = TrueCameraMatrix() * plane_to_camera * flat_to_plane_;
-    cv::Mat image;
-    cv::warpPerspective(flat_, image, H, cv::Size(kWidth, kHeight),
-                        cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(255));
-    return image;
+    return RenderBoard(board_, TrueCameraMatrix(), cv::Size(kWidth, kHeight),
+                       rvec, tvec)
+        .image;
   }
 
  private:
   cv::Ptr<cv::aruco::CharucoBoard> board_;
-  cv::Mat flat_;
-  cv::Mat flat_to_plane_;
 };
 
 class CalibrationServerTest : public ::testing::Test {
@@ -366,7 +333,9 @@ TEST_F(CalibrationServerTest, CalibratesSavesAndRemembers) {
     ASSERT_TRUE(session.has_solve());
     const calibration::Solve &solve = *session.solve();
     EXPECT_EQ(solve.error()->string_view(), "");
-    EXPECT_LT(solve.reprojection_error(), 0.5);
+    // Its corners are found to a few hundredths of a pixel, so the solve
+    // fits them as well.
+    EXPECT_LT(solve.reprojection_error(), 0.05);
     EXPECT_EQ(solve.captures(), 11);
     ASSERT_EQ(solve.capture_errors()->size(), 11u);
     ASSERT_EQ(solve.residuals()->size(), 11u);
@@ -400,7 +369,7 @@ TEST_F(CalibrationServerTest, CalibratesSavesAndRemembers) {
     ASSERT_EQ(solved->results()->size(), 3u);
     const auto *straightness = solved->results()->Get(0);
     EXPECT_GT(straightness->frames(), 50);
-    EXPECT_LT(straightness->median(), 0.5);
+    EXPECT_LT(straightness->median(), 0.05);
     EXPECT_EQ(
         straightness->means()->size(),
         static_cast<size_t>(straightness->columns() * straightness->rows()));

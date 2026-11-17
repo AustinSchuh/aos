@@ -27,16 +27,9 @@ struct CharucoDetection {
   cv::Vec3d tvec;
 };
 
-// Refines `corners`, the inner corners of `board` found in `image`, with
-// cornerSubPix.  OpenCV 4.6's interpolateCornersCharuco leaves them about half
-// a pixel off in x and y; a shift every corner shares leaves no reprojection
-// error, but moves a calibration's principal point by as much.
-void RefineCorners(const cv::Ptr<cv::aruco::CharucoBoard> &board,
-                   const cv::Mat &image, std::vector<cv::Point2f> &corners);
-
 // Finds `board` in `image` (grayscale or BGR).  Interpolates the corners
 // twice: without the calibration, for a calibration to use (refined with
-// RefineCorners), and with it, for a better pose.
+// RefineCharucoCorners), and with it, for a better pose.
 CharucoDetection DetectCharuco(const cv::Ptr<cv::aruco::CharucoBoard> &board,
                                const cv::Mat &image,
                                const cv::Mat &camera_matrix,
