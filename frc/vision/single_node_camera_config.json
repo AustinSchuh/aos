@@ -620,6 +620,7 @@
       "user": "root",
       "args": [
         "--user=pi",
+        "--sendable-channels=/camera_settings:frc.vision.CameraStreamSettings",
         "--session-commands=/calibration:frc.vision.calibration.Command",
         "--session-app=calibration_server",
         "--session-stops=apriltag_detector0,apriltag_detector1,apriltag_detector2,apriltag_detector3",

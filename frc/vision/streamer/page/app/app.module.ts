@@ -4,6 +4,7 @@ import {BrowserModule} from '@angular/platform-browser';
 
 import {App} from './app';
 import {CalibratePanel} from './calibrate';
+import {CameraSettingsCard} from './camera_settings_card';
 import {CameraTile} from './camera_tile';
 import {DistortionMap} from './distortion_map';
 import {IntrinsicsCard} from './intrinsics_card';
@@ -14,6 +15,7 @@ import {ValidationGridView} from './validation_grid';
   declarations: [
     App,
     CalibratePanel,
+    CameraSettingsCard,
     CameraTile,
     DistortionMap,
     IntrinsicsCard,

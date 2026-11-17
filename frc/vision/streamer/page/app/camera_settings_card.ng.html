@@ -1,0 +1,44 @@
+<section class="card camera-settings">
+  <h2>Exposure and gain</h2>
+  <div class="setting-row">
+    <label for="exposure">Exposure</label>
+    <input
+      id="exposure"
+      type="range"
+      min="0"
+      [max]="steps"
+      [value]="slider"
+      [disabled]="!known || auto"
+      (input)="slide($event)"
+    />
+    <span class="setting-value">{{ exposureText }}</span>
+    <label class="setting-auto">
+      <input
+        type="checkbox"
+        [checked]="known && auto"
+        [disabled]="!known"
+        (change)="setAuto($event)"
+      />
+      Auto
+    </label>
+  </div>
+  <div class="setting-row">
+    <label for="gain">Gain</label>
+    <input
+      id="gain"
+      type="number"
+      min="0"
+      step="1"
+      [value]="gain ?? ''"
+      [disabled]="!known"
+      placeholder="driver default"
+      (change)="setGain($event)"
+    />
+  </div>
+  <p class="error" *ngIf="robot.settingsError">{{ robot.settingsError }}</p>
+  <p class="source">
+    Every camera's. Saved on the robot, so they hold across restarts and
+    deploys; a camera takes the nearest it can. Until set, the constants': {{
+    defaults }}.
+  </p>
+</section>

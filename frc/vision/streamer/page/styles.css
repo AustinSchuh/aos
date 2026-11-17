@@ -223,6 +223,52 @@ intrinsics-card dd,
   color: var(--warn);
 }
 
+.camera-settings .setting-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+
+.camera-settings .setting-row > label:first-child {
+  width: 4.5em;
+  color: var(--muted);
+}
+
+.camera-settings input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.camera-settings input[type="number"] {
+  width: 8em;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font: inherit;
+}
+
+.camera-settings .setting-value {
+  min-width: 4.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.camera-settings .setting-auto {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+
+.camera-settings .error {
+  color: var(--bad);
+  margin: 6px 0 0;
+}
+
 .matrix {
   border-collapse: collapse;
   font-variant-numeric: tabular-nums;

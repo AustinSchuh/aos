@@ -2,7 +2,13 @@ import {strict as assert} from 'node:assert';
 import {test} from 'node:test';
 
 import {
+  EXPOSURE_MAX_100US,
+  EXPOSURE_MIN_100US,
+  EXPOSURE_SLIDER_STEPS,
+  exposureMsText,
+  exposureSlider,
   exposureText,
+  sliderExposure,
   fixedWidth,
   gainText,
   sizeText,
@@ -96,4 +102,26 @@ test("a tile's line holds still as its numbers change", () => {
 test("a stream's size, once it has one", () => {
   assert.equal(streamSizeText(800, 652), '800×652');
   assert.equal(streamSizeText(null, 652), '–');
+});
+
+test('the exposure slider spans 0.1 ms to 33.3 ms, logarithmically', () => {
+  assert.equal(sliderExposure(0), EXPOSURE_MIN_100US);
+  assert.equal(sliderExposure(EXPOSURE_SLIDER_STEPS), EXPOSURE_MAX_100US);
+  // Halfway is the geometric mean, about 1.8 ms.
+  assert.equal(sliderExposure(EXPOSURE_SLIDER_STEPS / 2), 18);
+  // Out of range clamps.
+  assert.equal(sliderExposure(-5), EXPOSURE_MIN_100US);
+  assert.equal(exposureSlider(10000), EXPOSURE_SLIDER_STEPS);
+  assert.equal(exposureSlider(0), 0);
+});
+
+test('an exposure comes back from its slider position', () => {
+  for (const exposure of [1, 2, 15, 60, 100, 333]) {
+    assert.equal(sliderExposure(exposureSlider(exposure)), exposure);
+  }
+});
+
+test('an exposure is in ms, or auto for 0', () => {
+  assert.equal(exposureMsText(60), '6.0 ms');
+  assert.equal(exposureMsText(0), 'auto');
 });
