@@ -317,6 +317,14 @@ namespace {
 void UnDistortPixels(double *u, double *v, int count,
                      const CameraMatrix &camera_matrix,
                      const DistCoeffs &distortion_coefficients) {
+  if (distortion_coefficients.model == DistortionModel::kKannalaBrandt) {
+    // Newton's method converges in a few steps: no lanes needed.
+    for (int i = 0; i < count; ++i) {
+      UnDistort(&u[i], &v[i], camera_matrix, distortion_coefficients);
+    }
+    return;
+  }
+
   const double fx = camera_matrix.fx;
   const double cx = camera_matrix.cx;
   const double fy = camera_matrix.fy;

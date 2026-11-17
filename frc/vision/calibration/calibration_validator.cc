@@ -76,6 +76,21 @@ absl::Status CheckSanity(const calibration::CameraCalibration &calibration,
 
   const flatbuffers::Vector<float> *dist_coeffs = calibration.dist_coeffs();
   const size_t num_coeffs = dist_coeffs == nullptr ? 0 : dist_coeffs->size();
+  if (calibration.distortion_model() ==
+      calibration::DistortionModel::KANNALA_BRANDT) {
+    if (num_coeffs != 4) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("dist_coeffs has ", num_coeffs,
+                       " coefficients, but Kannala-Brandt has 4"));
+    }
+    if (!std::all_of(dist_coeffs->begin(), dist_coeffs->end(),
+                     [](float x) { return std::isfinite(x); })) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("dist_coeffs [", absl::StrJoin(*dist_coeffs, ", "),
+                       "] are not all finite"));
+    }
+    return absl::OkStatus();
+  }
   if (num_coeffs != 5 && num_coeffs != 8 && num_coeffs != 14) {
     return absl::InvalidArgumentError(
         absl::StrCat("dist_coeffs has ", num_coeffs,
@@ -172,6 +187,46 @@ void ScanRadialModel(const apriltag::DistCoeffs &dist_coeffs,
         report->limit_distorted_radius / max_distorted - 1;
     // With no undistorted radius, the distorted margin fails anyway.
     report->undistorted_margin = report->singular_radius / start_radius() - 1;
+  }
+}
+
+// ScanRadialModel for Kannala-Brandt, whose distorted radius is the angle
+// theta_d(theta) for the angle theta off the axis, at undistorted radius
+// tan(theta).  Its branch ends where theta_d stops increasing (a fold) or at
+// 90 degrees, past which nothing is in front of the camera; it has no pole or
+// zero, so N / D's limit is the branch's.
+void ScanKannalaBrandt(const apriltag::DistCoeffs &dist_coeffs,
+                       CalibrationReport *report) {
+  const double max_distorted = report->max_distorted_radius;
+  constexpr int kSteps = 100000;
+  // Just short of 90 degrees, where tan(theta) runs away.
+  const double max_theta = M_PI / 2 * (1 - 1e-6);
+  double distorted = 0;
+  report->limit_radius = std::tan(max_theta);
+  report->limit_reason = "90 degrees off the axis";
+  for (int i = 1; i <= kSteps; ++i) {
+    const double theta = max_theta * i / kSteps;
+    if (!(apriltag::KannalaBrandtSlope(dist_coeffs, theta) > 0)) {
+      report->limit_radius = std::tan(theta);
+      report->limit_reason = "fold, theta_d' <= 0";
+      break;
+    }
+    distorted = apriltag::KannalaBrandtThetaD(dist_coeffs, theta);
+    if (std::isnan(report->max_undistorted_radius) &&
+        distorted >= max_distorted) {
+      report->max_undistorted_radius = std::tan(theta);
+    }
+  }
+  report->limit_distorted_radius = distorted;
+  report->singular_radius = report->limit_radius;
+  report->singular_reason = report->limit_reason;
+  if (max_distorted > 0) {
+    report->distorted_margin = distorted / max_distorted - 1;
+    const double start =
+        std::max(max_distorted, std::isnan(report->max_undistorted_radius)
+                                    ? 0.0
+                                    : report->max_undistorted_radius);
+    report->undistorted_margin = report->singular_radius / start - 1;
   }
 }
 
@@ -419,7 +474,11 @@ absl::Status ValidateCalibration(
   }
 
   std::vector<std::string> problems;
-  ScanRadialModel(dist_coeffs, report);
+  if (dist_coeffs.model == apriltag::DistortionModel::kKannalaBrandt) {
+    ScanKannalaBrandt(dist_coeffs, report);
+  } else {
+    ScanRadialModel(dist_coeffs, report);
+  }
   if (!(report->distorted_margin >= kRadialMargin &&
         report->undistorted_margin >= kRadialMargin)) {
     report->failed_check = CalibrationCheck::kRadialModel;

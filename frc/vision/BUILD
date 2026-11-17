@@ -46,6 +46,7 @@ flatbuffer_ts_library(
     ts_files = [
         "frc/vision/calibration.ts",
         "frc/vision/calibration/transformation-matrix.ts",
+        "frc/vision/calibration/distortion-model.ts",
         "frc/vision/calibration/board-spec.ts",
         "frc/vision/calibration/camera-calibration.ts",
         "frc/vision/calibration/calibration-data.ts",
