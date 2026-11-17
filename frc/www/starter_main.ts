@@ -6,6 +6,4 @@ const conn = new Connection();
 
 conn.connect();
 
-const starterHandler = new StarterHandler(conn);
-
-starterHandler.draw();
+new StarterHandler(conn);
