@@ -57,8 +57,6 @@ IntrinsicsCalibration::IntrinsicsCalibration(
       camera_channel_(camera_channel),
       camera_id_(camera_id),
       reprojection_error_(std::numeric_limits<double>::max()),
-      prev_H_board_camera_(Eigen::Affine3d::Identity()),
-      last_frame_H_board_camera_(Eigen::Affine3d::Identity()),
       base_intrinsics_(
           aos::JsonFileToFlatbuffer<calibration::CameraCalibration>(
               base_intrinsics_file)),
@@ -178,61 +176,21 @@ void IntrinsicsCalibration::HandleCharuco(
       << "Charuco board should only return one rotational pose. Returned "
       << rvecs_eigen.size();
 
-  // Calculate rotation and translation delta from last image stored to
-  // determine when to capture next image
-  Eigen::Affine3d H_camera_board =
+  const Eigen::Affine3d H_camera_board =
       Eigen::Translation3d(tvecs_eigen[0]) *
       Eigen::AngleAxisd(rvecs_eigen[0].norm(),
                         rvecs_eigen[0] / rvecs_eigen[0].norm());
-  Eigen::Affine3d H_delta_camera = H_camera_board * prev_H_board_camera_;
-
-  Eigen::AngleAxisd delta_r = Eigen::AngleAxisd(H_delta_camera.rotation());
-  Eigen::Vector3d delta_t = H_delta_camera.translation();
-
-  double r_norm = std::abs(delta_r.angle());
-  double t_norm = delta_t.norm();
-
-  bool store_image = false;
-  double percent_motion =
-      std::max<double>(r_norm / kDeltaRThreshold, t_norm / kDeltaTThreshold);
+  const CaptureGate::Decision decision = capture_gate_.Judge(H_camera_board);
+  bool store_image = decision.verdict == CaptureGate::Verdict::kCapture;
   ABSL_LOG(INFO) << "Captured: " << all_charuco_ids_.size()
-                 << " samples; \nMoved "
-                 << static_cast<int>(percent_motion * 100)
-                 << "% of what's needed";
-
-  // Verify that camera has moved enough from last stored image
-  if (r_norm > kDeltaRThreshold || t_norm > kDeltaTThreshold) {
-    // frame_ refers to deltas between current and last captured image
-    Eigen::Affine3d frame_H_delta_camera =
-        H_camera_board * last_frame_H_board_camera_;
-
-    Eigen::AngleAxisd frame_delta_r =
-        Eigen::AngleAxisd(frame_H_delta_camera.rotation());
-    Eigen::Vector3d frame_delta_t = frame_H_delta_camera.translation();
-
-    double frame_r_norm = std::abs(frame_delta_r.angle());
-    double frame_t_norm = frame_delta_t.norm();
-
-    // Make sure camera has stopped moving before storing image
-    store_image =
-        frame_r_norm < kFrameDeltaRLimit && frame_t_norm < kFrameDeltaTLimit;
-    double percent_stop = std::max<double>(frame_r_norm / kFrameDeltaRLimit,
-                                           frame_t_norm / kFrameDeltaTLimit);
-    ABSL_LOG(INFO) << "\nCaptured: " << all_charuco_ids_.size()
-                   << " samples; \nMoved enough ("
-                   << static_cast<int>(percent_motion * 100)
-                   << "%); Last motion was "
-                   << static_cast<int>(percent_stop * 100) << "% of limit. "
-                   << (store_image ? "Capturing image" : "Still need to stop");
-  }
-  last_frame_H_board_camera_ = H_camera_board.inverse();
-
-  if (all_charuco_ids_.empty() && valid) {
-    // If we haven't captured yet, and it's a valid pose, go ahead and store
-    // it, since we don't have a previous pose to reference
-    ABSL_LOG(INFO) << "Capturing first valid pose estimate";
-    store_image = true;
-  }
+                 << " samples; moved " << static_cast<int>(decision.moved * 100)
+                 << "% of what's needed"
+                 << (decision.verdict == CaptureGate::Verdict::kMoveToNewPose
+                         ? ""
+                         : absl::StrCat("; last motion was ",
+                                        static_cast<int>(decision.motion * 100),
+                                        "% of the limit"))
+                 << (store_image ? ". Capturing image" : "");
 
   if (absl::GetFlag(FLAGS_image_load_path) != "") {
     ABSL_LOG(INFO) << "Loading from disk, so capturing all images";
@@ -243,10 +201,6 @@ void IntrinsicsCalibration::HandleCharuco(
     // Protect from hitting capture key but then the image captured is bad
     if (charuco_ids.size() > 15) {
       ABSL_LOG(INFO) << "Manual capture triggered";
-      H_camera_board = prev_H_board_camera_;
-      if (!valid) {
-        invalid_images_saved_++;
-      }
       store_image = true;
     } else {
       ABSL_LOG(INFO) << "Manual attempt rejected due to too few features "
@@ -256,7 +210,7 @@ void IntrinsicsCalibration::HandleCharuco(
 
   if (store_image) {
     if (valid) {
-      prev_H_board_camera_ = H_camera_board.inverse();
+      capture_gate_.Captured(H_camera_board);
 
       // Unpack the Charuco ids from Vec4i
       std::vector<int> charuco_ids_int;
@@ -266,14 +220,6 @@ void IntrinsicsCalibration::HandleCharuco(
       all_charuco_ids_.emplace_back(std::move(charuco_ids_int));
       all_charuco_corners_.emplace_back(std::move(charuco_corners[0]));
 
-      if (r_norm > kDeltaRThreshold) {
-        ABSL_LOG(INFO) << "Triggered by rotation delta = " << r_norm << " > "
-                       << kDeltaRThreshold;
-      }
-      if (t_norm > kDeltaTThreshold) {
-        ABSL_LOG(INFO) << "Triggered by translation delta = " << t_norm << " > "
-                       << kDeltaTThreshold;
-      }
       if (absl::GetFlag(FLAGS_visualize)) {
         if (point_viz_image_.empty()) {
           point_viz_image_ = cv::Mat::zeros(mutable_rgb_image.size(), CV_8UC1);
@@ -304,12 +250,6 @@ void IntrinsicsCalibration::HandleCharuco(
         cv::imwrite(path, rgb_image);
       }
     }
-  }
-
-  // TODO<Jim>: Do we really need this?
-  if (invalid_images_saved_ > 0) {
-    ABSL_LOG(INFO) << "Captured " << invalid_images_saved_
-                   << " invalid images out of " << all_charuco_corners_.size();
   }
 }
 
@@ -346,8 +286,13 @@ IntrinsicsCalibration::BuildCalibration(
     cv::Mat camera_matrix, cv::Mat dist_coeffs,
     aos::realtime_clock::time_point realtime_now, std::string_view node_name,
     std::string_view camera_channel, std::string_view camera_id,
-    uint16_t team_number, double reprojection_error) {
+    uint16_t team_number, double reprojection_error,
+    std::optional<BoardSpec> board) {
   flatbuffers::FlatBufferBuilder fbb;
+  flatbuffers::Offset<calibration::BoardSpec> board_offset;
+  if (board.has_value()) {
+    board_offset = PackBoardSpec(&fbb, *board);
+  }
   flatbuffers::Offset<flatbuffers::String> name_offset =
       fbb.CreateString(node_name);
   flatbuffers::Offset<flatbuffers::String> camera_id_offset =
@@ -382,6 +327,9 @@ IntrinsicsCalibration::BuildCalibration(
       realtime_now.time_since_epoch().count());
   camera_calibration_builder.add_intrinsics(intrinsics_offset);
   camera_calibration_builder.add_dist_coeffs(distortion_coefficients_offset);
+  if (!board_offset.IsNull()) {
+    camera_calibration_builder.add_board(board_offset);
+  }
   fbb.Finish(camera_calibration_builder.Finish());
 
   return fbb.Release();
@@ -522,27 +470,26 @@ absl::Status IntrinsicsCalibration::MaybeCalibrate() {
     if (dist_coeffs_.empty()) {
       dist_coeffs_ = charuco_extractor_.dist_coeffs();
     }
-    cv::Mat std_deviations_intrinsics, std_deviations_extrinsics,
-        per_view_errors;
-    // Providing an initial guess of the intrinsics is very useful, even if it's
-    // just approximate or from an old camera
-    int calibration_flags = cv::CALIB_USE_INTRINSIC_GUESS;
-    if (absl::GetFlag(FLAGS_use_rational_model)) {
-      ABSL_LOG(INFO) << "Using rational (8-parameter) model";
-      calibration_flags |= cv::CALIB_RATIONAL_MODEL;
+    std::vector<CharucoCapture> captures;
+    for (size_t i = 0; i < all_charuco_ids_.size(); ++i) {
+      captures.push_back({all_charuco_ids_[i], all_charuco_corners_[i]});
     }
-    // Found that using at least 100 iterations helped get convergence to
-    // correct values
-    cv::TermCriteria term_crit = cv::TermCriteria(
-        cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 10000, 1e-12);
-    reprojection_error_ = cv::aruco::calibrateCameraCharuco(
-        all_charuco_corners_, all_charuco_ids_, charuco_extractor_.board(),
-        image_size_, camera_mat_, dist_coeffs_, rvecs_, tvecs_,
-        std_deviations_intrinsics, std_deviations_extrinsics, per_view_errors,
-        calibration_flags, term_crit);
-
-    ABSL_CHECK_LE(reprojection_error_, 5.0)
-        << ": Reproduction error is bad-- greater than 5 pixels.";
+    absl::StatusOr<IntrinsicsSolution> solution = SolveIntrinsics(
+        charuco_extractor_.board(), captures, image_size_, camera_mat_,
+        dist_coeffs_, absl::GetFlag(FLAGS_use_rational_model));
+    if (!solution.ok()) {
+      ABSL_LOG(ERROR) << solution.status();
+      return solution.status();
+    }
+    camera_mat_ = solution->camera_matrix;
+    dist_coeffs_ = solution->dist_coeffs;
+    reprojection_error_ = solution->reprojection_error;
+    rvecs_.clear();
+    tvecs_.clear();
+    for (size_t i = 0; i < solution->rvecs.size(); ++i) {
+      rvecs_.push_back(cv::Mat(solution->rvecs[i]).clone());
+      tvecs_.push_back(cv::Mat(solution->tvecs[i]).clone());
+    }
     if (reprojection_error_ < 1.0) {
       ABSL_LOG(INFO) << "Reprojection Error is " << reprojection_error_;
     } else {
@@ -557,10 +504,10 @@ absl::Status IntrinsicsCalibration::MaybeCalibrate() {
     ABSL_CHECK(team_number.has_value()) << ": Invalid hostname " << hostname_
                                         << ", failed to parse team number";
     aos::FlatbufferDetachedBuffer<calibration::CameraCalibration>
-        camera_calibration =
-            BuildCalibration(camera_mat_, dist_coeffs_, realtime_now,
-                             node_name_, camera_channel_, camera_id_,
-                             team_number.value(), reprojection_error_);
+        camera_calibration = BuildCalibration(
+            camera_mat_, dist_coeffs_, realtime_now, node_name_,
+            camera_channel_, camera_id_, team_number.value(),
+            reprojection_error_, BoardSpecFromFlags());
     std::stringstream time_ss;
     time_ss << realtime_now;
 

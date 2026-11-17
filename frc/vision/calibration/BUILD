@@ -53,6 +53,52 @@ cc_library(
 )
 
 cc_library(
+    name = "capture_gate",
+    srcs = ["capture_gate.cc"],
+    hdrs = ["capture_gate.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@eigen"],
+)
+
+cc_test(
+    name = "capture_gate_test",
+    srcs = ["capture_gate_test.cc"],
+    deps = [
+        ":capture_gate",
+        "//aos/testing:googletest",
+    ],
+)
+
+cc_library(
+    name = "intrinsics_solver",
+    srcs = ["intrinsics_solver.cc"],
+    hdrs = ["intrinsics_solver.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//third_party:opencv",
+        "@ceres-solver//:ceres",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "intrinsics_solver_test",
+    srcs = ["intrinsics_solver_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":intrinsics_solver",
+        "//aos/testing:googletest",
+        "//frc/vision/util:charuco_board",
+        "//third_party:opencv",
+        "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
+cc_library(
     name = "intrinsics_calibration_lib",
     srcs = [
         "intrinsics_calibration_lib.cc",
@@ -63,6 +109,8 @@ cc_library(
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":calibration_validator",
+        ":capture_gate",
+        ":intrinsics_solver",
         "//aos/events:event_loop",
         "//frc/control_loops/drivetrain:improved_down_estimator",
         "//frc/vision:vision_fbs",

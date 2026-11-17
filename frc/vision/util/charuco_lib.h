@@ -18,6 +18,7 @@
 #include "aos/events/event_loop.h"
 #include "aos/network/message_bridge_server_generated.h"
 #include "frc/vision/calibration_generated.h"
+#include "frc/vision/util/charuco_board.h"
 #include "frc/vision/vision_generated.h"
 
 ABSL_DECLARE_FLAG(bool, visualize);
@@ -102,6 +103,10 @@ class ImageCallback {
   CameraImageCallback camera_image_callback_;
   Format format_ = Format::BGR;
 };
+
+// The ChArUco board the flags (--dict5x5_9x14_board, --large_board,
+// --coarse_pattern, --twenty_inch_large_board) choose.
+BoardSpec BoardSpecFromFlags();
 
 // Types of targets that a CharucoExtractor can detect in images
 enum class TargetType : uint8_t {

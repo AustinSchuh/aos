@@ -6,6 +6,19 @@ table TransformationMatrix {
   data:[float] (id: 0);
 }
 
+// A ChArUco board, as a calibration is made with.
+table BoardSpec {
+  // The squares across and down.
+  squares_x:int (id: 0);
+  squares_y:int (id: 1);
+  // The side of a square, and of the ArUco marker in a white square, in
+  // meters, as measured on the printed board.
+  square_length:double (id: 2);
+  marker_length:double (id: 3);
+  // The markers' ArUco dictionary, by OpenCV's name, e.g. "DICT_5X5_100".
+  dictionary:string (id: 4);
+}
+
 // Calibration information for a given camera on a given robot.
 table CameraCalibration {
   // The name of the compute node which this calibration data applies to.
@@ -54,6 +67,9 @@ table CameraCalibration {
 
   // The reprojection error associated with the camera calibration.
   reprojection_error:float (id: 9);
+
+  // The board the intrinsics were calibrated with, if recorded.
+  board:BoardSpec (id: 10);
 }
 
 // Calibration information for all the cameras we know about.
