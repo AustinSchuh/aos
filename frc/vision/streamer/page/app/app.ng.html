@@ -60,15 +60,12 @@
         <dt>Camera {{ camera }} stream</dt>
         <dd>{{ streamSize(camera) }}</dd>
       </ng-container>
-      <dt>Exposure</dt>
-      <dd>{{ exposure }}</dd>
-      <dt>Gain</dt>
-      <dd>{{ gain }}</dd>
       <dt>Node</dt>
       <dd>{{ node }}</dd>
     </dl>
     <p class="source">From default_camera_stream_settings in /constants.</p>
   </section>
+  <camera-settings-card></camera-settings-card>
   <intrinsics-card
     *ngFor="let calibration of robot.calibrations"
     [calibration]="calibration"

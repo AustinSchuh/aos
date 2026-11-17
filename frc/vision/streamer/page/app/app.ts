@@ -1,13 +1,6 @@
 import {Component, HostListener, OnInit} from '@angular/core';
 
-import {
-  exposureText,
-  fixedWidth,
-  gainText,
-  sizeText,
-  streamSizeText,
-  tileLine,
-} from '../lib/format.js';
+import {fixedWidth, sizeText, streamSizeText, tileLine} from '../lib/format.js';
 import {sharedMax} from '../lib/distortion.js';
 import {CalibrationSession} from './calibration';
 import {NODE, Robot} from './robot';
@@ -49,6 +42,7 @@ export class App implements OnInit {
       visible && (this.tab === 'feeds' || this.tab === 'calibrate'),
     );
     this.robot.setPolling(visible && this.tab === 'feeds');
+    this.robot.setWatchingSettings(visible && this.tab === 'settings');
     this.calibration.setActive(visible && this.tab === 'calibrate');
   }
 
@@ -79,14 +73,6 @@ export class App implements OnInit {
       this.distortionMax = sharedMax(lenses, width, height);
     }
     return this.distortionMax;
-  }
-
-  get exposure(): string {
-    return exposureText(this.robot.settings);
-  }
-
-  get gain(): string {
-    return gainText(this.robot.settings);
   }
 
   get cameras(): number[] {

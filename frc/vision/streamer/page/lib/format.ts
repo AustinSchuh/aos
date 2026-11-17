@@ -118,3 +118,42 @@ export function streamSizeText(
 ): string {
   return width !== null && height !== null ? `${width}×${height}` : '–';
 }
+
+/**
+ * The exposure slider's range, in camera_reader's 100 us units: 0.1 ms, the least it can say,
+ * to 33.3 ms, a frame at 30 Hz.  Each camera takes the nearest it can.  The slider is
+ * logarithmic, so the short exposures a bright field needs get as much of it as the long ones.
+ */
+export const EXPOSURE_MIN_100US = 1;
+export const EXPOSURE_MAX_100US = 333;
+/** The slider's positions, 0 to this. */
+export const EXPOSURE_SLIDER_STEPS = 1000;
+
+/** The exposure, in 100 us units, at a slider position. */
+export function sliderExposure(position: number): number {
+  const t = Math.min(Math.max(position / EXPOSURE_SLIDER_STEPS, 0), 1);
+  const exposure =
+    EXPOSURE_MIN_100US * Math.pow(EXPOSURE_MAX_100US / EXPOSURE_MIN_100US, t);
+  return Math.min(
+    Math.max(Math.round(exposure), EXPOSURE_MIN_100US),
+    EXPOSURE_MAX_100US,
+  );
+}
+
+/** Where the slider sits for an exposure, in 100 us units. */
+export function exposureSlider(exposure100us: number): number {
+  const clamped = Math.min(
+    Math.max(exposure100us, EXPOSURE_MIN_100US),
+    EXPOSURE_MAX_100US,
+  );
+  return Math.round(
+    (Math.log(clamped / EXPOSURE_MIN_100US) /
+      Math.log(EXPOSURE_MAX_100US / EXPOSURE_MIN_100US)) *
+      EXPOSURE_SLIDER_STEPS,
+  );
+}
+
+/** An exposure: "6.0 ms", or "auto" for 0, as camera_reader takes it. */
+export function exposureMsText(exposure100us: number): string {
+  return exposure100us <= 0 ? 'auto' : `${(exposure100us / 10).toFixed(1)} ms`;
+}
