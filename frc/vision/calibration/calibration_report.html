@@ -1,0 +1,981 @@
+<title><!--REPORT_TITLE--> lens calibration</title>
+<meta name="claude:viewport-fit-sides" content="cover" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link
+  rel="stylesheet"
+  href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+/>
+<style>
+  /* Layout: one reading column of sections, comparisons side by side in a grid
+   that stacks on a phone; charts are drawn from the embedded report data. */
+  :root {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --fg: #15181d;
+    --muted: #5b6472;
+    --line: #dde1e7;
+    --grid: #eceff3;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --good: #1f7a45;
+    --good-bg: #e3f3e9;
+    --bad: #b8382a;
+    --bad-bg: #fbe7e3;
+    --ramp-0: #eef4fc;
+    --ramp-1: #b7d3f6;
+    --ramp-2: #6da7ec;
+    --ramp-3: #3987e5;
+    --ramp-4: #256abf;
+    --ramp-5: #184f95;
+    --ramp-6: #0d366b;
+    --none: #d4d7dc;
+    --display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+    --body: "Barlow", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #101216;
+      --surface: #171a1f;
+      --fg: #e5e8ec;
+      --muted: #98a1ae;
+      --line: #2a2f37;
+      --grid: #20242b;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --good: #57c287;
+      --good-bg: #16301f;
+      --bad: #ec7a68;
+      --bad-bg: #3a1c17;
+      --ramp-0: #142236;
+      --ramp-1: #104281;
+      --ramp-2: #184f95;
+      --ramp-3: #256abf;
+      --ramp-4: #3987e5;
+      --ramp-5: #86b6ef;
+      --ramp-6: #cde2fb;
+      --none: #2e333b;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #101216;
+    --surface: #171a1f;
+    --fg: #e5e8ec;
+    --muted: #98a1ae;
+    --line: #2a2f37;
+    --grid: #20242b;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --good: #57c287;
+    --good-bg: #16301f;
+    --bad: #ec7a68;
+    --bad-bg: #3a1c17;
+    --ramp-0: #142236;
+    --ramp-1: #104281;
+    --ramp-2: #184f95;
+    --ramp-3: #256abf;
+    --ramp-4: #3987e5;
+    --ramp-5: #86b6ef;
+    --ramp-6: #cde2fb;
+    --none: #2e333b;
+    color-scheme: dark;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 400 15px/1.55 var(--body);
+  }
+  .page {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 28px 56px;
+    display: grid;
+    gap: 40px;
+  }
+  h1,
+  h2,
+  h3 {
+    font-family: var(--display);
+    font-weight: 600;
+    text-wrap: balance;
+    margin: 0;
+    letter-spacing: 0.005em;
+  }
+  h1 {
+    font-size: 34px;
+    line-height: 1.1;
+  }
+  h2 {
+    font-size: 22px;
+  }
+  h3 {
+    font-size: 16px;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  p {
+    margin: 0;
+    max-width: 68ch;
+  }
+  .eyebrow {
+    font: 500 12px/1 var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  header {
+    display: grid;
+    gap: 10px;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .lead {
+    font-size: 17px;
+  }
+  section {
+    display: grid;
+    gap: 16px;
+    min-width: 0;
+  }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+    min-width: 0;
+  }
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+    gap: 16px;
+  }
+  .figure {
+    display: grid;
+    gap: 8px;
+    min-width: 0;
+  }
+  .figure canvas,
+  .figure img,
+  .figure svg {
+    width: 100%;
+    display: block;
+    border-radius: 4px;
+  }
+  .caption {
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .num,
+  td,
+  .mono {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .table-wrap {
+    overflow-x: auto;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 14px;
+  }
+  th,
+  td {
+    text-align: left;
+    padding: 8px 12px 8px 0;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    font: 500 13px/1.3 var(--body);
+    color: var(--muted);
+  }
+  td {
+    font-size: 13px;
+  }
+  thead th {
+    color: var(--fg);
+    font-family: var(--display);
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .key {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: 0;
+  }
+  .pill {
+    display: inline-block;
+    font: 500 12px/1 var(--body);
+    padding: 4px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .pill.good {
+    color: var(--good);
+    background: var(--good-bg);
+  }
+  .pill.bad {
+    color: var(--bad);
+    background: var(--bad-bg);
+  }
+  .why {
+    display: block;
+    margin-top: 6px;
+    color: var(--muted);
+    font: 12px/1.4 var(--body);
+    max-width: 46ch;
+  }
+  .best {
+    font-weight: 600;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    align-items: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .ramp {
+    width: 140px;
+    height: 8px;
+    border-radius: 4px;
+  }
+  .tip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--fg);
+    color: var(--bg);
+    font: 12px/1.4 var(--mono);
+    padding: 6px 8px;
+    border-radius: 4px;
+    z-index: 5;
+  }
+  .frames {
+    display: flex;
+    align-items: flex-end;
+    gap: 1px;
+    height: 120px;
+  }
+  .frames span {
+    flex: 1;
+    min-width: 1px;
+    background: var(--series-1);
+    border-radius: 1px 1px 0 0;
+  }
+  footer {
+    color: var(--muted);
+    font-size: 13px;
+    display: grid;
+    gap: 6px;
+  }
+</style>
+
+<div class="page">
+  <header>
+    <span class="eyebrow">Camera calibration report</span>
+    <h1 id="title"></h1>
+    <p class="meta" id="meta"></p>
+    <p class="lead" id="lead"></p>
+  </header>
+
+  <section>
+    <h2>The models side by side</h2>
+    <div class="panel table-wrap"><table id="summary"></table></div>
+    <p class="caption">
+      Held out: each model solved from every other frame, then measured on the
+      rest, fitting only each board's pose. Rigidity: on those frames, each half
+      of the board fitted alone; how far apart the halves put the board is the
+      error a small target such as an AprilTag sees.
+    </p>
+  </section>
+
+  <section>
+    <h2>The distortion each finds</h2>
+    <p>
+      How far undistorting moves each pixel, to where a pinhole camera with the
+      same focal length would see it. One scale for every map; arrows show the
+      direction, scaled to the grid. Gray: the model doesn't invert there.
+    </p>
+    <div class="cols" id="fields"></div>
+    <div class="legend" id="field-legend"></div>
+    <div class="figure panel" id="disagree-panel">
+      <h3>Where the models disagree</h3>
+      <canvas id="disagree"></canvas>
+      <p class="caption" id="disagree-caption"></p>
+    </div>
+  </section>
+
+  <section>
+    <h2>One frame, undistorted by each</h2>
+    <p id="showcase-text"></p>
+    <div class="cols" id="showcase"></div>
+  </section>
+
+  <section>
+    <h2>Where the board's corners were</h2>
+    <div class="cols">
+      <div class="figure panel">
+        <canvas id="coverage"></canvas>
+        <p class="caption" id="coverage-caption"></p>
+      </div>
+      <div class="figure panel">
+        <h3>Error on held-out frames, by distance from the image's centre</h3>
+        <svg id="radius" role="img" aria-label="Held-out error by radius"></svg>
+        <div class="legend" id="radius-legend"></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Each frame's error</h2>
+    <div class="panel figure">
+      <div class="frames" id="frames"></div>
+      <p class="caption" id="frames-caption"></p>
+    </div>
+  </section>
+
+  <footer id="footer"></footer>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+  const REPORT = /*REPORT_DATA*/ null;
+
+  const css = (name) =>
+    getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const fmt = (x, digits = 3) =>
+    x === null || x === undefined || Number.isNaN(x)
+      ? "–"
+      : Number(x).toFixed(digits);
+  const el = (tag, attrs = {}, text) => {
+    const e = document.createElementNS(
+      tag === "svg" || attrs.svg
+        ? "http://www.w3.org/2000/svg"
+        : "http://www.w3.org/1999/xhtml",
+      tag,
+    );
+    for (const [k, v] of Object.entries(attrs))
+      if (k !== "svg") e.setAttribute(k, v);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const seriesColor = (i) => css(`--series-${(i % 3) + 1}`);
+  const tip = document.getElementById("tip");
+  const showTip = (event, text) => {
+    tip.textContent = text;
+    tip.hidden = false;
+    tip.style.left = `${Math.min(event.clientX + 12, innerWidth - tip.offsetWidth - 8)}px`;
+    tip.style.top = `${event.clientY + 12}px`;
+  };
+  const hideTip = () => {
+    tip.hidden = true;
+  };
+
+  function hexRgb(hex) {
+    const h = hex.replace("#", "");
+    return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  }
+  function ramp(t) {
+    const stops = [0, 1, 2, 3, 4, 5, 6].map((i) => hexRgb(css(`--ramp-${i}`)));
+    const p = Math.min(Math.max(t, 0), 1) * (stops.length - 1);
+    const i = Math.min(Math.floor(p), stops.length - 2);
+    const f = p - i;
+    return stops[i].map((a, k) => Math.round(a + (stops[i + 1][k] - a) * f));
+  }
+
+  function sizeCanvas(canvas, aspect) {
+    const ratio = devicePixelRatio || 1;
+    const w = canvas.clientWidth || 320;
+    canvas.width = Math.round(w * ratio);
+    canvas.height = Math.round((w / aspect) * ratio);
+    return {
+      ctx: canvas.getContext("2d"),
+      w: canvas.width,
+      h: canvas.height,
+      ratio,
+    };
+  }
+
+  const R = REPORT;
+  const aspect = R.width / R.height;
+  const models = R.models;
+
+  function header() {
+    document.getElementById("title").textContent = R.title;
+    const b = R.board;
+    const ratio = b.marker_length / b.square_length;
+    document.getElementById("meta").textContent =
+      `${R.images} images at ${R.width}×${R.height} · board found in ${R.frames.length} · ` +
+      `${b.squares_x}×${b.squares_y} ChArUco, ${b.dictionary}, markers ${ratio.toFixed(3)} of a square` +
+      (b.marker_measured ? " (measured from the images)" : "");
+    const byHeld = [...models].sort((a, b) => a.held_out_rms - b.held_out_rms);
+    const valid = models.filter((m) => m.valid);
+    let lead = "";
+    if (models.length > 0) {
+      const best = byHeld[0];
+      lead = `${best.label} fits frames it wasn't solved from best, at ${fmt(best.held_out_rms)} px`;
+      if (byHeld.length > 1) {
+        lead += `, against ${byHeld
+          .slice(1)
+          .map((m) => `${fmt(m.held_out_rms)} px for ${m.label}`)
+          .join(" and ")}`;
+      }
+      lead += ". ";
+      lead +=
+        valid.length === models.length
+          ? "Every model passes validation."
+          : valid.length === 0
+            ? "No model passes validation."
+            : `${valid.map((m) => m.label).join(" and ")} passes validation; ${models
+                .filter((m) => !m.valid)
+                .map((m) => m.label)
+                .join(" and ")} doesn't.`;
+    }
+    document.getElementById("lead").textContent = lead;
+  }
+
+  function summary() {
+    const table = document.getElementById("summary");
+    table.replaceChildren();
+    const head = el("thead");
+    const hr = el("tr");
+    hr.append(el("th", {}, ""));
+    models.forEach((m, i) => {
+      const th = el("th");
+      const key = el("span", {class: "key"});
+      key.style.background = seriesColor(i);
+      th.append(key, document.createTextNode(m.label));
+      hr.append(th);
+    });
+    head.append(hr);
+    const body = el("tbody");
+    const bestOf = (get) => Math.min(...models.map(get));
+    const rows = [
+      [
+        "Error on held-out frames",
+        (m) => `${fmt(m.held_out_rms)} px`,
+        (m) => m.held_out_rms === bestOf((x) => x.held_out_rms),
+      ],
+      [
+        "Fit to every frame",
+        (m) => `${fmt(m.fit_rms)} px`,
+        (m) => m.fit_rms === bestOf((x) => x.fit_rms),
+      ],
+      [
+        "Rigidity, median",
+        (m) => `${fmt(m.rigidity_median_mm, 2)} mm`,
+        (m) => m.rigidity_median_mm === bestOf((x) => x.rigidity_median_mm),
+      ],
+      [
+        "Rigidity, 90th percentile",
+        (m) => `${fmt(m.rigidity_p90_mm, 2)} mm`,
+        (m) => m.rigidity_p90_mm === bestOf((x) => x.rigidity_p90_mm),
+      ],
+      ["Validation", null],
+      ["fx, fy", (m) => `${fmt(m.fx, 1)}, ${fmt(m.fy, 1)}`],
+      ["cx, cy", (m) => `${fmt(m.cx, 1)}, ${fmt(m.cy, 1)}`],
+      [
+        "Coefficients",
+        (m) =>
+          m.dist
+            .slice(0, 8)
+            .map((d) => d.toPrecision(3))
+            .join("  "),
+      ],
+      ["Calibration file", (m) => m.file],
+    ];
+    for (const [label, value, best] of rows) {
+      const tr = el("tr");
+      tr.append(el("th", {}, label));
+      for (const m of models) {
+        const td = el("td");
+        if (value === null) {
+          td.append(
+            el(
+              "span",
+              {class: `pill ${m.valid ? "good" : "bad"}`},
+              m.valid ? "Passes" : "Fails",
+            ),
+          );
+          if (!m.valid) td.append(el("span", {class: "why"}, m.validation));
+        } else {
+          td.textContent = value(m);
+          if (best && models.length > 1 && best(m)) td.classList.add("best");
+        }
+        tr.append(td);
+      }
+      body.append(tr);
+    }
+    table.append(head, body);
+  }
+
+  function magnitude(field, i) {
+    const dx = field.dx[i],
+      dy = field.dy[i];
+    return dx === null || dy === null ? null : Math.hypot(dx, dy);
+  }
+
+  function fields() {
+    const container = document.getElementById("fields");
+    container.replaceChildren();
+    let max = 0;
+    for (const m of models) {
+      for (let i = 0; i < m.field.dx.length; ++i) {
+        const v = magnitude(m.field, i);
+        if (v !== null) max = Math.max(max, v);
+      }
+    }
+    models.forEach((m, index) => {
+      const figure = el("div", {class: "figure panel"});
+      const title = el("h3");
+      const key = el("span", {class: "key"});
+      key.style.background = seriesColor(index);
+      title.append(key, document.createTextNode(m.label));
+      const canvas = el("canvas");
+      figure.append(title, canvas);
+      container.append(figure);
+      const draw = () => drawField(canvas, m.field, max);
+      requestAnimationFrame(draw);
+      canvas.addEventListener("mousemove", (event) => {
+        const box = canvas.getBoundingClientRect();
+        const c = Math.floor(
+          ((event.clientX - box.left) / box.width) * m.field.columns,
+        );
+        const r = Math.floor(
+          ((event.clientY - box.top) / box.height) * m.field.rows,
+        );
+        const i = r * m.field.columns + c;
+        const v = magnitude(m.field, i);
+        showTip(
+          event,
+          v === null
+            ? "Doesn’t invert here"
+            : `${fmt(v, 1)} px  (${fmt(m.field.dx[i], 1)}, ${fmt(m.field.dy[i], 1)})`,
+        );
+      });
+      canvas.addEventListener("mouseleave", hideTip);
+    });
+    const legend = document.getElementById("field-legend");
+    legend.replaceChildren();
+    const bar = el("span", {class: "ramp"});
+    bar.style.background = `linear-gradient(to right, ${[0, 1, 2, 3, 4, 5, 6].map((i) => css(`--ramp-${i}`)).join(", ")})`;
+    const none = el("span", {class: "key"});
+    none.style.background = css("--none");
+    legend.append(
+      el("span", {class: "mono"}, "0"),
+      bar,
+      el("span", {class: "mono"}, `${fmt(max, 0)} px moved`),
+    );
+    const noneLabel = el("span");
+    noneLabel.append(none, document.createTextNode("doesn’t invert"));
+    legend.append(noneLabel);
+  }
+
+  function drawField(canvas, field, max) {
+    const {ctx, w, h, ratio} = sizeCanvas(canvas, aspect);
+    const cw = w / field.columns,
+      ch = h / field.rows;
+    for (let r = 0; r < field.rows; ++r) {
+      for (let c = 0; c < field.columns; ++c) {
+        const v = magnitude(field, r * field.columns + c);
+        ctx.fillStyle =
+          v === null
+            ? css("--none")
+            : `rgb(${ramp(max > 0 ? v / max : 0).join(",")})`;
+        ctx.fillRect(
+          Math.floor(c * cw),
+          Math.floor(r * ch),
+          Math.ceil(cw) + 1,
+          Math.ceil(ch) + 1,
+        );
+      }
+    }
+    // Arrows on every fourth cell, scaled so the longest spans four cells.
+    const step = 4;
+    const scale = max > 0 ? (step * cw * 0.9) / max : 0;
+    ctx.strokeStyle = css("--fg");
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = 1.2 * ratio;
+    for (let r = step / 2; r < field.rows; r += step) {
+      for (let c = step / 2; c < field.columns; c += step) {
+        const i = r * field.columns + c;
+        if (magnitude(field, i) === null) continue;
+        const x0 = (c + 0.5) * cw,
+          y0 = (r + 0.5) * ch;
+        const x1 = x0 + field.dx[i] * scale;
+        const y1 = y0 + field.dy[i] * scale;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        const a = Math.atan2(y1 - y0, x1 - x0),
+          head = Math.min(5 * ratio, Math.hypot(x1 - x0, y1 - y0) / 2);
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(
+          x1 - head * Math.cos(a - 0.45),
+          y1 - head * Math.sin(a - 0.45),
+        );
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(
+          x1 - head * Math.cos(a + 0.45),
+          y1 - head * Math.sin(a + 0.45),
+        );
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function disagreement() {
+    const panel = document.getElementById("disagree-panel");
+    if (models.length < 2) {
+      panel.hidden = true;
+      return;
+    }
+    const [a, b] = models;
+    const values = a.field.dx.map((_, i) => {
+      if (magnitude(a.field, i) === null || magnitude(b.field, i) === null)
+        return null;
+      return Math.hypot(
+        a.field.dx[i] - b.field.dx[i],
+        a.field.dy[i] - b.field.dy[i],
+      );
+    });
+    const max = Math.max(...values.filter((v) => v !== null), 1e-9);
+    const canvas = document.getElementById("disagree");
+    const {ctx, w, h} = sizeCanvas(canvas, aspect);
+    const cw = w / a.field.columns,
+      ch = h / a.field.rows;
+    values.forEach((v, i) => {
+      const r = Math.floor(i / a.field.columns),
+        c = i % a.field.columns;
+      ctx.fillStyle =
+        v === null ? css("--none") : `rgb(${ramp(v / max).join(",")})`;
+      ctx.fillRect(
+        Math.floor(c * cw),
+        Math.floor(r * ch),
+        Math.ceil(cw) + 1,
+        Math.ceil(ch) + 1,
+      );
+    });
+    // Where the data reaches: corners out to this radius.
+    ctx.strokeStyle = css("--series-3");
+    ctx.setLineDash([6, 5]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const half = Math.hypot(w, h) / 2;
+    ctx.arc(w / 2, h / 2, R.farthest * half, 0, 2 * Math.PI);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const inside = [],
+      outside = [];
+    values.forEach((v, i) => {
+      if (v === null) return;
+      const r = Math.floor(i / a.field.columns),
+        c = i % a.field.columns;
+      const x = ((c + 0.5) / a.field.columns) * R.width - R.width / 2;
+      const y = ((r + 0.5) / a.field.rows) * R.height - R.height / 2;
+      ((Math.hypot(x, y) / Math.hypot(R.width, R.height)) * 2 <= R.farthest
+        ? inside
+        : outside
+      ).push(v);
+    });
+    const median = (xs) => {
+      const s = [...xs].sort((p, q) => p - q);
+      return s.length ? s[Math.floor(s.length / 2)] : NaN;
+    };
+    document.getElementById("disagree-caption").textContent =
+      `How far apart ${a.label} and ${b.label} put each pixel undistorted, 0 to ${fmt(max, 1)} px on the same ramp. ` +
+      `Inside the dashed circle, where the board's corners reach, they differ by ${fmt(median(inside), 2)} px at the median; ` +
+      `outside it, with no corners to fit, by ${fmt(median(outside), 1)} px.`;
+  }
+
+  function showcase() {
+    document.getElementById("showcase-text").textContent =
+      `${R.showcase.name}, whose corners reach farthest out, with the corners found marked; then as each model undistorts it. ` +
+      "A model that fits makes the board’s edges straight.";
+    const container = document.getElementById("showcase");
+    container.replaceChildren();
+    const add = (label, src, color) => {
+      const figure = el("div", {class: "figure panel"});
+      const title = el("h3");
+      if (color) {
+        const key = el("span", {class: "key"});
+        key.style.background = color;
+        title.append(key);
+      }
+      title.append(document.createTextNode(label));
+      figure.append(title, el("img", {src, alt: label}));
+      container.append(figure);
+    };
+    add("As the camera saw it", R.showcase.image);
+    models.forEach((m, i) =>
+      add(`Undistorted, ${m.label}`, m.undistorted, seriesColor(i)),
+    );
+  }
+
+  function coverage() {
+    const canvas = document.getElementById("coverage");
+    const {ctx, w, h, ratio} = sizeCanvas(canvas, aspect);
+    ctx.fillStyle = css("--grid");
+    ctx.fillRect(0, 0, w, h);
+    // Cells no corner reached.
+    const cov = R.coverage;
+    const cw = w / cov.columns,
+      ch = h / cov.rows;
+    ctx.fillStyle = css("--bad-bg");
+    cov.counts.forEach((n, i) => {
+      if (n > 0) return;
+      const r = Math.floor(i / cov.columns),
+        c = i % cov.columns;
+      ctx.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
+    });
+    ctx.fillStyle = css("--series-1");
+    ctx.globalAlpha = 0.35;
+    for (let i = 0; i < R.corners_x.length; ++i) {
+      ctx.beginPath();
+      ctx.arc(
+        (R.corners_x[i] / R.width) * w,
+        (R.corners_y[i] / R.height) * h,
+        1.4 * ratio,
+        0,
+        2 * Math.PI,
+      );
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Rings at fifths of the half diagonal, the bins of the chart beside.
+    const half = Math.hypot(w, h) / 2;
+    ctx.strokeStyle = css("--muted");
+    ctx.lineWidth = 1;
+    ctx.font = `${11 * ratio}px ${css("--mono")}`;
+    ctx.fillStyle = css("--muted");
+    for (let k = 1; k <= 5; ++k) {
+      ctx.beginPath();
+      ctx.arc(w / 2, h / 2, (k / 5) * half, 0, 2 * Math.PI);
+      ctx.stroke();
+      if (k < 5)
+        ctx.fillText(
+          `${k * 20}%`,
+          w / 2 + 4 * ratio,
+          h / 2 - (k / 5) * half + 13 * ratio,
+        );
+    }
+    const empty = cov.counts.filter((n) => n === 0).length;
+    document.getElementById("coverage-caption").textContent =
+      `Every fourth corner of every frame. The corners reach ${(R.farthest * 100).toFixed(0)}% of the way from the centre to the image's corners; ` +
+      `${empty} of ${cov.counts.length} cells (shaded) have none. Rings mark fifths of the way.`;
+  }
+
+  function radiusChart() {
+    const svg = document.getElementById("radius");
+    svg.replaceChildren();
+    const W = 520,
+      H = 260,
+      left = 48,
+      right = 12,
+      top = 12,
+      bottom = 52;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const bins = 5;
+    const values = models.map((m) => m.held_out_by_radius);
+    const max = Math.max(
+      ...values.flat().filter((v) => v !== null && Number.isFinite(v)),
+      0.1,
+    );
+    const niceMax = Math.ceil(max * 4) / 4;
+    const y = (v) => top + (H - top - bottom) * (1 - v / niceMax);
+    const ticks = [0, niceMax / 2, niceMax];
+    for (const t of ticks) {
+      svg.append(
+        el("line", {
+          svg: 1,
+          x1: left,
+          x2: W - right,
+          y1: y(t),
+          y2: y(t),
+          stroke: css("--grid"),
+          "stroke-width": 1,
+        }),
+      );
+      svg.append(
+        el(
+          "text",
+          {
+            svg: 1,
+            x: left - 6,
+            y: y(t) + 4,
+            "text-anchor": "end",
+            fill: css("--muted"),
+            "font-size": 11,
+            "font-family": css("--mono"),
+          },
+          `${t.toFixed(2)}`,
+        ),
+      );
+    }
+    const groupW = (W - left - right) / bins;
+    const barW = Math.min(28, (groupW - 16) / models.length);
+    for (let b = 0; b < bins; ++b) {
+      const x0 =
+        left +
+        b * groupW +
+        (groupW - barW * models.length - 2 * (models.length - 1)) / 2;
+      models.forEach((m, i) => {
+        const v = m.held_out_by_radius[b];
+        if (v === null || !Number.isFinite(v)) return;
+        const x = x0 + i * (barW + 2);
+        const rect = el("rect", {
+          svg: 1,
+          x,
+          y: y(v),
+          width: barW,
+          height: Math.max(0, y(0) - y(v)),
+          rx: 2,
+          fill: seriesColor(i),
+        });
+        rect.addEventListener("mousemove", (event) =>
+          showTip(
+            event,
+            `${m.label}: ${fmt(v)} px, ${m.held_out_counts[b]} corners`,
+          ),
+        );
+        rect.addEventListener("mouseleave", hideTip);
+        svg.append(rect);
+      });
+      svg.append(
+        el(
+          "text",
+          {
+            svg: 1,
+            x: left + (b + 0.5) * groupW,
+            y: H - bottom + 18,
+            "text-anchor": "middle",
+            fill: css("--fg"),
+            "font-size": 12,
+            "font-family": css("--mono"),
+          },
+          `${b * 20}–${(b + 1) * 20}%`,
+        ),
+      );
+      svg.append(
+        el(
+          "text",
+          {
+            svg: 1,
+            x: left + (b + 0.5) * groupW,
+            y: H - bottom + 34,
+            "text-anchor": "middle",
+            fill: css("--muted"),
+            "font-size": 11,
+            "font-family": css("--mono"),
+          },
+          `${models[0]?.held_out_counts[b] ?? 0} corners`,
+        ),
+      );
+    }
+    svg.append(
+      el("line", {
+        svg: 1,
+        x1: left,
+        x2: W - right,
+        y1: y(0),
+        y2: y(0),
+        stroke: css("--muted"),
+        "stroke-width": 1,
+      }),
+    );
+    const legend = document.getElementById("radius-legend");
+    legend.replaceChildren();
+    models.forEach((m, i) => {
+      const item = el("span");
+      const key = el("span", {class: "key"});
+      key.style.background = seriesColor(i);
+      item.append(key, document.createTextNode(m.label));
+      legend.append(item);
+    });
+    legend.append(
+      el(
+        "span",
+        {},
+        "RMS error, px, by distance from the centre as a share of the way to the corners",
+      ),
+    );
+  }
+
+  function frameErrors() {
+    const m = models[0];
+    const container = document.getElementById("frames");
+    container.replaceChildren();
+    if (!m) return;
+    const max = Math.max(...m.capture_errors);
+    m.capture_errors.forEach((e, i) => {
+      const bar = el("span");
+      bar.style.height = `${(e / max) * 100}%`;
+      bar.addEventListener("mousemove", (event) =>
+        showTip(event, `${R.frames[i]}: ${fmt(e)} px`),
+      );
+      bar.addEventListener("mouseleave", hideTip);
+      container.append(bar);
+    });
+    const worst = m.capture_errors
+      .map((e, i) => [e, R.frames[i]])
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, 3);
+    document.getElementById("frames-caption").textContent =
+      `Each frame's RMS error under ${m.label}, solved from every frame, 0 to ${fmt(max)} px. Worst: ` +
+      worst.map(([e, name]) => `${name} (${fmt(e)} px)`).join(", ") +
+      ".";
+  }
+
+  function footer() {
+    const f = document.getElementById("footer");
+    f.replaceChildren(
+      el(
+        "p",
+        {},
+        `Made by calibrate_images. ${R.rejected.length} of ${R.images} images had too few of the board's corners to use${R.rejected.length ? `: ${R.rejected.slice(0, 8).join(", ")}${R.rejected.length > 8 ? "…" : ""}` : ""}.`,
+      ),
+      el(
+        "p",
+        {},
+        `Rigidity is in millimeters for squares of ${(R.board.square_length * 1000).toFixed(1)} mm; it scales with the board's real size.`,
+      ),
+    );
+  }
+
+  function render() {
+    header();
+    summary();
+    fields();
+    disagreement();
+    showcase();
+    coverage();
+    radiusChart();
+    frameErrors();
+    footer();
+  }
+  render();
+  let resizeTimer;
+  addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(render, 150);
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  new MutationObserver(render).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["data-theme"],
+  });
+</script>
