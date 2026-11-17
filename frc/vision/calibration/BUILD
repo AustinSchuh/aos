@@ -1,7 +1,9 @@
+load("@aos//aos/flatbuffers:ts.bzl", "flatbuffer_ts_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//aos:config.bzl", "aos_config")
+load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
 
 cc_binary(
     name = "modify_extrinsics",
@@ -324,5 +326,163 @@ cc_test(
         "//frc/vision:camera_constants_list_fbs",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
+    ],
+)
+
+static_flatbuffer(
+    name = "calibration_command_fbs",
+    srcs = ["calibration_command.fbs"],
+    visibility = ["//visibility:public"],
+    deps = ["//frc/vision:calibration_fbs"],
+)
+
+static_flatbuffer(
+    name = "calibration_status_fbs",
+    srcs = ["calibration_status.fbs"],
+    visibility = ["//visibility:public"],
+)
+
+static_flatbuffer(
+    name = "calibration_session_fbs",
+    srcs = ["calibration_session.fbs"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":calibration_status_fbs",
+        "//frc/vision:calibration_fbs",
+    ],
+)
+
+flatbuffer_ts_library(
+    name = "calibration_session_ts_fbs",
+    srcs = [
+        "calibration_command.fbs",
+        "calibration_session.fbs",
+        "calibration_status.fbs",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    ts_files = [
+        "frc/vision/calibration.ts",
+        "frc/vision/calibration/command-action.ts",
+        "frc/vision/calibration/command.ts",
+        "frc/vision/calibration/session-state.ts",
+        "frc/vision/calibration/frame-verdict.ts",
+        "frc/vision/calibration/status.ts",
+        "frc/vision/calibration/corner.ts",
+        "frc/vision/calibration/residual.ts",
+        "frc/vision/calibration/capture.ts",
+        "frc/vision/calibration/capture-residuals.ts",
+        "frc/vision/calibration/solve.ts",
+        "frc/vision/calibration/saved-board.ts",
+        "frc/vision/calibration/session.ts",
+        "frc/vision/calibration/camera-board.ts",
+        "frc/vision/calibration/board-store.ts",
+        "frc/vision/calibration/board-spec.ts",
+        "frc/vision/calibration/camera-calibration.ts",
+        "frc/vision/calibration/transformation-matrix.ts",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["//frc/vision:calibration_ts_fbs"],
+)
+
+cc_library(
+    name = "charuco_detector",
+    srcs = ["charuco_detector.cc"],
+    hdrs = ["charuco_detector.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = ["//third_party:opencv"],
+)
+
+cc_library(
+    name = "calibration_server_lib",
+    srcs = ["calibration_server_lib.cc"],
+    hdrs = ["calibration_server_lib.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":calibration_command_fbs",
+        ":calibration_session_fbs",
+        ":calibration_status_fbs",
+        ":calibration_validator",
+        ":capture_gate",
+        ":charuco_detector",
+        ":intrinsics_calibration_lib",
+        ":intrinsics_solver",
+        "//aos:flatbuffer_merge",
+        "//aos:flatbuffers",
+        "//aos:json_to_flatbuffer",
+        "//aos/events:event_loop",
+        "//frc/vision:calibration_fbs",
+        "//frc/vision:camera_constants_fbs",
+        "//frc/vision:vision_fbs",
+        "//frc/vision/util:charuco_board",
+        "//frc/vision/util:charuco_lib",
+        "//frc/vision/util:vision_util_lib",
+        "//third_party:opencv",
+        "@com_github_foxglove_schemas//:schemas",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@eigen",
+    ],
+)
+
+cc_binary(
+    name = "calibration_server",
+    srcs = ["calibration_server_main.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":calibration_server_lib",
+        "//aos:configuration",
+        "//aos:init",
+        "//aos/events:shm_event_loop",
+        "//aos/network:team_number",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+aos_config(
+    name = "calibration_server_test_config",
+    src = "calibration_server_test_config_source.json",
+    flatbuffers = [
+        ":calibration_command_fbs",
+        ":calibration_session_fbs",
+        ":calibration_status_fbs",
+        "//frc/vision:camera_constants_fbs",
+        "//frc/vision:vision_fbs",
+        "@com_github_foxglove_schemas//:schemas",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = ["//aos/events:aos_config"],
+)
+
+cc_test(
+    name = "calibration_server_test",
+    srcs = ["calibration_server_test.cc"],
+    data = [":calibration_server_test_config"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":calibration_server_lib",
+        ":charuco_detector",
+        "//aos/events:simulated_event_loop",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing:tmpdir",
+        "//frc/vision/util:charuco_board",
+        "//third_party:opencv",
+    ],
+)
+
+cc_test(
+    name = "charuco_detector_test",
+    srcs = ["charuco_detector_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":charuco_detector",
+        "//aos/testing:googletest",
+        "//frc/vision/util:charuco_board",
+        "//third_party:opencv",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )

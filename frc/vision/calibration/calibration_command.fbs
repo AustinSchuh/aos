@@ -1,0 +1,54 @@
+include "frc/vision/calibration.fbs";
+
+// The messages of a calibration session from the vision page: the page sends
+// /calibration Command through robot_server, and calibration_server answers
+// with /calibration Status, a small live summary, and /calibration Session,
+// the whole session every time it changes.
+namespace frc.vision.calibration;
+
+enum CommandAction : ubyte {
+  // Starts a session on `camera`, with `board` (else the last board used on
+  // it) and `target_captures` (else the last target).
+  START = 0,
+  // Uses `board`.  Only before the first capture.
+  SET_BOARD = 1,
+  // Collects `target_captures` before offering to solve.
+  SET_TARGET = 2,
+  // Saves `board` under `board_name`, replacing any board of that name.
+  SAVE_BOARD = 3,
+  // Forgets the board named `board_name`.
+  DELETE_BOARD = 4,
+  // Captures the next frame with a valid pose, however little it has moved.
+  CAPTURE = 5,
+  // Drops the last capture.
+  UNDO = 6,
+  // Drops the captures numbered in `drop`.
+  DROP = 7,
+  // Solves for the intrinsics from the captures.
+  SOLVE = 8,
+  // Writes the solved calibration, if it passes validation or `force` says
+  // to write it anyway.
+  SAVE = 9,
+  // Ends the session.  robot_server acts on these: it stops
+  // calibration_server and starts the AprilTag detectors again.
+  FINISH = 10,
+  CANCEL = 11,
+  // Names the physical camera `camera_id` (YY-NN), as a new calibration is
+  // filed under.
+  SET_CAMERA_ID = 12,
+}
+
+table Command {
+  // The session it's for, as Session gives it; START names a new one.
+  session_id:string (id: 0);
+  action:CommandAction (id: 1);
+  camera:int (id: 2);
+  board:BoardSpec (id: 3);
+  board_name:string (id: 4);
+  target_captures:int (id: 5);
+  drop:[int] (id: 6);
+  force:bool (id: 7);
+  camera_id:string (id: 8);
+}
+
+root_type Command;

@@ -109,6 +109,9 @@ aos_config(
         "//frc/input:joystick_state_fbs",
         "//frc/input:robot_state_fbs",
         "@com_github_foxglove_schemas//:schemas",
+        "//frc/vision/calibration:calibration_command_fbs",
+        "//frc/vision/calibration:calibration_session_fbs",
+        "//frc/vision/calibration:calibration_status_fbs",
     ],
     visibility = ["//visibility:public"],
 )
@@ -128,6 +131,7 @@ robot_downloader(
         ":field_side_exposure_adjuster",
         ":game_piece_mapper",
         "//frc/vision/camera:image_logger",
+        "//frc/vision/calibration:calibration_server",
         "//frc/vision/calibration:intrinsics_calibration",
         "//frc/vision/camera:nvjpeg_decoder",
         "//frc/vision/camera:turbojpeg_decoder",
