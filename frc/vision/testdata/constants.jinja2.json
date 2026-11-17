@@ -14,7 +14,9 @@
         ],
         "default_camera_stream_settings": {
           "image_width": 1456,
-          "image_height": 1088
+          "image_height": 1088,
+          "exposure_100us": 60,
+          "gain": 0
         }
       }
     }
