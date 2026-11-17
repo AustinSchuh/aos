@@ -12,12 +12,7 @@
           {% include 'frc/vision/testdata/test-calibration_cam-3.json' %},
           {% include 'frc/vision/testdata/test-calibration_cam-4.json' %}
         ],
-        "default_camera_stream_settings": {
-          "image_width": 1456,
-          "image_height": 1088,
-          "exposure_100us": 60,
-          "gain": 0
-        }
+        "default_camera_stream_settings": {% include 'frc/vision/testdata/camera_settings_0-test.json' %}
       }
     }
   ]

@@ -14,12 +14,7 @@
           {% include 'frc/vision/constants/calibration_orin1-4646-2_cam-25-03_fake.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-3_cam-25-04_fake.json' %}
         ],
-        "default_camera_stream_settings": {
-          "image_width": 1600,
-          "image_height": 1304,
-          "exposure_100us": 60,
-          "gain": 0
-        }
+        "default_camera_stream_settings": {% include 'frc/vision/constants/camera_settings_1868-austin.json' %}
       }
     },
     {
@@ -32,12 +27,7 @@
           {% include 'frc/vision/constants/calibration_orin1-4646-0_cam-25-11_2025-02-17_13-48-18.json' %},
           {% include 'frc/vision/constants/calibration_orin1-4646-0_cam-25-06_2025-02-17_13-13-24.json' %}
         ],
-        "default_camera_stream_settings": {
-          "image_width": 1600,
-          "image_height": 1304,
-          "exposure_100us": 15,
-          "gain": 0
-        }
+        "default_camera_stream_settings": {% include 'frc/vision/constants/camera_settings_4646-alpha.json' %}
       }
     },
     {
@@ -66,12 +56,7 @@
         "waived_calibrations": [
           {"camera_id": "25-09", "calibration_timestamp": 1741304224499387712}
         ],
-        "default_camera_stream_settings": {
-          "image_width": 1600,
-          "image_height": 1304,
-          "exposure_100us": 15,
-          "gain": 0
-        }
+        "default_camera_stream_settings": {% include 'frc/vision/constants/camera_settings_4646-blackbeard.json' %}
       }
     },
     {
@@ -84,15 +69,7 @@
           {% include 'frc/vision/constants/calibration_orin1-1868-2-fake.json' %},
           {% include 'frc/vision/constants/calibration_orin1-1868-3-fake.json' %}
         ],
-        "default_camera_stream_settings": {
-          "image_width": 1280,
-          "image_height": 800,
-          "exposure_100us": 50,
-          "frame_period": {
-            "numerator": 1,
-            "denominator": 120
-          }
-        }
+        "default_camera_stream_settings": {% include 'frc/vision/constants/camera_settings_1868-bot1.json' %}
       }
     }
   ]
