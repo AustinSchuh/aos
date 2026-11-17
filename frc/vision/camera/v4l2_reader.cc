@@ -6,6 +6,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <algorithm>
+
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
 
@@ -213,7 +215,9 @@ void V4L2ReaderBase::SetExposure(size_t duration) {
 
   v4l2_control exposure_control;
   exposure_control.id = V4L2_CID_EXPOSURE_ABSOLUTE;
-  exposure_control.value = static_cast<int>(duration);  // 100 micro s units
+  // 100 micro s units
+  exposure_control.value =
+      ClampToControl(V4L2_CID_EXPOSURE_ABSOLUTE, static_cast<int>(duration));
   ABSL_PCHECK(Ioctl(VIDIOC_S_CTRL, &exposure_control) == 0);
 }
 
@@ -292,6 +296,22 @@ void V4L2ReaderBase::Buffer::PrepareMessage(
 
 int V4L2ReaderBase::Ioctl(unsigned long number, void *arg) {
   return ioctl(fd_.get(), number, arg);
+}
+
+int V4L2ReaderBase::ClampToControl(uint32_t id, int value) {
+  v4l2_queryctrl query;
+  memset(&query, 0, sizeof(query));
+  query.id = id;
+  if (Ioctl(VIDIOC_QUERYCTRL, &query) != 0) {
+    return value;
+  }
+  const int clamped = std::clamp(value, query.minimum, query.maximum);
+  if (clamped != value) {
+    ABSL_LOG(WARNING) << query.name << " " << value << " is outside "
+                      << query.minimum << " to " << query.maximum << "; using "
+                      << clamped;
+  }
+  return clamped;
 }
 
 V4L2ReaderBase::BufferInfo V4L2ReaderBase::DequeueBuffer() {
@@ -563,7 +583,7 @@ void RockchipV4L2Reader::SetExposure(size_t duration) {
 void V4L2ReaderBase::SetGain(size_t gain) {
   v4l2_control gain_control;
   gain_control.id = V4L2_CID_GAIN;
-  gain_control.value = static_cast<int>(gain);
+  gain_control.value = ClampToControl(V4L2_CID_GAIN, static_cast<int>(gain));
   ABSL_PCHECK(ioctl(fd_.get(), VIDIOC_S_CTRL, &gain_control) == 0);
 }
 
