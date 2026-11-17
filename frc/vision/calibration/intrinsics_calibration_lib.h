@@ -17,6 +17,8 @@
 #include "aos/network/team_number.h"
 #include "aos/time/time.h"
 #include "aos/util/file.h"
+#include "frc/vision/calibration/capture_gate.h"
+#include "frc/vision/calibration/intrinsics_solver.h"
 #include "frc/vision/util/charuco_lib.h"
 #include "frc/vision/util/vision_util_lib.h"
 
@@ -64,7 +66,8 @@ class IntrinsicsCalibration {
                    aos::realtime_clock::time_point realtime_now,
                    std::string_view node_name, std::string_view camera_channel,
                    std::string_view camera_id, uint16_t team_number,
-                   double reprojection_error);
+                   double reprojection_error,
+                   std::optional<BoardSpec> board = std::nullopt);
 
   // Writes calibration to filename if it passes ValidateCalibration at
   // image_size, or --write_invalid_calibration says to write it anyway.
@@ -98,12 +101,6 @@ class IntrinsicsCalibration {
   double GetReprojectionError() { return reprojection_error_; };
 
  private:
-  static constexpr double kDeltaRThreshold = std::numbers::pi / 6.0;
-  static constexpr double kDeltaTThreshold = 0.3;
-
-  static constexpr double kFrameDeltaRLimit = std::numbers::pi / 60;
-  static constexpr double kFrameDeltaTLimit = 0.01;
-
   std::string hostname_;
   std::string node_name_;
   const std::string camera_channel_;
@@ -119,10 +116,8 @@ class IntrinsicsCalibration {
   std::vector<cv::Mat> rvecs_;
   double reprojection_error_;
 
-  // Inverses of the board location in camera frame, for computing deltas
-  // later
-  Eigen::Affine3d prev_H_board_camera_;
-  Eigen::Affine3d last_frame_H_board_camera_;
+  // Decides which frames to capture.
+  CaptureGate capture_gate_;
 
   // Image used to visualize collected points as they come in
   cv::Mat point_viz_image_;
@@ -146,7 +141,6 @@ class IntrinsicsCalibration {
   std::vector<std::string> file_list_;
 
   int image_save_count_ = 0;
-  int invalid_images_saved_ = 0;
 };
 
 }  // namespace frc::vision

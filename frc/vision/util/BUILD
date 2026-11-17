@@ -3,6 +3,34 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_library(
+    name = "charuco_board",
+    srcs = ["charuco_board.cc"],
+    hdrs = ["charuco_board.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//frc/vision:calibration_fbs",
+        "//third_party:opencv",
+        "@aos_flatbuffers//:flatbuffers",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "charuco_board_test",
+    srcs = ["charuco_board_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":charuco_board",
+        "//aos:flatbuffers",
+        "//aos/testing:googletest",
+    ],
+)
+
+cc_library(
     name = "charuco_lib",
     srcs = [
         "charuco_lib.cc",
@@ -13,6 +41,7 @@ cc_library(
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
+        ":charuco_board",
         "//aos:flatbuffers",
         "//aos/events:event_loop",
         "//aos/network:message_bridge_server_fbs",
