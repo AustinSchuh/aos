@@ -11,6 +11,7 @@ import {
   parseStatus,
   pose,
   sameBoard,
+  validationRows,
 } from './calibration.js';
 
 // What /api/latest gives for /calibration Status.
@@ -162,4 +163,32 @@ test('a pose has a distance and a tilt', () => {
   assert.deepEqual(pose(capture([])), {distance: 2, tiltDeg: 0});
   const tilted = pose(capture([], [Math.PI / 6, 0, 0]));
   assert.ok(Math.abs(tilted.tiltDeg - 30) < 1e-9);
+});
+
+test('validation lines up each measure across calibrations', () => {
+  const result = (measure: string, median: number) => ({
+    check: 'RIGIDITY',
+    measure,
+    frames: 10,
+    median,
+    worst: median * 2,
+    columns: 2,
+    rows: 1,
+    means: [median, -1],
+  });
+  const session = parseSession({
+    validation: [
+      {name: 'current', results: [result('mm', 3), result('deg', 0.5)]},
+      {name: 'solved', results: [result('mm', 1)]},
+    ],
+    checks: ['RIGIDITY'],
+  })!;
+  assert.deepEqual(session.checks, ['RIGIDITY']);
+  const rows = validationRows(session.validation);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.measure, 'mm');
+  assert.equal(rows[0]!.byLens[0]!.median, 3);
+  assert.equal(rows[0]!.byLens[1]!.median, 1);
+  assert.equal(rows[1]!.byLens[1], null);
+  assert.deepEqual(rows[0]!.byLens[0]!.means, [3, -1]);
 });

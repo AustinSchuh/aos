@@ -8,6 +8,7 @@ import {CameraTile} from './camera_tile';
 import {DistortionMap} from './distortion_map';
 import {IntrinsicsCard} from './intrinsics_card';
 import {SamplesView} from './samples_view';
+import {ValidationGridView} from './validation_grid';
 
 @NgModule({
   declarations: [
@@ -17,6 +18,7 @@ import {SamplesView} from './samples_view';
     DistortionMap,
     IntrinsicsCard,
     SamplesView,
+    ValidationGridView,
   ],
   imports: [BrowserModule, FormsModule],
   bootstrap: [App],

@@ -487,6 +487,45 @@ main.calibrate .error-bars .error-bar.dropping {
   gap: 12px;
 }
 
+.check-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+main.calibrate .check-list label {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.validation-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.validation-table th,
+.validation-table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 2px 8px 2px 0;
+  font-weight: normal;
+}
+
+.validation-table th {
+  color: var(--muted);
+}
+
+validation-grid canvas {
+  display: block;
+  width: 100%;
+  max-width: 260px;
+  border-radius: 3px;
+}
+
 .banner {
   display: flex;
   align-items: center;
