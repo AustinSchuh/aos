@@ -1,67 +1,172 @@
-// End-to-end tests of the vision page: the built page, in headless Chrome,
-// against a fake robot_server (see fake_robot.mjs).  The robot's own pieces
-// are tested on their own; these check that the page shows what the robot
-// says and sends what the robot expects.
+// End to end tests of the vision page: the built page, in headless Chrome,
+// against the robot simulated (//frc/vision/sim:vision_robot_sim), which runs
+// robot_server, web_proxy, calibration_server and the exposure adjuster as on
+// the robot, with fake cameras and a fake starter.
 //
-// Each test saves a screenshot to the test's undeclared outputs, to look at.
+// camera_streamer can't run on x86 until the amd64 sysroot has its GStreamer
+// plugins (frc/amd64/build_rootfs.py), so a stand-in on its port tells the page
+// which cameras there are, through robot_server's /cameras/ws as on the robot;
+// there's no video.
+//
+// The robot keeps its state across the tests, as a robot does, so they run in
+// order.  Each saves screenshots, and the robot's log, to the test's
+// undeclared outputs.
 
 import {strict as assert} from "node:assert";
+import {spawn} from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import {after, before, beforeEach, test} from "node:test";
 
 import {Browser} from "./browser.mjs";
-import {FakeRobot} from "./fake_robot.mjs";
 
 const RUNFILES = process.env.JS_BINARY__RUNFILES;
 const runfile = (rlocation) => path.join(RUNFILES, rlocation);
 const OUTPUTS = process.env.TEST_UNDECLARED_OUTPUTS_DIR;
+const CAMERAS = [0, 2];
 
-// What the robot's /constants says, cut down: two cameras' settings and one
-// calibration.
-const CONSTANTS = {
-  default_camera_stream_settings: {
-    image_width: 1600,
-    image_height: 1304,
-    exposure_100us: 60,
-    gain: 0,
-  },
-  calibration: [
-    {
-      node_name: "orin",
-      intrinsics: [1975.39, 0, 845.56, 0, 1974.92, 714.27, 0, 0, 1],
-      dist_coeffs: [-0.02, 0.05, 0, 0, -0.03],
-      distortion_model: "KANNALA_BRANDT",
-      calibration_timestamp: 1741280928754949431,
-      camera_id: "25-01",
-      camera_number: 0,
-      reprojection_error: 0.21,
-    },
-  ],
-};
-
-const BOARD = {
-  name: "12x9 5x5",
-  squares_x: 12,
-  squares_y: 9,
-  square_length: 0.06,
-  marker_length: 0.0436,
-  dictionary: "DICT_5X5_1000",
-};
+// In the page: the Starter tab's rows, {name: state}, or null before any.
+const STARTER_STATES = `(() => {
+  const doc = document.querySelector('main.embed iframe')?.contentDocument;
+  if (!doc) return null;
+  const states = {};
+  for (const row of doc.querySelectorAll('#status_list tr')) {
+    const cells = row.querySelectorAll('td');
+    states[cells[0].textContent.trim()] = cells[2].textContent.trim();
+  }
+  return Object.keys(states).length > 0 ? states : null;
+})()`;
 
 let robot;
+let robotLog = "";
+let cameraStreamer;
 let browser;
 let page;
+let origin;
+let stateDir;
+
+/** A port nothing is listening on. */
+async function freePort() {
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const {port} = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+/** Copies every file in `from` (a runfiles directory) into `to`. */
+function copyFiles(from, to) {
+  for (const name of fs.readdirSync(from)) {
+    const file = path.join(from, name);
+    if (fs.statSync(file).isFile()) {
+      fs.copyFileSync(file, path.join(to, name));
+    }
+  }
+}
+
+/**
+ * camera_streamer's signalling, as far as saying which cameras it has: what the
+ * page needs before it asks for video.
+ */
+function startCameraStreamerStandIn(port) {
+  const server = http.createServer((request, response) => {
+    response.writeHead(404).end();
+  });
+  server.on("upgrade", (request, socket) => {
+    const accept = crypto
+      .createHash("sha1")
+      .update(
+        request.headers["sec-websocket-key"] +
+          "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
+      )
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    const payload = Buffer.from(
+      JSON.stringify({type: "cameras", cameras: CAMERAS}),
+    );
+    socket.write(Buffer.concat([Buffer.from([0x81, payload.length]), payload]));
+    socket.on("data", () => {});
+    socket.on("error", () => {});
+  });
+  return new Promise((resolve) =>
+    server.listen(port, "127.0.0.1", () => resolve(server)),
+  );
+}
 
 before(async () => {
-  robot = new FakeRobot({
-    visionDir: runfile(process.env.VISION_DIR),
-    rootDir: path.dirname(runfile(process.env.STARTER_HTML)),
-    certDir: path.dirname(runfile(process.env.TEST_CERT)),
-    cameras: [0, 2],
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vision-robot-"));
+  const www = path.join(root, "www");
+  stateDir = path.join(root, "state");
+  const tls = path.join(root, "tls");
+  for (const dir of [www, stateDir, tls]) {
+    fs.mkdirSync(dir, {recursive: true});
+  }
+  // The pages as deployed: the vision page, and the robot's own.
+  fs.cpSync(runfile(process.env.VISION_DIR), path.join(www, "vision"), {
+    recursive: true,
+    dereference: true,
   });
-  await robot.start();
-  // The sysroot holding SYSROOT_FILE, usr/bin/ptxas.
+  copyFiles(path.dirname(runfile(process.env.STARTER_HTML)), www);
+  copyFiles(path.dirname(runfile(process.env.FIELD_HTML)), www);
+  fs.copyFileSync(
+    runfile(process.env.TEST_CERT),
+    path.join(tls, "server-chain.crt"),
+  );
+  fs.copyFileSync(
+    runfile(process.env.TEST_CERT).replace(/\.crt$/, ".key"),
+    path.join(tls, "server.key"),
+  );
+
+  const [httpsPort, httpPort, proxyPort, streamerPort] = await Promise.all([
+    freePort(),
+    freePort(),
+    freePort(),
+    freePort(),
+  ]);
+  cameraStreamer = await startCameraStreamerStandIn(streamerPort);
+  robot = spawn(
+    runfile(process.env.ROBOT_SIM),
+    [
+      `--config=${runfile(process.env.ROBOT_CONFIG)}`,
+      `--constants=${runfile(process.env.ROBOT_CONSTANTS)}`,
+      `--data_dir=${www}`,
+      `--state_dir=${stateDir}`,
+      `--tls_dir=${tls}`,
+      `--https_port=${httpsPort}`,
+      `--http_port=${httpPort}`,
+      `--proxy_port=${proxyPort}`,
+      `--camera_streamer_port=${streamerPort}`,
+      `--cameras=${CAMERAS.join(",")}`,
+    ],
+    {stdio: ["ignore", "pipe", "pipe"]},
+  );
+  robot.stderr.on("data", (chunk) => (robotLog += chunk));
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`The robot didn't start:\n${robotLog}`)),
+      60000,
+    );
+    robot.stdout.on("data", (chunk) => {
+      if (/Serving/.test(chunk)) {
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+    robot.on("exit", (code) => {
+      clearTimeout(timeout);
+      reject(new Error(`The robot exited with ${code}:\n${robotLog}`));
+    });
+  });
+  origin = `https://localhost:${httpsPort}`;
+
   const sysroot = path.resolve(
     path.dirname(runfile(process.env.SYSROOT_FILE)),
     "../..",
@@ -71,16 +176,20 @@ before(async () => {
 
 after(async () => {
   await browser?.close();
-  await robot?.stop();
+  robot?.kill("SIGINT");
+  cameraStreamer?.close();
+  if (OUTPUTS) {
+    fs.writeFileSync(path.join(OUTPUTS, "robot.log"), robotLog);
+    fs.writeFileSync(
+      path.join(OUTPUTS, "interfaces.json"),
+      JSON.stringify(os.networkInterfaces(), null, 1),
+    );
+  }
 });
 
 beforeEach(async () => {
-  robot.sent = [];
-  robot.latest.clear();
-  robot.failNextSend = null;
-  robot.setLatest("/constants", "frc.vision.CameraConstants", CONSTANTS);
   await page?.close();
-  page = await browser.open(`${robot.origin}/vision/`);
+  page = await browser.open(`${origin}/vision/`);
   await page.waitFor(`document.querySelector('vision-app nav')`, {
     what: "the page to load",
   });
@@ -95,25 +204,38 @@ async function screenshot(name) {
   }
 }
 
-/** Waits until the fake robot has `count` sends on `name`, and returns them. */
-async function sends(name, count) {
-  const deadline = Date.now() + 5000;
-  while (robot.sentOn(name).length < count) {
-    if (Date.now() > deadline) {
-      assert.fail(
-        `Expected ${count} sends on ${name}; got ${JSON.stringify(robot.sentOn(name))}`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return robot.sentOn(name);
-}
-
 function tab(label) {
   return page.clickButton(label);
 }
 
-test("the feeds show a tile for each camera the streamer has", async () => {
+/** The exposure and gain the robot saved, or null before any. */
+function savedSettings() {
+  // Read, not checked for first: the robot may remove it in between.
+  let text;
+  try {
+    text = fs.readFileSync(path.join(stateDir, "camera_settings.json"), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+  return JSON.parse(text);
+}
+
+/** Waits until `predicate` holds of what the robot saved. */
+async function waitForSaved(predicate, what) {
+  const deadline = Date.now() + 10000;
+  while (!predicate(savedSettings())) {
+    assert.ok(
+      Date.now() < deadline,
+      `Timed out waiting for ${what}; saved: ${JSON.stringify(savedSettings())}`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+test("the feeds show a tile for each camera", async () => {
   const names = await page.waitFor(
     `(() => {
       const names = [...document.querySelectorAll('.tile-name')]
@@ -123,8 +245,6 @@ test("the feeds show a tile for each camera the streamer has", async () => {
     {what: "two camera tiles"},
   );
   assert.deepEqual(names, ["Camera 0", "Camera 2"]);
-  // No video from the fake robot.
-  assert.equal(await page.text(".no-signal"), "No signal");
   await screenshot("feeds");
 });
 
@@ -141,8 +261,7 @@ test("every tab shows its own view", async () => {
     await page.waitFor(`document.querySelector(${JSON.stringify(selector)})`, {
       what: `the ${label} tab`,
     });
-    const active = await page.text("nav button.active");
-    assert.equal(active, label);
+    assert.equal(await page.text("nav button.active"), label);
     assert.equal(
       await page.evaluate(`document.querySelectorAll('main').length`),
       1,
@@ -151,44 +270,27 @@ test("every tab shows its own view", async () => {
   }
 });
 
-test("the starter tab embeds the robot’s starter page", async () => {
+test("the starter tab shows starter's applications, through web_proxy", async () => {
   await tab("Starter");
-  // The real starter.html, waiting: web_proxy, which would carry starter's
-  // status, is down on the fake robot.
-  const headings = await page.waitFor(
-    `(() => {
-      const doc = document.querySelector('main.embed iframe').contentDocument;
-      const headings = doc && [...doc.querySelectorAll('th')]
-        .map((th) => th.textContent.trim());
-      return headings && headings.length > 0 ? headings : null;
-    })()`,
-    {what: "the starter page in its frame"},
-  );
-  assert.deepEqual(headings, [
-    "Name",
-    "Node",
-    "State",
-    "Exit code",
-    "PID",
-    "Last start",
-    "Last stop reason",
-    "Binary",
-  ]);
-  // Fixed column widths, so a state changing length moves nothing.
+  const states = await page.waitFor(STARTER_STATES, {
+    what: "starter's status in its page",
+    timeoutMs: 20000,
+  });
+  assert.equal(states["robot_server"], "RUNNING");
+  assert.equal(states["apriltag_detector0"], "RUNNING");
+  assert.equal(states["calibration_server"], "STOPPED");
   assert.equal(
-    await page.evaluate(`(() => {
-      const doc = document.querySelector('main.embed iframe').contentDocument;
-      return getComputedStyle(doc.querySelector('table')).tableLayout;
-    })()`),
+    await page.evaluate(`getComputedStyle(document.querySelector('main.embed iframe')
+      .contentDocument.querySelector('table')).tableLayout`),
     "fixed",
   );
   await screenshot("starter");
 });
 
-test("settings show the constants until the cameras have been sent any", async () => {
+test("settings show the robot's constants until something is set", async () => {
+  assert.equal(savedSettings(), null);
   await tab("Settings");
-  await page.waitFor(`document.querySelector('camera-settings-card')`);
-  // The constants' exposure, once they've come ("–" until then).
+  // orin-1868-1's constants: 6 ms, gain 0, once they've come ("–" until then).
   assert.equal(
     await page.waitFor(
       `(() => {
@@ -204,222 +306,141 @@ test("settings show the constants until the cameras have been sent any", async (
     await page.evaluate(`document.querySelector('#gain').value`),
     "0",
   );
-  assert.match(
-    await page.text(".camera-settings .source"),
-    /exposure 6\.0 ms, gain 0/,
-  );
-  // The calibration's card.
+  // A card for each of its calibrations.
   assert.equal(
-    await page.waitFor(
-      `document.querySelector('intrinsics-card .card-id')?.textContent.trim()`,
-    ),
-    "25-01",
+    await page.waitFor(`document.querySelectorAll('intrinsics-card').length`),
+    4,
   );
   await screenshot("settings");
 });
 
-test("settings show what the cameras were last sent, over the constants", async () => {
-  robot.setLatest("/camera0", "frc.vision.CameraStreamSettings", {
-    exposure_100us: 125,
-    gain: 3,
-  });
-  await tab("Settings");
-  await page.waitFor(
-    `document.querySelector('.camera-settings .setting-value')?.textContent.trim() === '12.5 ms'`,
-    {what: "the exposure the cameras were sent"},
-  );
-  await page.waitFor(`document.querySelector('#gain').value === '3'`, {
-    what: "the gain the cameras were sent",
-  });
-});
-
-test("dragging the exposure sends it to every camera, throttled", async () => {
+test("the exposure dragged is saved on the robot and sent to the cameras", async () => {
   await tab("Settings");
   await page.waitFor(`document.querySelector('#exposure')`);
-  // A drag: many positions in quick succession.
   for (const position of [400, 450, 500, 550, 600]) {
     await page.setInput("#exposure", position);
   }
-  // The last position is sent, though not every one in between.
+  await waitForSaved((s) => s?.exposure_100us === 33, "the exposure");
+
+  // A new page reads it back from the cameras' channel.
+  await page.close();
+  page = await browser.open(`${origin}/vision/`);
+  await page.waitFor(`document.querySelector('vision-app nav')`);
+  await tab("Settings");
   await page.waitFor(
-    `document.querySelector('.camera-settings .setting-value').textContent.trim() === '3.3 ms'`,
-    {what: "the dragged exposure"},
+    `document.querySelector('.camera-settings .setting-value')?.textContent.trim() === '3.3 ms'`,
+    {what: "the saved exposure"},
   );
-  const deadline = Date.now() + 3000;
-  while (robot.sentOn("/camera_settings").at(-1)?.exposure_100us !== 33) {
-    assert.ok(Date.now() < deadline, JSON.stringify(robot.sent));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  assert.ok(robot.sentOn("/camera_settings").length < 5);
-  for (const message of robot.sentOn("/camera_settings")) {
-    assert.deepEqual(Object.keys(message), ["exposure_100us"]);
-  }
-  // As the adjuster would, the robot has sent it on to the cameras, and the
-  // page keeps showing it.
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  assert.equal(await page.text(".camera-settings .setting-value"), "3.3 ms");
 });
 
-test("auto exposure sends 0, and leaving it goes back to a manual one", async () => {
+test("auto exposure is saved as 0, and the gain alongside", async () => {
   await tab("Settings");
-  await page.waitFor(`document.querySelector('.setting-auto input')`);
-  assert.equal(
-    await page.evaluate(`document.querySelector('#exposure').disabled`),
-    false,
+  await page.waitFor(
+    `document.querySelector('.camera-settings .setting-value')?.textContent.trim() === '3.3 ms'`,
+    {what: "the saved exposure"},
   );
   await page.click(".setting-auto input");
-  assert.deepEqual(await sends("/camera_settings", 1), [{exposure_100us: 0}]);
-  await page.waitFor(`document.querySelector('#exposure').disabled`, {
-    what: "the slider to disable",
-  });
-  assert.equal(await page.text(".camera-settings .setting-value"), "auto");
-
-  await page.click(".setting-auto input");
-  const sent = await sends("/camera_settings", 2);
-  // The constants' exposure, the last manual one there was.
-  assert.deepEqual(sent[1], {exposure_100us: 60});
-});
-
-test("a gain sends only the gain; a bad one sends nothing", async () => {
-  await tab("Settings");
-  await page.waitFor(`document.querySelector('#gain')`);
+  await waitForSaved((s) => s?.exposure_100us === 0, "auto exposure");
   await page.setInput("#gain", "2", "change");
-  assert.deepEqual(await sends("/camera_settings", 1), [{gain: 2}]);
-  await page.setInput("#gain", "-1", "change");
-  await page.setInput("#gain", "1.5", "change");
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  assert.equal(robot.sentOn("/camera_settings").length, 1);
-});
-
-test("a refused change says why", async () => {
-  robot.failNextSend = "The event loop is gone";
-  await tab("Settings");
-  await page.waitFor(`document.querySelector('#gain')`);
-  await page.setInput("#gain", "1", "change");
-  assert.equal(
-    await page.waitFor(
-      `document.querySelector('.camera-settings .error')?.textContent.trim()`,
-      {
-        what: "the error",
-      },
-    ),
-    "The event loop is gone",
+  await waitForSaved(
+    (s) => s?.exposure_100us === 0 && s?.gain === 2,
+    "the gain, keeping auto",
   );
+  // Leaving auto goes back to the last manual exposure this page set, or,
+  // on a page that set none, the constants' 6 ms.
+  await page.click(".setting-auto input");
+  await waitForSaved((s) => s?.exposure_100us === 60, "back to manual");
 });
 
-/** calibration_server's Status, as when collecting `captures`. */
-function collecting(sessionId, captures, sequence) {
-  return {
-    session_id: sessionId,
-    state: "COLLECTING",
-    camera: 2,
-    verdict: "NO_BOARD",
-    corners: 0,
-    min_corners: 15,
-    captures,
-    target_captures: 70,
-    session_sequence: sequence,
-  };
-}
-
-test("calibrating: start, see captures, and download their images", async () => {
-  robot.setLatest("/calibration", "frc.vision.calibration.Status", {
-    state: "IDLE",
-    camera: -1,
-  });
+test("calibrating: start, captures, export, download, cancel", async () => {
   await tab("Calibrate");
   await page.waitFor(
     `[...document.querySelectorAll('.calibrate-start option')].length === 2`,
     {what: "the cameras to pick from"},
   );
-  // Pick camera 2, and 40 captures.
   await page.evaluate(`(() => {
     const select = document.querySelector('.calibrate-start select');
     select.selectedIndex = 1;
     select.dispatchEvent(new Event('change'));
   })()`);
-  await page.setInput(".calibrate-start input[type=number]", "40");
+  await page.setInput(".calibrate-start input[type=number]", "10");
   await page.clickButton("Start");
-  const [start] = await sends("/calibration", 1);
-  assert.equal(start.action, "START");
-  assert.equal(start.camera, 2);
-  assert.equal(start.target_captures, 40);
-  assert.match(start.session_id, /\S/);
 
-  // calibration_server starts, and has three captures.
-  const id = start.session_id;
-  robot.setLatest("/calibration", "frc.vision.calibration.Status", {
-    ...collecting(id, 3, 1),
-    target_captures: 40,
-  });
-  robot.setLatest("/calibration", "frc.vision.calibration.Session", {
-    session_id: id,
-    state: "COLLECTING",
-    camera: 2,
-    image_width: 1600,
-    image_height: 1304,
-    board: BOARD,
-    boards: [BOARD],
-    target_captures: 40,
-    // Each capture's corners, where it saw them, and its pose.
-    captures: [0, 1, 2].map((i) => ({
-      monotonic_timestamp_ns: i * 1e9,
-      corners: [0, 1, 2, 3].map((id) => ({
-        id,
-        x: 400 + 300 * i + 40 * id,
-        y: 600 + 10 * id,
-      })),
-      rvec: [0.1 * i, 0, 0],
-      tvec: [0, 0, 1 + 0.5 * i],
-    })),
-  });
+  // robot_server stops the detectors, starts calibration_server, and it
+  // captures the fake camera's board as it moves.
   await page.waitFor(
     `document.querySelector('.calibrate-live h2')?.textContent.trim() === 'Calibrating camera 2'`,
-    {what: "the live session"},
+    {what: "the session", timeoutMs: 20000},
   );
-  assert.match(
-    await page.evaluate(`document.body.innerText`),
-    /3 of 40 captures/,
-  );
-
-  // Export, and the robot's zip shows as a link.
-  await page.clickButton("Export the images");
-  const exported = await sends("/calibration", 2);
-  assert.equal(exported[1].action, "EXPORT_IMAGES");
-  assert.equal(exported[1].session_id, id);
-  robot.setLatest("/calibration", "frc.vision.calibration.Status", {
-    ...collecting(id, 3, 2),
-    target_captures: 40,
-  });
-  robot.latest.get(
-    "/calibration frc.vision.calibration.Session",
-  ).images_download_path = `/calibration/camera2-${id}.zip`;
-  robot.latest.get(
-    "/calibration frc.vision.calibration.Session",
-  ).images_exported = 3;
-  const link = await page.waitFor(
+  await page.waitFor(
     `(() => {
-      const a = [...document.querySelectorAll('a[download]')]
-        .find((a) => /Download 3 images/.test(a.textContent));
-      return a ? a.getAttribute('href') : null;
+      const m = /(\\d+) of 10 captures/.exec(document.body.innerText);
+      return m && Number(m[1]) >= 3;
     })()`,
-    {what: "the download link"},
+    {what: "three captures", timeoutMs: 30000},
   );
-  assert.equal(link, `/calibration/camera2-${id}.zip`);
   await screenshot("calibrating");
 
-  // Other tabs say a session is running, and offer to cancel it.
-  await tab("Feeds");
+  await page.clickButton("Export the images");
+  const href = await page.waitFor(
+    `(() => {
+      const a = [...document.querySelectorAll('a[download]')]
+        .find((a) => /Download \\d+ images/.test(a.textContent));
+      return a ? a.getAttribute('href') : null;
+    })()`,
+    {what: "the download link", timeoutMs: 15000},
+  );
+  // The zip, from robot_server, as the browser downloads it: its directory
+  // lists a PNG for each capture exported, and the note.
+  const zip = await page.evaluate(`(async () => {
+    const response = await fetch(${JSON.stringify(href)});
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const view = new DataView(bytes.buffer);
+    const end = bytes.length - 22;
+    return {
+      status: response.status,
+      magic: String.fromCharCode(bytes[0], bytes[1]),
+      entries: view.getUint16(end + 10, true),
+    };
+  })()`);
+  assert.equal(zip.status, 200);
+  assert.equal(zip.magic, "PK");
+  const exported = Number(
+    /Download (\d+) images/.exec(
+      await page.evaluate(`document.body.innerText`),
+    )[1],
+  );
+  assert.ok(exported >= 3);
+  assert.equal(zip.entries, exported + 1);
+
+  // While it runs, starter says so.
+  await tab("Starter");
+  await page.waitFor(`${STARTER_STATES}?.calibration_server === 'RUNNING'`, {
+    what: "calibration_server running",
+    timeoutMs: 20000,
+  });
+  assert.equal(
+    (await page.evaluate(STARTER_STATES))["apriltag_detector0"],
+    "STOPPED",
+  );
+
+  // Cancelling from the banner puts the detectors back.
   await page.waitFor(`document.querySelector('.banner')`, {what: "the banner"});
   await page.clickButton("Cancel");
-  const cancelled = await sends("/calibration", 3);
-  assert.equal(cancelled[2].action, "CANCEL");
+  await page.waitFor(
+    `(() => {
+      const s = ${STARTER_STATES};
+      return s?.calibration_server === 'STOPPED' && s?.apriltag_detector0 === 'RUNNING';
+    })()`,
+    {what: "the detectors back", timeoutMs: 20000},
+  );
+  await screenshot("cancelled");
 });
 
 test("the page throws nothing", () => {
-  // web_proxy's refused socket and the missing video are expected noise.
+  // Video can't start without camera_streamer.
   const unexpected = browser.errors.filter(
-    (e) => !/WebSocket|wss:|\/ws|net::ERR|404|Failed to load resource/.test(e),
+    (e) => !/WebSocket|wss:|net::ERR|Failed to load resource/.test(e),
   );
   assert.deepEqual(unexpected, []);
 });

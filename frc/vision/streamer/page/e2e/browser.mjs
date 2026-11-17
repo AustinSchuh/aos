@@ -47,6 +47,11 @@ export class Browser {
         "--no-default-browser-check",
         // The fake robot's certificate is self-signed.
         "--ignore-certificate-errors",
+        // WebRTC to the robot's web_proxy on this machine: a test machine may
+        // have only loopback, which Chrome leaves out of ICE, and mDNS names
+        // for its addresses, which nothing here resolves.
+        "--allow-loopback-in-peer-connection",
+        "--disable-features=WebRtcHideLocalIpsWithMdns",
         "--remote-debugging-port=0",
         `--user-data-dir=${profile}`,
         "--window-size=1280,900",
