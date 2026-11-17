@@ -391,6 +391,7 @@ cc_binary(
         "//aos:init",
         "//aos/events:shm_event_loop",
         "//frc/constants:constants_sender_lib",
+        "@com_google_absl//absl/log:absl_log",
     ],
 )
 
