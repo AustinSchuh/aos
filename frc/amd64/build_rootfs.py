@@ -150,6 +150,17 @@ def main():
                 "nvidia-cudnn",
                 "libgstreamer-plugins-base1.0-dev",
                 "libgstreamer-plugins-bad1.0-dev",
+                # camera_streamer's pipeline: x264enc, rtph264pay and
+                # webrtcbin with its nice, dtls and srtp, so it runs on x86
+                # (in simulations, for the pages' end-to-end tests) as on the
+                # Orin.
+                "gstreamer1.0-plugins-good",
+                "gstreamer1.0-plugins-bad",
+                "gstreamer1.0-plugins-ugly",
+                "gstreamer1.0-nice",
+                # libdw, which libgstreamer links, needs it; Rust links it
+                # by its unversioned name.
+                "libbz2-dev",
                 "libturbojpeg0-dev",
                 "postgresql",
                 "apache2",
