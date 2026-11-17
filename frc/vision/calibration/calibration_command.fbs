@@ -43,6 +43,10 @@ enum CommandAction : ubyte {
   VALIDATE = 13,
   // Goes back to capturing; the measurements stay in the Session.
   STOP_VALIDATING = 14,
+  // Packs the captures' images into a zip, with the board and the
+  // calibrate_images command that calibrates from them, for robot_server to
+  // serve: Session's images_download_path.
+  EXPORT_IMAGES = 15,
 }
 
 table Command {

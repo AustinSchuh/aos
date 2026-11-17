@@ -178,3 +178,19 @@ cc_test(
         "@com_google_absl//absl/log:absl_log",
     ],
 )
+
+cc_library(
+    name = "zip_writer",
+    srcs = ["zip_writer.cc"],
+    hdrs = ["zip_writer.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "zip_writer_test",
+    srcs = ["zip_writer_test.cc"],
+    deps = [
+        ":zip_writer",
+        "//aos/testing:googletest",
+    ],
+)

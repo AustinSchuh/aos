@@ -124,6 +124,35 @@
       Tilt the board up to 45° and use the whole range of distances the robot
       sees tags at.
     </p>
+    <div class="row">
+      <button
+        type="button"
+        (click)="exportImages()"
+        [disabled]="calibration.busy || captures.length === 0"
+      >
+        Export the images
+      </button>
+      <a
+        *ngIf="session.imagesDownloadPath"
+        [href]="session.imagesDownloadPath"
+        download
+      >
+        Download {{ session.imagesExported }} images (zip)
+      </a>
+      <span
+        class="source"
+        *ngIf="
+          session.imagesDownloadPath &&
+          session.imagesExported !== captures.length
+        "
+      >
+        The captures have changed since: export again.
+      </span>
+    </div>
+    <p class="source">
+      Each capture's full image, with the board and the calibrate_images command
+      to calibrate from them offline.
+    </p>
   </section>
 
   <section class="card" *ngIf="session as session">

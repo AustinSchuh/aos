@@ -9,6 +9,7 @@
 
 #include "absl/log/absl_log.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "opencv2/imgcodecs.hpp"
 
 #include "aos/flatbuffer_merge.h"
@@ -18,6 +19,7 @@
 #include "frc/vision/calibration/intrinsics_calibration_lib.h"
 #include "frc/vision/util/charuco_lib.h"
 #include "frc/vision/util/vision_util_lib.h"
+#include "frc/vision/util/zip_writer.h"
 
 namespace frc::vision {
 namespace {
@@ -265,6 +267,8 @@ absl::Status CalibrationServer::Execute(const calibration::Command &command) {
         return absl::FailedPreconditionError("Solving");
       }
       return Validate(command);
+    case CommandAction::EXPORT_IMAGES:
+      return ExportImages();
     case CommandAction::STOP_VALIDATING:
       if (state_ == SessionState::VALIDATING) {
         state_ = solved_.has_value() &&
@@ -308,6 +312,9 @@ absl::Status CalibrationServer::Start(const calibration::Command &command) {
   capture_next_ = false;
   checks_.clear();
   validations_.clear();
+  next_image_ = 0;
+  images_download_path_.clear();
+  images_exported_ = 0;
   solved_.reset();
   solve_error_.clear();
   image_size_ = cv::Size();
@@ -512,10 +519,23 @@ void CalibrationServer::LookAtImage(const CameraImage &image) {
   }
   capture_next_ = false;
   gate_.Captured(H_camera_board);
+  // The image, for calibrating again offline: calibrate_images.
+  std::string image_file;
+  std::vector<uchar> png;
+  if (cv::imencode(".png", gray, png)) {
+    const std::filesystem::path path =
+        SessionFolder() / absl::StrFormat("frame_%04d.png", next_image_++);
+    if (WriteFile(path,
+                  std::string_view(reinterpret_cast<const char *>(png.data()),
+                                   png.size()))) {
+      image_file = path;
+    }
+  }
   captures_.push_back({.monotonic_timestamp_ns = image.monotonic_timestamp_ns(),
                        .capture = {detection.ids, detection.corners},
                        .rvec = detection.rvec,
-                       .tvec = detection.tvec});
+                       .tvec = detection.tvec,
+                       .image_file = image_file});
   verdict_ = FrameVerdict::CAPTURED;
   CapturesChanged();
 }
@@ -748,6 +768,59 @@ CalibrationServer::PackValidation(flatbuffers::FlatBufferBuilder *fbb) const {
   return fbb->CreateVector(lenses);
 }
 
+std::filesystem::path CalibrationServer::SessionFolder() const {
+  return std::filesystem::path(options_.calibration_folder) / "sessions" /
+         session_id_;
+}
+
+absl::Status CalibrationServer::ExportImages() {
+  ZipWriter zip;
+  int count = 0;
+  for (const StoredCapture &capture : captures_) {
+    if (capture.image_file.empty()) {
+      continue;
+    }
+    std::ifstream file(capture.image_file, std::ios::binary);
+    std::stringstream contents;
+    contents << file.rdbuf();
+    if (!file) {
+      return absl::InternalError(
+          absl::StrCat("Failed to read ", capture.image_file));
+    }
+    zip.Add(std::filesystem::path(capture.image_file).filename().string(),
+            contents.str());
+    ++count;
+  }
+  if (count == 0) {
+    return absl::FailedPreconditionError("No captures' images to export");
+  }
+  const std::string folder =
+      absl::StrFormat("camera%d-%s", camera_, session_id_);
+  std::ostringstream board;
+  board << board_;
+  zip.Add(
+      folder + ".txt",
+      absl::StrCat(
+          count, " captures of camera ", camera_,
+          camera_id_.empty() ? "" : absl::StrCat(" (", camera_id_, ")"), ", ",
+          image_size_.width, "x", image_size_.height, ", of a ", board.str(),
+          ".\n\nTo calibrate from them, unzip them to a folder and run:\n\n"
+          "  bazel run -c opt //frc/vision/calibration:calibrate_images -- \\\n"
+          "      --images=FOLDER --squares_x=",
+          board_.squares_x, " --squares_y=", board_.squares_y,
+          " \\\n      --square_length=", board_.square_length,
+          " --marker_length=", board_.marker_length, " \\\n      --dictionary=",
+          board_.dictionary, " --output=OUTPUT_FOLDER\n"));
+  const std::string name = folder + ".zip";
+  if (!WriteFile(std::filesystem::path(options_.www_folder) / name,
+                 zip.Finish())) {
+    return absl::InternalError(absl::StrCat("Failed to write ", name));
+  }
+  images_download_path_ = absl::StrCat(options_.www_path, "/", name);
+  images_exported_ = count;
+  return absl::OkStatus();
+}
+
 void CalibrationServer::SendStatus() {
   auto builder = status_sender_.MakeBuilder();
   const auto session_id = builder.fbb()->CreateString(session_id_);
@@ -901,6 +974,7 @@ flatbuffers::Offset<calibration::Session> CalibrationServer::PackSession(
   }
 
   const auto validation = PackValidation(fbb);
+  const auto images_download_path = fbb->CreateString(images_download_path_);
   const auto checks = fbb->CreateVector(checks_);
 
   calibration::Session::Builder session(*fbb);
@@ -922,6 +996,8 @@ flatbuffers::Offset<calibration::Session> CalibrationServer::PackSession(
     session.add_solve(solve);
   }
   session.add_validation(validation);
+  session.add_images_download_path(images_download_path);
+  session.add_images_exported(images_exported_);
   session.add_checks(checks);
   return session.Finish();
 }

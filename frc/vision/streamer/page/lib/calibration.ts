@@ -123,6 +123,9 @@ export interface Session {
   solve: Solve | null;
   validation: LensValidation[];
   checks: ValidationCheck[];
+  /** Where robot_server serves the last export of the captures' images. */
+  imagesDownloadPath: string;
+  imagesExported: number;
 }
 
 type Json = Record<string, unknown>;
@@ -291,6 +294,8 @@ export function parseSession(message: unknown): Session | null {
       };
     }),
     checks: list(m['checks']).map((check) => str(check) as ValidationCheck),
+    imagesDownloadPath: str(m['images_download_path']),
+    imagesExported: num(m['images_exported']),
   };
 }
 

@@ -114,6 +114,10 @@ table Session {
   // What validation measured, for each calibration checked.
   validation:[LensValidation] (id: 13);
   checks:[ValidationCheck] (id: 14);
+  // Where robot_server serves the last EXPORT_IMAGES' zip, and how many
+  // captures' images it holds.
+  images_download_path:string (id: 15);
+  images_exported:int (id: 16);
 }
 
 table CameraBoard {
