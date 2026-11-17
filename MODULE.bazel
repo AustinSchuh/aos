@@ -311,8 +311,7 @@ bazel_dep(name = "bazel_iwyu", version = "0.0.4", dev_dependency = True)
 
 bazel_dep(name = "rules_shell", version = "0.8.0")
 
-bazel_dep(name = "amd64_tensorrt", version = "10.9.0", dev_dependency = True)
-bazel_dep(name = "amd64_debian_sysroot", version = "2025.04.20", dev_dependency = True)
+bazel_dep(name = "amd64_debian_sysroot", version = "2026.11.17", dev_dependency = True)
 
 bazel_dep(name = "rules_rust", version = "0.71.3")
 
@@ -852,8 +851,34 @@ use_repo(
     llvm_k8 = "llvm_k8_llvm",
 )
 
+# CUDA 13.2, the Orin's (JetPack 7.2), from NVIDIA's redistributable
+# archives rather than either sysroot: the same toolkit for x86 and the Orin.
+# Its host tools are x86's for either target; its headers and runtime are the
+# target's (linux-sbsa for the Orin: CUDA 13 has one Arm build).
+cuda = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain", dev_dependency = True)
+cuda.redist_json(
+    name = "cuda_redist",
+    components = [
+        "cccl",
+        "crt",
+        "cudart",
+        "culibos",
+        # clang's CUDA wrapper header includes curand_mtgp32_kernel.h.
+        "curand",
+        "nvcc",
+        "nvvm",
+    ],
+    platforms = [
+        "linux-sbsa",
+        "linux-x86_64",
+    ],
+    version = "13.2.2",
+)
+cuda.toolkit(name = "cuda")
+use_repo(cuda, "cuda")
+
 register_toolchains(
-    "//tools/cuda:x86_64_clang_toolchain",
+    "//tools/cuda:linux_clang_toolchain",
     "//tools/cuda:aarch64_clang_toolchain",
     "//tools/cuda:no_gpu_clang_toolchain",
     dev_dependency = True,
@@ -961,5 +986,5 @@ single_version_override(
         "rm -f usr/share/man/man2/_Exit.2.gz usr/share/man/man2/exit.2.gz usr/share/man/man7/pam.7.gz",
         "rm -f usr/share/terminfo/N/NCR260VT300WPP",
     ],
-    version = "2025.04.20",
+    version = "2026.11.17",
 )

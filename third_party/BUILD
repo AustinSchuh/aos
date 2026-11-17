@@ -110,8 +110,18 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = select({
         "//tools:arm64_macos": [":unavailable"],
-        "//tools:cpu_arm64": ["@arm64_debian_sysroot//:cudart"],
-        "//tools:cpu_k8": ["@amd64_debian_sysroot//:cudart"],
+        # CUDA 13.2's runtime and headers, from NVIDIA's archives, with
+        # cuRAND's, which clang's CUDA wrapper header includes.
+        "//tools:cpu_arm64": [
+            "@cuda//:cuda_headers",
+            "@cuda//:cuda_runtime",
+            "@cuda//:curand_headers",
+        ],
+        "//tools:cpu_k8": [
+            "@cuda//:cuda_headers",
+            "@cuda//:cuda_runtime",
+            "@cuda//:curand_headers",
+        ],
         "//conditions:default": [":unavailable"],
     }),
 )
@@ -126,7 +136,7 @@ cc_library(
     deps = select({
         "//tools:arm64_macos": [":unavailable"],
         "//tools:cpu_arm64": ["@arm64_debian_sysroot//:tensorrt"],
-        "//tools:cpu_k8": ["@amd64_tensorrt//:tensorrt"],
+        "//tools:cpu_k8": ["@amd64_debian_sysroot//:tensorrt"],
         "//conditions:default": [":unavailable"],
     }),
 )
