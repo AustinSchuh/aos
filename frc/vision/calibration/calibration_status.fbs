@@ -1,0 +1,59 @@
+// calibration_server's live summary of a calibration session; see
+// calibration_session.fbs.
+namespace frc.vision.calibration;
+
+enum SessionState : ubyte {
+  // No session: waiting for START.
+  IDLE = 0,
+  // Taking captures.
+  COLLECTING = 1,
+  // Solving; the captures can't change until it's done.
+  SOLVING = 2,
+  // Solved: the captures can still change, and the solve be redone.
+  SOLVED = 3,
+}
+
+// What became of the last frame looked at.
+enum FrameVerdict : ubyte {
+  // No image from the camera recently.
+  NO_IMAGE = 0,
+  // Too few of the board's corners found.
+  TOO_FEW_CORNERS = 1,
+  // Corners found, but no pose from them.
+  NO_POSE = 2,
+  // Too close to the last capture.
+  MOVE_TO_NEW_POSE = 3,
+  // Far enough from the last capture, but moving.
+  HOLD_STILL = 4,
+  // Captured.
+  CAPTURED = 5,
+  // Not collecting: no session, or solving.
+  NOT_COLLECTING = 6,
+  // As many captures as the target: solve, or capture more by hand.
+  TARGET_REACHED = 7,
+}
+
+// About 5 Hz, small.
+table Status {
+  session_id:string (id: 0);
+  state:SessionState (id: 1);
+  camera:int (id: 2);
+  verdict:FrameVerdict (id: 3);
+  // Corners found in the last frame, and how many a capture needs.
+  corners:int (id: 4);
+  min_corners:int (id: 5);
+  // How far the board has moved from the last capture, as a fraction of
+  // what's needed, and how much since the last frame, as a fraction of the
+  // still limit.
+  moved:double (id: 6);
+  motion:double (id: 7);
+  captures:int (id: 8);
+  target_captures:int (id: 9);
+  // The last command's error, if it failed.
+  error:string (id: 10);
+  // Counts the Session messages sent, so a page polling Status fetches the
+  // Session only when there's a new one.
+  session_sequence:int (id: 11);
+}
+
+root_type Status;

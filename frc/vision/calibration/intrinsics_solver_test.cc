@@ -33,7 +33,7 @@ std::vector<CharucoCapture> Captures(
   std::uniform_real_distribution<double> tilt(-0.6, 0.6), shift(-0.35, 0.35),
       distance(0.8, 1.6);
 #if CV_VERSION_MINOR >= 9
-  const std::vector<cv::Point3f> &corners = board->getChessboardCorners();
+  const std::vector<cv::Point3f> corners = board->getChessboardCorners();
 #else
   const std::vector<cv::Point3f> &corners = board->chessboardCorners;
 #endif

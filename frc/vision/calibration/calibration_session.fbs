@@ -1,0 +1,105 @@
+include "frc/vision/calibration.fbs";
+include "frc/vision/calibration/calibration_status.fbs";
+
+// The messages of a calibration session from the vision page: the page sends
+// /calibration Command (calibration_command.fbs) through robot_server, and
+// calibration_server answers with /calibration Status
+// (calibration_status.fbs), a small live summary, and /calibration Session,
+// the whole session every time it changes.
+namespace frc.vision.calibration;
+
+struct Corner {
+  // Pixels, not undistorted.
+  x:float;
+  y:float;
+  // The board's inner corner number.
+  id:short;
+}
+
+// A corner's error after a solve, observed less projected, in hundredths of a
+// pixel, saturating at +-327 px.
+struct Residual {
+  dx:short;
+  dy:short;
+}
+
+table Capture {
+  // When the image was taken.
+  monotonic_timestamp_ns:int64 (id: 0);
+  corners:[Corner] (id: 1);
+  // The board's pose, board to camera, from the starting calibration:
+  // angle-axis rotation and translation in meters.
+  rvec:[double] (id: 2);
+  tvec:[double] (id: 3);
+}
+
+table CaptureResiduals {
+  // In the order of the capture's corners.
+  residuals:[Residual] (id: 0);
+}
+
+table Solve {
+  calibration:CameraCalibration (id: 0);
+  // RMS over every corner, and over each capture's, in pixels.
+  reprojection_error:double (id: 1);
+  capture_errors:[double] (id: 2);
+  // Each corner's error; left out when the session would be too big to send
+  // with them.
+  residuals:[CaptureResiduals] (id: 3);
+  // Whether it passes ValidateCalibration at the image's size, and why not.
+  valid:bool (id: 4);
+  validation_error:string (id: 5);
+  // The file it was saved to on the robot, and where robot_server serves a
+  // copy, once saved.
+  saved_path:string (id: 6);
+  download_path:string (id: 7);
+  // How many of the captures it was solved from: captures added since are
+  // not in it.
+  captures:int (id: 8);
+  // The solve's error, if it failed.
+  error:string (id: 9);
+}
+
+table SavedBoard {
+  name:string (id: 0);
+  board:BoardSpec (id: 1);
+  // One of the built-in presets, which can't be deleted.
+  preset:bool (id: 2);
+}
+
+// The whole session, sent after each change, at most once a second.
+table Session {
+  session_id:string (id: 0);
+  state:SessionState (id: 1);
+  camera:int (id: 2);
+  // The physical camera, as calibrations are filed under.
+  camera_id:string (id: 3);
+  image_width:int (id: 4);
+  image_height:int (id: 5);
+  board:BoardSpec (id: 6);
+  // Where robot_server serves a picture of the board to print.
+  board_image_path:string (id: 7);
+  boards:[SavedBoard] (id: 8);
+  target_captures:int (id: 9);
+  captures:[Capture] (id: 10);
+  // The calibration the session started from: the camera's current one, from
+  // /constants, if it has one.
+  current:CameraCalibration (id: 11);
+  solve:Solve (id: 12);
+}
+
+table CameraBoard {
+  camera:int (id: 0);
+  board:BoardSpec (id: 1);
+}
+
+// What calibration_server keeps on the robot between sessions.
+table BoardStore {
+  // The boards people saved; the presets aren't kept here.
+  boards:[SavedBoard] (id: 0);
+  // The last board used on each camera.
+  last_boards:[CameraBoard] (id: 1);
+  target_captures:int (id: 2);
+}
+
+root_type Session;

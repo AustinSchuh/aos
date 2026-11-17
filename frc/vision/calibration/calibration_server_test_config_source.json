@@ -1,0 +1,45 @@
+{
+  "channels": [
+    {
+      "name": "/constants",
+      "type": "frc.vision.CameraConstants",
+      "max_size": 4096,
+      "frequency": 1
+    },
+    {
+      "name": "/camera0/gray",
+      "type": "frc.vision.CameraImage",
+      "max_size": 4172800,
+      "frequency": 125,
+      "channel_storage_duration": 100000000
+    },
+    {
+      "name": "/camera0/calibration",
+      "type": "foxglove.ImageAnnotations",
+      "max_size": 16384,
+      "frequency": 15
+    },
+    {
+      "name": "/calibration",
+      "type": "frc.vision.calibration.Command",
+      "max_size": 2048,
+      "frequency": 20,
+      "num_senders": 2
+    },
+    {
+      "name": "/calibration",
+      "type": "frc.vision.calibration.Status",
+      "max_size": 512,
+      "frequency": 15
+    },
+    {
+      "name": "/calibration",
+      "type": "frc.vision.calibration.Session",
+      "max_size": 262144,
+      "frequency": 2
+    }
+  ],
+  "imports": [
+    "../../../aos/events/aos.json"
+  ]
+}

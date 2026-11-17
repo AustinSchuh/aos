@@ -118,7 +118,7 @@
       "name": "/camera0/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 6,
+      "num_readers": 7,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -192,7 +192,7 @@
       "name": "/camera1/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 6,
+      "num_readers": 7,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -245,7 +245,7 @@
       "name": "/camera2/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 6,
+      "num_readers": 7,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -298,7 +298,7 @@
       "name": "/camera3/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
-      "num_readers": 6,
+      "num_readers": 7,
       "source_node": "orin",
       "logger": "NOT_LOGGED",
       "channel_storage_duration": 100000000,
@@ -355,6 +355,55 @@
       "type": "frc.orin.HardwareStats",
       "source_node": "orin",
       "frequency": 1
+    },
+    {
+      "name": "/camera0/calibration",
+      "type": "foxglove.ImageAnnotations",
+      "source_node": "orin",
+      "max_size": 16384,
+      "frequency": 15
+    },
+    {
+      "name": "/camera1/calibration",
+      "type": "foxglove.ImageAnnotations",
+      "source_node": "orin",
+      "max_size": 16384,
+      "frequency": 15
+    },
+    {
+      "name": "/camera2/calibration",
+      "type": "foxglove.ImageAnnotations",
+      "source_node": "orin",
+      "max_size": 16384,
+      "frequency": 15
+    },
+    {
+      "name": "/camera3/calibration",
+      "type": "foxglove.ImageAnnotations",
+      "source_node": "orin",
+      "max_size": 16384,
+      "frequency": 15
+    },
+    {
+      "name": "/calibration",
+      "type": "frc.vision.calibration.Command",
+      "source_node": "orin",
+      "max_size": 2048,
+      "frequency": 20
+    },
+    {
+      "name": "/calibration",
+      "type": "frc.vision.calibration.Status",
+      "source_node": "orin",
+      "max_size": 512,
+      "frequency": 15
+    },
+    {
+      "name": "/calibration",
+      "type": "frc.vision.calibration.Session",
+      "source_node": "orin",
+      "max_size": 262144,
+      "frequency": 2
     }
   ],
   "applications": [
@@ -416,6 +465,11 @@
     },
     {
       "name": "camera_streamer",
+      "nodes": ["orin"]
+    },
+    {
+      "name": "calibration_server",
+      "autostart": false,
       "nodes": ["orin"]
     },
     {

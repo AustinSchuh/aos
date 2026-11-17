@@ -12,7 +12,7 @@
 namespace frc::vision {
 namespace {
 
-const std::vector<cv::Point3f> &ChessboardCorners(
+std::vector<cv::Point3f> ChessboardCorners(
     const cv::Ptr<cv::aruco::CharucoBoard> &board) {
 #if CV_VERSION_MINOR >= 9
   return board->getChessboardCorners();
@@ -74,7 +74,7 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
     return absl::FailedPreconditionError(absl::StrCat(
         "Need at least 4 captures to calibrate, not ", captures.size()));
   }
-  const std::vector<cv::Point3f> &board_corners = ChessboardCorners(board);
+  const std::vector<cv::Point3f> board_corners = ChessboardCorners(board);
 
   cv::Mat guess_matrix, guess_dist;
   camera_matrix.convertTo(guess_matrix, CV_64F);

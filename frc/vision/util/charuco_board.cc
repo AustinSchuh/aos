@@ -11,7 +11,8 @@ namespace {
 
 struct Dictionary {
   std::string_view name;
-  cv::aruco::PREDEFINED_DICTIONARY_NAME id;
+  // OpenCV's predefined dictionary, as getPredefinedDictionary takes it.
+  int id;
   int size;
 };
 
@@ -115,8 +116,7 @@ absl::Status ValidateBoardSpec(const BoardSpec &spec) {
 cv::Ptr<cv::aruco::CharucoBoard> MakeCharucoBoard(const BoardSpec &spec) {
   const absl::Status valid = ValidateBoardSpec(spec);
   ABSL_CHECK(valid.ok()) << valid;
-  const cv::aruco::PREDEFINED_DICTIONARY_NAME id =
-      FindDictionary(spec.dictionary)->id;
+  const int id = FindDictionary(spec.dictionary)->id;
 #if CV_VERSION_MINOR >= 9
   return cv::makePtr<cv::aruco::CharucoBoard>(
       cv::Size(spec.squares_x, spec.squares_y), spec.square_length,
