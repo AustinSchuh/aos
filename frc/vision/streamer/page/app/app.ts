@@ -6,9 +6,12 @@ import {CalibrationSession} from './calibration';
 import {NODE, Robot} from './robot';
 import {CameraStreams} from './streams';
 
-type Tab = 'feeds' | 'calibrate' | 'settings';
+type Tab = 'feeds' | 'calibrate' | 'settings' | 'field' | 'starter';
 
-/** The vision page: the cameras' feeds, and their settings and calibrations. */
+/**
+ * The vision page: the cameras' feeds, and their settings and calibrations; and, embedded, the
+ * robot's own field map (the localizer's /field.html) and starter status (/starter.html).
+ */
 @Component({
   selector: 'vision-app',
   templateUrl: './app.ng.html',
