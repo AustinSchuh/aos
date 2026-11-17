@@ -5,4 +5,5 @@
 pub use camera_streamer_core::{annotations, draw, frame, join, overlay, signalling, tag_box};
 
 pub mod pipeline;
+pub mod server;
 pub mod streamer;
