@@ -8,6 +8,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "camera_streamer_core",
     srcs = [
+        "annotations.rs",
         "core.rs",
         "draw.rs",
         "frame.rs",
@@ -21,6 +22,7 @@ rust_library(
         "//frc/vision:camera_constants_rust_fbs",
         "//frc/vision:target_map_rust_fbs",
         "@aos_flatbuffers//rust:flatbuffers",
+        "@com_github_foxglove_schemas//:ImageAnnotations_rust_fbs",
         "@crate_index//:serde_json",
     ],
 )
@@ -56,6 +58,8 @@ rust_library(
 _BINARY_DEPS = [
     ":camera_streamer_lib",
     "//aos:configuration_rs",
+    "//aos:configuration_rust_fbs",
+    "//aos:flatbuffers_rs",
     "//aos:init_rs",
     "//aos/events:tokio_event_loop_rs",
     "//frc/vision:vision_rust_fbs",

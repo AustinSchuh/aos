@@ -7,6 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::draw::{self, Frame};
 use crate::frame;
 use crate::join::{Join, JoinOptions, Ready};
+use crate::overlay::Overlay;
 use crate::pipeline::{Pipeline, Session, Settings};
 use crate::signalling::ToBrowser;
 use crate::tag_box::{self, Intrinsics};
@@ -33,6 +34,10 @@ pub struct Options {
     pub tag_size: f64,
 }
 
+/// How far from the frame calibration_server found its corners in they're drawn: a little more
+/// than it takes between looks, at 10 Hz.
+const CORNERS_SHOWN_FOR_NS: i64 = 150_000_000;
+
 struct Camera {
     last_sent_ns: Option<i64>,
     /// Frames waiting for their overlays.
@@ -41,6 +46,8 @@ struct Camera {
     scale: f64,
     /// Its calibration, for drawing the tags' boxes; `None` until the constants have one.
     intrinsics: Option<Intrinsics>,
+    /// calibration_server's latest corners on this camera.
+    corners: Option<Overlay>,
 }
 
 struct Viewer {
@@ -74,6 +81,7 @@ impl Streamer {
                             join: Join::new(options.join),
                             scale: 1.0,
                             intrinsics: None,
+                            corners: None,
                         },
                     )
                 })
@@ -237,6 +245,17 @@ impl Streamer {
             if let Some(overlay) = overlay {
                 draw::draw(&mut frame, &overlay, scale);
             }
+            // calibration_server looks at a frame in three, so its corners are drawn on every
+            // frame near the one they were found in, rather than joined to exactly theirs.
+            if let Some(corners) = self
+                .cameras
+                .get(&camera)
+                .and_then(|state| state.corners.as_ref())
+            {
+                if (capture_ns - corners.capture_ns).abs() <= CORNERS_SHOWN_FOR_NS {
+                    draw::draw(&mut frame, corners, scale);
+                }
+            }
             self.pipeline.push(camera, frame.i420, capture_ns);
         }
     }
@@ -341,6 +360,13 @@ impl Streamer {
         };
         let ready = state.join.add_overlay(overlay, now_ns);
         self.send(camera, ready);
+    }
+
+    /// calibration_server's corners found in one of `camera`'s images.
+    pub fn on_corners(&mut self, camera: u32, corners: Overlay) {
+        if let Some(state) = self.cameras.get_mut(&camera) {
+            state.corners = Some(corners);
+        }
     }
 
     /// When `camera`'s oldest waiting frame stops waiting for its overlays, if one is waiting.
