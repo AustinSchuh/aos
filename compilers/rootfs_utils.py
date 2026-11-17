@@ -108,13 +108,17 @@ def scoped_tmpdir_tarball(image):
     """
     with tempfile.TemporaryDirectory() as tempdir:
         logging.info(f'Extracting original image to {tempdir}')
-        subprocess.run([
-            "tar",
-            "xf",
-            image,
-            "-C",
-            tempdir,
-        ], check=True)
+        subprocess.run(
+            [
+                "tar",
+                "xf",
+                image,
+                "-C",
+                tempdir,
+                # Device nodes take root to make, and nothing reads them.
+                "--exclude=./dev/*",
+            ],
+            check=True)
 
         yield tempdir
 
@@ -602,6 +606,15 @@ class Filesystem:
             # Directories are all the things before the last /
             for parent in pathlib.Path(file).parents:
                 self.directories.add(str(parent))
+
+        # Packaged files the image leaves out (build_rootfs.py excludes some,
+        # such as TensorRT's builder) aren't there to find, and Bazel can't
+        # name a file with a ':' in it (Perl's man pages, Dpkg::Arch.3perl.gz).
+        for package in self.packages.values():
+            package.files = [
+                f for f in package.files
+                if ':' not in f and os.path.lexists(f"{self.partition}/{f}")
+            ]
 
         # Now, populate self.files with a mapping from each file to the owning
         # package so we can do file ownership lookups.
