@@ -89,6 +89,10 @@ class V4L2ReaderBase {
 
   int Ioctl(unsigned long number, void *arg);
 
+  // `value` within what the camera takes for control `id`, so a value it
+  // can't take sets the nearest it can rather than failing.
+  int ClampToControl(uint32_t id, int value);
+
   bool multiplanar() const { return multiplanar_; }
 
   // TODO(Brian): This concept won't exist once we start using variable-size
