@@ -344,6 +344,15 @@ char *aos_configuration_channel_message_to_json(const aos_channel_t *channel,
                                                 size_t *json_size);
 void aos_string_destroy(char *string);
 
+// Parses `json_size` bytes of JSON at `json` as a message on `channel`, into a
+// new buffer of `*message_size` bytes.  Returns NULL if the channel has no
+// schema or the JSON doesn't parse as its type.  Free the buffer with
+// aos_string_destroy.
+char *aos_configuration_channel_json_to_message(const aos_channel_t *channel,
+                                                const char *json,
+                                                size_t json_size,
+                                                size_t *message_size);
+
 // All aos_simulated_event_loop_* functions may move to a different file, once
 // we decide on a path for scalable shared libraries.
 

@@ -10,9 +10,10 @@ use aos_events_event_loop_c::{
     aos_configuration_buffer_destroy, aos_configuration_buffer_get_data,
     aos_configuration_buffer_get_size, aos_configuration_buffer_maybe_read_from_file,
     aos_configuration_channel_has_name, aos_configuration_channel_has_type,
-    aos_configuration_channel_is_readable_on_node, aos_configuration_channel_message_to_json,
-    aos_configuration_channel_name, aos_configuration_channel_type, aos_configuration_get_channel,
-    aos_configuration_get_node, aos_string_destroy,
+    aos_configuration_channel_is_readable_on_node, aos_configuration_channel_json_to_message,
+    aos_configuration_channel_message_to_json, aos_configuration_channel_name,
+    aos_configuration_channel_type, aos_configuration_get_channel, aos_configuration_get_node,
+    aos_string_destroy,
 };
 use aos_flatbuffers::{transmute_table_to, NonSizePrefixedFlatbuffer};
 
@@ -191,6 +192,28 @@ pub trait ChannelExt<'a>: AsChannel<'a> {
         unsafe { aos_string_destroy(json) };
         Some(String::from_utf8(result).expect("FlatbufferToJson writes UTF-8"))
     }
+
+    /// `json` as a message on this channel.  `None` if the channel has no schema, or `json`
+    /// doesn't parse as its type.
+    fn json_to_message(self, json: &str) -> Option<Vec<u8>> {
+        let mut size = 0;
+        // SAFETY: The channel and json are valid for the call, which keeps neither.
+        let message = unsafe {
+            aos_configuration_channel_json_to_message(
+                self.as_channel(),
+                json.as_ptr().cast(),
+                json.len(),
+                &mut size,
+            )
+        };
+        if message.is_null() {
+            return None;
+        }
+        // SAFETY: It returned `size` bytes, which are ours until we destroy them.
+        let result = unsafe { std::slice::from_raw_parts(message as *const u8, size) }.to_vec();
+        unsafe { aos_string_destroy(message) };
+        Some(result)
+    }
 }
 
 impl<'a, T: AsChannel<'a>> ChannelExt<'a> for T {}
@@ -287,5 +310,26 @@ mod tests {
         );
         // Not a Ping.
         assert_eq!(channel.message_to_json(&[1, 2, 3], 100), None);
+    }
+
+    #[test]
+    fn json_to_message() {
+        let config = read_config_from(&artifact_path(Path::new(
+            "aos/testing/ping_pong/pingpong_config.json",
+        )))
+        .unwrap();
+        let channel = config
+            .message()
+            .get_channel("/test", "aos.examples.Ping", "", None)
+            .unwrap();
+        let message = channel
+            .json_to_message(r#"{"value": 7, "send_time": 123}"#)
+            .unwrap();
+        assert_eq!(
+            channel.message_to_json(&message, 100).as_deref(),
+            Some(r#"{ "value": 7, "send_time": 123 }"#)
+        );
+        assert_eq!(channel.json_to_message(r#"{"nope": 1}"#), None);
+        assert_eq!(channel.json_to_message("not json"), None);
     }
 }

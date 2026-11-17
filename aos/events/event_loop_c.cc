@@ -675,6 +675,29 @@ char *aos_configuration_channel_message_to_json(const aos_channel_t *channel,
 
 void aos_string_destroy(char *string) { free(string); }
 
+char *aos_configuration_channel_json_to_message(const aos_channel_t *channel,
+                                                const char *json,
+                                                size_t json_size,
+                                                size_t *message_size) {
+  const aos::Channel *c =
+      reinterpret_cast<const aos::Channel *>(ABSL_DIE_IF_NULL(channel));
+  ABSL_CHECK(message_size != nullptr);
+  if (!c->has_schema() || c->schema()->root_table() == nullptr ||
+      json == nullptr) {
+    return nullptr;
+  }
+  const flatbuffers::DetachedBuffer message = aos::JsonToFlatbuffer(
+      std::string_view(json, json_size), aos::FlatbufferType(c->schema()));
+  if (message.size() == 0) {
+    return nullptr;
+  }
+  char *result = static_cast<char *>(malloc(message.size()));
+  ABSL_CHECK(result != nullptr);
+  memcpy(result, message.data(), message.size());
+  *message_size = message.size();
+  return result;
+}
+
 bool aos_configuration_node_has_name(const aos_node_t *node) {
   return reinterpret_cast<const aos::Node *>(ABSL_DIE_IF_NULL(node))
       ->has_name();
