@@ -261,6 +261,7 @@ cc_library(
     name = "field_side_exposure_adjuster_lib",
     srcs = ["field_side_exposure_adjuster_lib.cc"],
     hdrs = ["field_side_exposure_adjuster_lib.h"],
+    visibility = ["//frc/vision/sim:__pkg__"],
     deps = [
         ":camera_settings_fbs",
         "//aos:configuration",

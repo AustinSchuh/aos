@@ -1,0 +1,22 @@
+{
+  "constants": [
+    {
+      "team": 0,
+      "robot_name": "test",
+      "data": {
+        /* These all hold 25-07's model, with the principal point moved for the
+           centered 1456x1088 crop of its 1600x1304 image. */
+        "calibration": [
+          {% include 'frc/vision/testdata/test-calibration_cam-1.json' %},
+          {% include 'frc/vision/testdata/test-calibration_cam-2.json' %},
+          {% include 'frc/vision/testdata/test-calibration_cam-3.json' %},
+          {% include 'frc/vision/testdata/test-calibration_cam-4.json' %}
+        ],
+        "default_camera_stream_settings": {
+          "image_width": 1456,
+          "image_height": 1088
+        }
+      }
+    }
+  ]
+}

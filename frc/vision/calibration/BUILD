@@ -405,6 +405,7 @@ cc_library(
     srcs = ["calibration_server_lib.cc"],
     hdrs = ["calibration_server_lib.h"],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//frc/vision/sim:__pkg__"],
     deps = [
         ":calibration_command_fbs",
         ":calibration_session_fbs",
@@ -491,6 +492,7 @@ cc_library(
     srcs = ["charuco_rendering.cc"],
     hdrs = ["charuco_rendering.h"],
     target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//frc/vision/sim:__pkg__"],
     deps = [
         ":charuco_detector",
         "//third_party:opencv",
