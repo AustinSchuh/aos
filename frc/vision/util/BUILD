@@ -31,6 +31,15 @@ cc_test(
 )
 
 cc_library(
+    name = "corner_refinement",
+    srcs = ["corner_refinement.cc"],
+    hdrs = ["corner_refinement.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = ["//third_party:opencv"],
+)
+
+cc_library(
     name = "charuco_lib",
     srcs = [
         "charuco_lib.cc",
