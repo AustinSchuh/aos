@@ -29,8 +29,13 @@ ABSL_FLAG(
 ABSL_FLAG(
     bool, review_images, false,
     "Whether to review the calibration result (only when reading from files)");
+ABSL_FLAG(std::string, distortion_model, "kannala_brandt",
+          "The lens model to calibrate: kannala_brandt (as OpenCV's fisheye "
+          "module has it), or opencv (its pinhole model, with "
+          "--use_rational_model's 8 terms or 5).");
 ABSL_FLAG(bool, use_rational_model, true,
-          "Whether to use the 8 parameter rational model");
+          "With --distortion_model=opencv, whether to use the 8 parameter "
+          "rational model");
 
 ABSL_DECLARE_FLAG(bool, visualize);
 
@@ -476,9 +481,25 @@ absl::Status IntrinsicsCalibration::MaybeCalibrate() {
     for (size_t i = 0; i < all_charuco_ids_.size(); ++i) {
       captures.push_back({all_charuco_ids_[i], all_charuco_corners_[i]});
     }
-    absl::StatusOr<IntrinsicsSolution> solution = SolveIntrinsics(
-        charuco_extractor_.board(), captures, image_size_, camera_mat_,
-        dist_coeffs_, absl::GetFlag(FLAGS_use_rational_model));
+    const std::string distortion_model = absl::GetFlag(FLAGS_distortion_model);
+    if (distortion_model != "kannala_brandt" && distortion_model != "opencv") {
+      return absl::InvalidArgumentError(
+          absl::StrCat("--distortion_model is kannala_brandt or opencv, not ",
+                       distortion_model));
+    }
+    const LensModel model =
+        distortion_model == "kannala_brandt"      ? LensModel::kKannalaBrandt
+        : absl::GetFlag(FLAGS_use_rational_model) ? LensModel::kOpenCvRational
+                                                  : LensModel::kOpenCv5;
+    // From the starting calibration's model, with the camera matrix and
+    // coefficients it holds (which a test may have set).
+    CameraLens guess = charuco_extractor_.lens();
+    camera_mat_.convertTo(guess.camera_matrix, CV_64F);
+    dist_coeffs_.convertTo(guess.dist_coeffs, CV_64F);
+    absl::StatusOr<IntrinsicsSolution> solution =
+        SolveIntrinsics(charuco_extractor_.board(), captures, image_size_,
+                        guess, SolveOptions{.model = model});
+    camera_model_ = model;
     if (!solution.ok()) {
       ABSL_LOG(ERROR) << solution.status();
       return solution.status();
@@ -509,7 +530,10 @@ absl::Status IntrinsicsCalibration::MaybeCalibrate() {
         camera_calibration = BuildCalibration(
             camera_mat_, dist_coeffs_, realtime_now, node_name_,
             camera_channel_, camera_id_, team_number.value(),
-            reprojection_error_, BoardSpecFromFlags());
+            reprojection_error_, BoardSpecFromFlags(),
+            camera_model_ == LensModel::kKannalaBrandt
+                ? calibration::DistortionModel::KANNALA_BRANDT
+                : calibration::DistortionModel::OPENCV);
     std::stringstream time_ss;
     time_ss << realtime_now;
 

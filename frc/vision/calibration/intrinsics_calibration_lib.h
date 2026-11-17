@@ -130,6 +130,8 @@ class IntrinsicsCalibration {
 
   // Decides which frames to capture.
   CaptureGate capture_gate_;
+  // The model the last solve was in.
+  LensModel camera_model_ = LensModel::kKannalaBrandt;
 
   // Image used to visualize collected points as they come in
   cv::Mat point_viz_image_;

@@ -30,6 +30,7 @@ ABSL_DECLARE_FLAG(bool, large_board);
 ABSL_DECLARE_FLAG(bool, coarse_pattern);
 ABSL_DECLARE_FLAG(bool, dict5x5_9x14_board);
 ABSL_DECLARE_FLAG(bool, write_invalid_calibration);
+ABSL_DECLARE_FLAG(std::string, distortion_model);
 
 namespace numbers = std::numbers;
 
@@ -110,6 +111,8 @@ absl::Status RunIntrinsicFromPoints(std::string calib_filename,
   calibrator.SetCameraMatrix(camera_mat_init);
   calibrator.SetDistortionCoefficients(dist_coeffs_init);
 
+  // Recover the OpenCV coefficients the points were made with.
+  absl::SetFlag(&FLAGS_distortion_model, "opencv");
   if (dist_coeffs.size().height == 5) {
     ABSL_LOG(INFO) << "Using 5 parameter traditional model";
     absl::SetFlag(&FLAGS_use_rational_model, false);
@@ -380,11 +383,23 @@ TEST(IntrinsicCalculationTest, ImagePlayback) {
                  << test_images_path.string();
   absl::SetFlag(&FLAGS_image_load_path, test_images_path.string());
   calibrator.LoadImagesFromPath(test_images_path);
+  // Calibrated with Kannala-Brandt, the default, which models this wide lens
+  // without folding outside the data: it passes validation, so it's written.
+  absl::SetFlag(&FLAGS_distortion_model, "kannala_brandt");
   EXPECT_TRUE(calibrator.MaybeCalibrate().ok());
 
-  CheckAgainstKnownCalibration(calibrator);
-  // Validate that reprojection error is < 1
-  EXPECT_LT(calibrator.GetReprojectionError(), 1.0);
+  // The stored calibration is the rational model's, so the coefficients
+  // aren't comparable, but the camera matrix is within a few pixels of it.
+  const cv::Mat known = calibrator.GetCharucoExtractor().camera_matrix();
+  const cv::Mat solved = calibrator.GetCameraMatrix();
+  for (const auto [row, column] :
+       {std::pair{0, 0}, std::pair{1, 1}, std::pair{0, 2}, std::pair{1, 2}}) {
+    EXPECT_NEAR(solved.at<double>(row, column), known.at<float>(row, column),
+                3.0)
+        << row << ", " << column;
+  }
+  EXPECT_EQ(calibrator.GetDistortionCoefficients().total(), 4u);
+  EXPECT_LT(calibrator.GetReprojectionError(), 0.5);
   EXPECT_GT(calibrator.NumCaptures(), 50);
 }
 
