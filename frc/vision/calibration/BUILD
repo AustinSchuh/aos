@@ -425,11 +425,13 @@ cc_library(
         "//frc/vision/util:charuco_board",
         "//frc/vision/util:charuco_lib",
         "//frc/vision/util:vision_util_lib",
+        "//frc/vision/util:zip_writer",
         "//third_party:opencv",
         "@com_github_foxglove_schemas//:schemas",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@eigen",
     ],
 )
@@ -530,5 +532,45 @@ cc_test(
         "//aos/testing:googletest",
         "//frc/vision/util:charuco_board",
         "//third_party:opencv",
+    ],
+)
+
+# The report page calibrate_images writes, its data filled in.
+genrule(
+    name = "calibrate_images_report",
+    srcs = ["calibration_report.html"],
+    outs = ["calibrate_images_report.h"],
+    cmd = " ".join([
+        "(echo '#pragma once';",
+        "echo '#include <string_view>';",
+        "echo 'namespace frc::vision {';",
+        "echo 'inline constexpr std::string_view kCalibrationReportHtml = R\"__html__(';",
+        "cat $<;",
+        "echo ')__html__\";';",
+        "echo '}  // namespace frc::vision') > $@",
+    ]),
+)
+
+cc_binary(
+    name = "calibrate_images",
+    srcs = [
+        "calibrate_images.cc",
+        ":calibrate_images_report",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":calibration_validator",
+        ":charuco_detector",
+        ":intrinsics_calibration_lib",
+        ":intrinsics_solver",
+        ":validation",
+        "//aos:init",
+        "//aos:json_to_flatbuffer",
+        "//frc/vision/util:charuco_board",
+        "//third_party:opencv",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
     ],
 )
