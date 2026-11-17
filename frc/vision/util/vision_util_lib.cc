@@ -49,6 +49,93 @@ cv::Mat CameraDistCoeffs(
   return result;
 }
 
+CameraLens CameraLens::FromCalibration(
+    const frc::vision::calibration::CameraCalibration *camera_calibration) {
+  CameraLens lens;
+  CameraIntrinsics(camera_calibration).convertTo(lens.camera_matrix, CV_64F);
+  CameraDistCoeffs(camera_calibration).convertTo(lens.dist_coeffs, CV_64F);
+  lens.kannala_brandt =
+      camera_calibration->distortion_model() ==
+      frc::vision::calibration::DistortionModel::KANNALA_BRANDT;
+  return lens;
+}
+
+std::vector<cv::Point2f> CameraLens::Undistort(
+    const std::vector<cv::Point2f> &points) const {
+  std::vector<cv::Point2f> undistorted;
+  if (points.empty()) {
+    return undistorted;
+  }
+  if (kannala_brandt) {
+    cv::fisheye::undistortPoints(points, undistorted, camera_matrix,
+                                 dist_coeffs, cv::noArray(), camera_matrix);
+  } else {
+    cv::undistortPoints(points, undistorted, camera_matrix, dist_coeffs,
+                        cv::noArray(), camera_matrix);
+  }
+  return undistorted;
+}
+
+std::vector<cv::Point2f> CameraLens::Project(
+    const std::vector<cv::Point3f> &object, const cv::Vec3d &rvec,
+    const cv::Vec3d &tvec) const {
+  std::vector<cv::Point2f> projected;
+  if (object.empty()) {
+    return projected;
+  }
+  if (kannala_brandt) {
+    cv::fisheye::projectPoints(object, projected, rvec, tvec, camera_matrix,
+                               dist_coeffs);
+  } else {
+    cv::projectPoints(object, rvec, tvec, camera_matrix, dist_coeffs,
+                      projected);
+  }
+  return projected;
+}
+
+bool CameraLens::SolvePnP(const std::vector<cv::Point3f> &object,
+                          const std::vector<cv::Point2f> &image,
+                          cv::Vec3d &rvec, cv::Vec3d &tvec, int flags,
+                          bool refine) const {
+  const std::vector<cv::Point2f> points =
+      kannala_brandt ? Undistort(image) : image;
+  if (!cv::solvePnP(object, points, camera_matrix, PinholeDistCoeffs(), rvec,
+                    tvec, false, flags)) {
+    return false;
+  }
+  if (refine) {
+    const auto error = [&](const cv::Vec3d &r, const cv::Vec3d &t) {
+      const std::vector<cv::Point2f> projected = Project(object, r, t);
+      double sum = 0;
+      for (size_t i = 0; i < projected.size(); ++i) {
+        const cv::Point2f d = image[i] - projected[i];
+        sum += d.dot(d);
+      }
+      return sum;
+    };
+    cv::Vec3d refined_rvec = rvec, refined_tvec = tvec;
+    cv::solvePnPRefineLM(object, points, camera_matrix, PinholeDistCoeffs(),
+                         refined_rvec, refined_tvec);
+    if (refined_tvec[2] > 0 &&
+        error(refined_rvec, refined_tvec) < error(rvec, tvec)) {
+      rvec = refined_rvec;
+      tvec = refined_tvec;
+    }
+  }
+  return true;
+}
+
+cv::Mat CameraLens::UndistortImage(const cv::Mat &image) const {
+  cv::Mat undistorted;
+  if (kannala_brandt) {
+    cv::fisheye::undistortImage(image, undistorted, camera_matrix, dist_coeffs,
+                                camera_matrix);
+  } else {
+    cv::undistort(image, undistorted, camera_matrix, dist_coeffs);
+  }
+  return undistorted;
+}
+
 std::optional<uint16_t> CameraNumberFromChannel(std::string camera_channel) {
   if (camera_channel.find("/camera") == std::string::npos) {
     return std::nullopt;

@@ -287,7 +287,8 @@ IntrinsicsCalibration::BuildCalibration(
     aos::realtime_clock::time_point realtime_now, std::string_view node_name,
     std::string_view camera_channel, std::string_view camera_id,
     uint16_t team_number, double reprojection_error,
-    std::optional<BoardSpec> board) {
+    std::optional<BoardSpec> board,
+    calibration::DistortionModel distortion_model) {
   flatbuffers::FlatBufferBuilder fbb;
   flatbuffers::Offset<calibration::BoardSpec> board_offset;
   if (board.has_value()) {
@@ -330,6 +331,7 @@ IntrinsicsCalibration::BuildCalibration(
   if (!board_offset.IsNull()) {
     camera_calibration_builder.add_board(board_offset);
   }
+  camera_calibration_builder.add_distortion_model(distortion_model);
   fbb.Finish(camera_calibration_builder.Finish());
 
   return fbb.Release();

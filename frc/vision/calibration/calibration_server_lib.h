@@ -146,8 +146,8 @@ class CalibrationServer {
   std::string board_image_path_;
   std::optional<aos::FlatbufferDetachedBuffer<calibration::CameraCalibration>>
       current_;
-  cv::Mat guess_matrix_;
-  cv::Mat guess_dist_;
+  // The starting guess at the lens; no camera matrix until there is one.
+  CameraLens guess_;
   cv::Size image_size_;
   std::vector<StoredCapture> captures_;
   CaptureGate gate_;

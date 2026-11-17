@@ -9,17 +9,16 @@
 #include "opencv2/aruco/charuco.hpp"
 #include "opencv2/core.hpp"
 
+#include "frc/vision/util/vision_util_lib.h"
+
 namespace frc::vision {
 
 // Checks of how well a calibration models the lens, made on frames a solve
 // wasn't fitted to.  Each says how far off a frame is, and where in the image,
 // since a calibration's errors live at places in the image.
 
-// A camera's calibration: its matrix and distortion coefficients.
-struct Lens {
-  cv::Mat camera_matrix;
-  cv::Mat dist_coeffs;
-};
+// A camera's calibration, with either distortion model.
+using Lens = CameraLens;
 
 // The board is flat and its geometry known: fit its pose with `lens`, and
 // return each corner's leftover error, in pixels, observed less projected.

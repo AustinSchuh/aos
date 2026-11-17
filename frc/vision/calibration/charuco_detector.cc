@@ -5,9 +5,8 @@
 namespace frc::vision {
 
 CharucoDetection DetectCharuco(const cv::Ptr<cv::aruco::CharucoBoard> &board,
-                               const cv::Mat &image,
-                               const cv::Mat &camera_matrix,
-                               const cv::Mat &dist_coeffs, int min_corners) {
+                               const cv::Mat &image, const CameraLens &lens,
+                               int min_corners) {
   CharucoDetection detection;
   std::vector<int> marker_ids;
   std::vector<std::vector<cv::Point2f>> marker_corners;
@@ -36,15 +35,22 @@ CharucoDetection DetectCharuco(const cv::Ptr<cv::aruco::CharucoBoard> &board,
 
   std::vector<cv::Point2f> calibrated_corners;
   std::vector<int> calibrated_ids;
-  cv::aruco::interpolateCornersCharuco(marker_corners, marker_ids, image, board,
-                                       calibrated_corners, calibrated_ids,
-                                       camera_matrix, dist_coeffs);
+  if (lens.kannala_brandt) {
+    // OpenCV's ChArUco functions take only its pinhole models: fit the pose to
+    // the refined corners, undistorted.
+    calibrated_corners = lens.Undistort(detection.corners);
+    calibrated_ids = detection.ids;
+  } else {
+    cv::aruco::interpolateCornersCharuco(
+        marker_corners, marker_ids, image, board, calibrated_corners,
+        calibrated_ids, lens.camera_matrix, lens.dist_coeffs);
+  }
   if (static_cast<int>(calibrated_ids.size()) < min_corners) {
     return detection;
   }
   detection.pose_valid = cv::aruco::estimatePoseCharucoBoard(
-      calibrated_corners, calibrated_ids, board, camera_matrix, dist_coeffs,
-      detection.rvec, detection.tvec);
+      calibrated_corners, calibrated_ids, board, lens.camera_matrix,
+      lens.PinholeDistCoeffs(), detection.rvec, detection.tvec);
   return detection;
 }
 

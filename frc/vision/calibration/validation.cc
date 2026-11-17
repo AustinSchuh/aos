@@ -53,9 +53,7 @@ double ReprojectionError(const std::vector<cv::Point3f> &object,
                          const std::vector<cv::Point2f> &image,
                          const Lens &lens, const cv::Vec3d &rvec,
                          const cv::Vec3d &tvec) {
-  std::vector<cv::Point2f> projected;
-  cv::projectPoints(object, rvec, tvec, lens.camera_matrix, lens.dist_coeffs,
-                    projected);
+  const std::vector<cv::Point2f> projected = lens.Project(object, rvec, tvec);
   double sum = 0;
   for (size_t i = 0; i < projected.size(); ++i) {
     const cv::Point2f d = image[i] - projected[i];
@@ -82,13 +80,11 @@ std::optional<std::vector<cv::Point2f>> StraightnessResiduals(
     object.push_back(board_corners.at(id));
   }
   cv::Vec3d rvec, tvec;
-  if (!cv::solvePnP(object, corners, lens.camera_matrix, lens.dist_coeffs, rvec,
-                    tvec)) {
+  if (!lens.SolvePnP(object, corners, rvec, tvec, cv::SOLVEPNP_ITERATIVE,
+                     true)) {
     return std::nullopt;
   }
-  std::vector<cv::Point2f> projected;
-  cv::projectPoints(object, rvec, tvec, lens.camera_matrix, lens.dist_coeffs,
-                    projected);
+  const std::vector<cv::Point2f> projected = lens.Project(object, rvec, tvec);
   std::vector<cv::Point2f> residuals;
   for (size_t i = 0; i < projected.size(); ++i) {
     residuals.push_back(corners[i] - projected[i]);
@@ -119,8 +115,8 @@ std::optional<PoseDisagreement> BoardRigidity(
   }
   cv::Vec3d rvec[2], tvec[2];
   for (int half = 0; half < 2; ++half) {
-    if (!cv::solvePnP(object[half], image[half], lens.camera_matrix,
-                      lens.dist_coeffs, rvec[half], tvec[half])) {
+    if (!lens.SolvePnP(object[half], image[half], rvec[half], tvec[half],
+                       cv::SOLVEPNP_ITERATIVE, true)) {
       return std::nullopt;
     }
   }
@@ -167,26 +163,16 @@ std::optional<PoseDisagreement> TagPair(const Tag &a, const Tag &b,
   cv::Vec3d rvec[2], tvec[2];
   const Tag *tags[2] = {&a, &b};
   for (int i = 0; i < 2; ++i) {
+    // IPPE solves the square, refined against the full model if that fits
+    // better.  A tag no pose fits is no measurement.
     if (tags[i]->corners.size() != 4 ||
-        !cv::solvePnP(object, tags[i]->corners, lens.camera_matrix,
-                      lens.dist_coeffs, rvec[i], tvec[i], false,
-                      cv::SOLVEPNP_IPPE_SQUARE)) {
+        !lens.SolvePnP(object, tags[i]->corners, rvec[i], tvec[i],
+                       cv::SOLVEPNP_IPPE_SQUARE, true)) {
       return std::nullopt;
     }
-    // IPPE solves an undistorted square; refine against the full model, and
-    // keep whichever fits better.  A tag no pose fits is no measurement.
-    cv::Vec3d refined_rvec = rvec[i], refined_tvec = tvec[i];
-    cv::solvePnPRefineLM(object, tags[i]->corners, lens.camera_matrix,
-                         lens.dist_coeffs, refined_rvec, refined_tvec);
-    const double before =
-        ReprojectionError(object, tags[i]->corners, lens, rvec[i], tvec[i]);
-    const double after = ReprojectionError(object, tags[i]->corners, lens,
-                                           refined_rvec, refined_tvec);
-    if (refined_tvec[2] > 0 && after < before) {
-      rvec[i] = refined_rvec;
-      tvec[i] = refined_tvec;
-    }
-    if (tvec[i][2] <= 0 || std::min(before, after) > kMaxTagFitError) {
+    if (tvec[i][2] <= 0 ||
+        ReprojectionError(object, tags[i]->corners, lens, rvec[i], tvec[i]) >
+            kMaxTagFitError) {
       return std::nullopt;
     }
   }

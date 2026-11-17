@@ -51,6 +51,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":charuco_board",
+        ":vision_util_lib",
         "//aos:flatbuffers",
         "//aos/events:event_loop",
         "//aos/network:message_bridge_server_fbs",

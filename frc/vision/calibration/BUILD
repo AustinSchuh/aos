@@ -78,6 +78,7 @@ cc_library(
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
+        "//frc/vision/util:vision_util_lib",
         "//third_party:opencv",
         "@ceres-solver//:ceres",
         "@com_google_absl//absl/log:absl_log",
@@ -379,8 +380,8 @@ flatbuffer_ts_library(
         "frc/vision/calibration/lens-validation.ts",
         "frc/vision/calibration/board-spec.ts",
         "frc/vision/calibration/camera-calibration.ts",
-        "frc/vision/calibration/transformation-matrix.ts",
         "frc/vision/calibration/distortion-model.ts",
+        "frc/vision/calibration/transformation-matrix.ts",
     ],
     visibility = ["//visibility:public"],
     deps = ["//frc/vision:calibration_ts_fbs"],
@@ -394,6 +395,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//frc/vision/util:corner_refinement",
+        "//frc/vision/util:vision_util_lib",
         "//third_party:opencv",
     ],
 )
@@ -513,7 +515,10 @@ cc_library(
     hdrs = ["validation.h"],
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
-    deps = ["//third_party:opencv"],
+    deps = [
+        "//frc/vision/util:vision_util_lib",
+        "//third_party:opencv",
+    ],
 )
 
 cc_test(

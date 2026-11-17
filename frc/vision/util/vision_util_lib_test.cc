@@ -137,4 +137,52 @@ TEST(PoseUtilsTest, EulerAnglesAndQuaternionConversions) {
   }
 }
 
+// A wide lens, as Kannala-Brandt models it: projecting, undistorting and
+// fitting a pose agree with each other.
+TEST(CameraLensTest, KannalaBrandtRoundTrips) {
+  const CameraLens lens{
+      .camera_matrix =
+          (cv::Mat_<double>(3, 3) << 648, 0, 766, 0, 648, 557, 0, 0, 1),
+      .dist_coeffs = (cv::Mat_<double>(4, 1) << 0.025, 0.001, 0.004, -0.002),
+      .kannala_brandt = true};
+  // A grid 1.5 m away, out to 60 degrees off the axis.
+  std::vector<cv::Point3f> object;
+  for (int i = -4; i <= 4; ++i) {
+    for (int j = -3; j <= 3; ++j) {
+      object.emplace_back(i * 0.3, j * 0.3, 0);
+    }
+  }
+  const cv::Vec3d rvec(0.1, -0.2, 0.05), tvec(0.1, -0.05, 1.5);
+  const std::vector<cv::Point2f> image = lens.Project(object, rvec, tvec);
+
+  // Undistorted, the points are where a pinhole camera puts them.
+  std::vector<cv::Point2f> pinhole;
+  cv::projectPoints(object, rvec, tvec, lens.camera_matrix, cv::Mat(), pinhole);
+  const std::vector<cv::Point2f> undistorted = lens.Undistort(image);
+  for (size_t i = 0; i < image.size(); ++i) {
+    EXPECT_LT(cv::norm(undistorted[i] - pinhole[i]), 1e-3) << i;
+  }
+
+  cv::Vec3d found_rvec, found_tvec;
+  ASSERT_TRUE(lens.SolvePnP(object, image, found_rvec, found_tvec,
+                            cv::SOLVEPNP_ITERATIVE, true));
+  EXPECT_LT(cv::norm(found_rvec - rvec), 1e-5);
+  EXPECT_LT(cv::norm(found_tvec - tvec), 1e-5);
+}
+
+TEST(CameraLensTest, OpenCvModelIsOpenCvs) {
+  const CameraLens lens{
+      .camera_matrix =
+          (cv::Mat_<double>(3, 3) << 1000, 0, 800, 0, 1000, 650, 0, 0, 1),
+      .dist_coeffs = (cv::Mat_<double>(1, 5) << -0.2, 0.05, 0, 0, 0),
+      .kannala_brandt = false};
+  const std::vector<cv::Point3f> object = {{0.2, 0.1, 0}, {-0.3, 0.2, 0}};
+  std::vector<cv::Point2f> expected;
+  cv::projectPoints(object, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 1),
+                    lens.camera_matrix, lens.dist_coeffs, expected);
+  const std::vector<cv::Point2f> projected =
+      lens.Project(object, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 1));
+  EXPECT_EQ(projected, expected);
+}
+
 }  // namespace frc::vision
