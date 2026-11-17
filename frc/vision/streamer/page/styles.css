@@ -156,6 +156,19 @@ camera-tile {
   letter-spacing: 0.05em;
 }
 
+main.embed {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* The robot's own pages are light; they keep their look. */
+main.embed iframe {
+  flex: 1;
+  border: 0;
+  background: #fff;
+}
+
 main.settings {
   flex: 1;
   overflow: auto;

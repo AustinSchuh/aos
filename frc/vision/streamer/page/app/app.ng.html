@@ -22,6 +22,20 @@
     >
       Calibrate
     </button>
+    <button
+      type="button"
+      [class.active]="tab === 'field'"
+      (click)="show('field')"
+    >
+      Field
+    </button>
+    <button
+      type="button"
+      [class.active]="tab === 'starter'"
+      (click)="show('starter')"
+    >
+      Starter
+    </button>
   </nav>
   <span class="status" [class.ok]="connected">
     <span class="dot"></span>
@@ -76,4 +90,13 @@
   <p *ngIf="robot.calibrations.length === 0">
     No calibrations for node {{ node }} in /constants yet.
   </p>
+</main>
+
+<!-- The robot's own pages, served beside this one; only loaded while shown. -->
+<main class="embed" *ngIf="tab === 'field'">
+  <iframe src="/field.html" title="Field map"></iframe>
+</main>
+
+<main class="embed" *ngIf="tab === 'starter'">
+  <iframe src="/starter.html" title="Starter status"></iframe>
 </main>
