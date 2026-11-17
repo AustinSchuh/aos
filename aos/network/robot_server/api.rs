@@ -8,27 +8,34 @@
 //! GET /api/latest?name=/constants&type=frc.vision.CameraConstants[&max_vector_size=100]
 //!     {"name": "/constants", "type": "frc.vision.CameraConstants",
 //!      "monotonic_event_time_ns": 123, "realtime_event_time_ns": 456, "message": {...}}
+//! POST /api/send?name=/calibration&type=frc.vision.calibration.Command, the message as JSON
+//!     {"sent": true}
 //! ```
+//!
+//! Only the channels robot_server is told it may send on (`--sendable-channels`) take a POST.
+//! A command that starts or ends a [`SessionApp`]'s session also starts or stops apps.
 //!
 //! The router's handlers run on any of tokio's threads, but AOS's fetchers live on the event
 //! loop's, so they ask an [`ApiRequest`] of [`serve()`], which runs there, and wait for its
 //! answer.
 //! Channels too big to want as JSON (images) aren't fetchable.
 
-use std::{collections::HashMap, ffi::CStr};
+use std::{cell::RefCell, collections::HashMap, ffi::CStr, rc::Rc, time::Duration};
 
 use aos_configuration::{AsChannel, ChannelExt, ConfigurationExt, Node};
 use aos_configuration_fbs::aos::{Channel, Configuration, ReadMethod};
 use aos_events_event_loop_c::aos_configuration_node_name;
-use aos_events_tokio::{AosHandle, RawFetcher};
+use aos_events_tokio::{AosHandle, RawFetcher, RawSender, Timer};
 
 use axum::{
     extract::Query,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
+
+use crate::session::{Effect, SessionApp, StarterCommand};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
@@ -73,6 +80,33 @@ pub enum LatestError {
     NotJson,
 }
 
+/// Why a message wasn't sent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SendError {
+    /// The configuration has no such channel.
+    NoChannel,
+    /// robot_server isn't to send on it.
+    NotSendable,
+    /// The JSON isn't a message of the channel's type.
+    NotAMessage,
+    /// The session's app didn't say it was ready.
+    NotReady(String),
+    /// AOS refused it, with this `aos_const_raw_sender_error_*` code.
+    Failed(i32),
+}
+
+/// What robot_server may send, and the apps the page starts and stops.
+#[derive(Clone, Debug, Default)]
+pub struct ApiOptions {
+    pub sendable: Vec<(String, String)>,
+    pub session: Option<SessionApp>,
+}
+
+/// How long a session's app has to say it's ready.
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often a session's start looks for its app being ready.
+const READY_POLL: Duration = Duration::from_millis(100);
+
 /// What a handler asks of the event loop's thread.
 #[derive(Debug)]
 pub enum ApiRequest {
@@ -84,6 +118,12 @@ pub enum ApiRequest {
         type_: String,
         max_vector_size: usize,
         reply: oneshot::Sender<Result<Latest, LatestError>>,
+    },
+    Send {
+        name: String,
+        type_: String,
+        json: String,
+        reply: oneshot::Sender<Result<(), SendError>>,
     },
 }
 
@@ -185,9 +225,58 @@ async fn latest(
     }
 }
 
+async fn send(
+    requests: mpsc::UnboundedSender<ApiRequest>,
+    query: HashMap<String, String>,
+    json: String,
+) -> Response {
+    let (Some(name), Some(type_)) = (query.get("name"), query.get("type")) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Say which channel: ?name=...&type=...",
+        );
+    };
+    let (reply, answer) = oneshot::channel();
+    let request = ApiRequest::Send {
+        name: name.clone(),
+        type_: type_.clone(),
+        json,
+        reply,
+    };
+    if requests.send(request).is_err() {
+        return gone();
+    }
+    let Ok(result) = answer.await else {
+        return gone();
+    };
+    match result {
+        Ok(()) => json_response(StatusCode::OK, json!({ "sent": true }).to_string()),
+        Err(SendError::NoChannel) => error(
+            StatusCode::NOT_FOUND,
+            &format!("There's no channel {name} {type_}"),
+        ),
+        Err(SendError::NotSendable) => error(
+            StatusCode::FORBIDDEN,
+            &format!("robot_server doesn't send on {name} {type_}"),
+        ),
+        Err(SendError::NotAMessage) => error(
+            StatusCode::BAD_REQUEST,
+            &format!("That isn't a {type_}, as JSON"),
+        ),
+        Err(SendError::NotReady(app)) => {
+            error(StatusCode::GATEWAY_TIMEOUT, &format!("{app} didn't start"))
+        }
+        Err(SendError::Failed(code)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Sending failed: AOS error {code}"),
+        ),
+    }
+}
+
 /// The `/api` routes, asking `requests` for what's on the channels.
 pub fn router(requests: mpsc::UnboundedSender<ApiRequest>) -> Router {
     let for_latest = requests.clone();
+    let for_send = requests.clone();
     Router::new()
         .route("/api/channels", get(move || channels(requests.clone())))
         .route(
@@ -195,6 +284,14 @@ pub fn router(requests: mpsc::UnboundedSender<ApiRequest>) -> Router {
             get(move |Query(query): Query<HashMap<String, String>>| {
                 latest(for_latest.clone(), query)
             }),
+        )
+        .route(
+            "/api/send",
+            post(
+                move |Query(query): Query<HashMap<String, String>>, body: String| {
+                    send(for_send.clone(), query, body)
+                },
+            ),
         )
 }
 
@@ -233,17 +330,37 @@ fn key(channel: &Channel) -> ChannelKey {
     )
 }
 
-/// What `/api` serves from: the configuration, and a fetcher on every channel it may fetch.
-/// AOS makes fetchers only before the event loop runs, so they're all made up front.
+/// A channel `get_channel` found, as `/api` keys it.
+fn mapped_key(channel: &aos_configuration::Channel) -> ChannelKey {
+    (
+        channel.name().unwrap_or_default().to_string(),
+        channel.type_().unwrap_or_default().to_string(),
+    )
+}
+
+/// What `/api` serves from: the configuration, a fetcher on every channel it may fetch, and a
+/// sender on every channel it may send on.  AOS makes fetchers and senders only before the event
+/// loop runs, so they're all made up front.
 pub struct Fetchers {
     config: Configuration<'static>,
     node: Option<&'static Node>,
     fetchers: HashMap<ChannelKey, RawFetcher>,
+    senders: HashMap<ChannelKey, RawSender>,
+    session: Option<SessionApp>,
+    starter: Option<(&'static aos_configuration::Channel, RawSender)>,
+    aos: AosHandle,
+    /// What a session's start waits on, while its app gets ready.  Made before the event loop
+    /// runs, as AOS's timers must be, and shared by any starts at once.
+    ready_timer: Rc<tokio::sync::Mutex<Timer>>,
 }
 
 impl Fetchers {
-    /// Makes the fetchers on `aos`'s event loop, which mustn't be running yet.
-    pub fn new(aos: &AosHandle, config: Configuration<'static>) -> Self {
+    /// Makes the fetchers and senders on `aos`'s event loop, which mustn't be running yet.
+    ///
+    /// # Panics
+    ///
+    /// If a channel `options` names isn't in the configuration.
+    pub fn new(aos: &AosHandle, config: Configuration<'static>, options: ApiOptions) -> Self {
         let node = node_of(aos, config);
         let fetchers = config
             .channels()
@@ -256,10 +373,103 @@ impl Fetchers {
                 ((name, type_), fetcher)
             })
             .collect();
+        let mut sendable = options.sendable.clone();
+        if let Some(session) = &options.session {
+            sendable.push(session.commands.clone());
+        }
+        let senders = sendable
+            .iter()
+            .map(|(name, type_)| {
+                let channel = config
+                    .get_channel(name, type_, "robot_server", node)
+                    .unwrap_or_else(|_| panic!("There's no channel {name} {type_} to send on"));
+                let key = mapped_key(channel);
+                let sender = aos.make_sender(&key.0, &key.1);
+                (key, sender)
+            })
+            .collect();
+        let starter = options.session.as_ref().map(|_| {
+            let channel = config
+                .get_channel("/aos", "aos.starter.StarterRpc", "robot_server", node)
+                .expect("There's no /aos aos.starter.StarterRpc to start and stop apps with");
+            let (name, type_) = mapped_key(channel);
+            (channel, aos.make_sender(&name, &type_))
+        });
         Self {
             config,
             node,
             fetchers,
+            senders,
+            session: options.session,
+            starter,
+            aos: aos.clone(),
+            ready_timer: Rc::new(tokio::sync::Mutex::new(aos.make_timer())),
+        }
+    }
+
+    /// `name` `type_`, after the configuration's maps, as `/api` keys it.
+    fn mapped(
+        &self,
+        name: &str,
+        type_: &str,
+    ) -> Option<(&'static aos_configuration::Channel, ChannelKey)> {
+        let channel = self
+            .config
+            .get_channel(name, type_, "robot_server", self.node)
+            .ok()?;
+        Some((channel, mapped_key(channel)))
+    }
+
+    /// Sends `json`, a message, on `name` `type_`.
+    fn send(&mut self, name: &str, type_: &str, json: &str) -> Result<(), SendError> {
+        let (channel, key) = self.mapped(name, type_).ok_or(SendError::NoChannel)?;
+        let sender = self.senders.get_mut(&key).ok_or(SendError::NotSendable)?;
+        let message = channel
+            .json_to_message(json)
+            .ok_or(SendError::NotAMessage)?;
+        match sender.send_copy(&message) {
+            0 => Ok(()),
+            code => Err(SendError::Failed(code)),
+        }
+    }
+
+    /// Has starter carry out `commands`.
+    fn starter(&mut self, commands: &[StarterCommand]) {
+        let Some((channel, sender)) = &mut self.starter else {
+            return;
+        };
+        for command in commands {
+            log::info!("{} {}", command.command, command.app);
+            let message = channel
+                .json_to_message(&command.json())
+                .expect("A StarterRpc is a StarterRpc");
+            if sender.send_copy(&message) != 0 {
+                log::error!(
+                    "Failed to ask starter to {} {}",
+                    command.command,
+                    command.app
+                );
+            }
+        }
+    }
+
+    /// When the session's app last said it was ready.
+    fn ready_time(&mut self) -> i64 {
+        let Some(session) = &self.session else {
+            return i64::MIN;
+        };
+        let ready = session.ready.clone();
+        let Some((_, key)) = self.mapped(&ready.0, &ready.1) else {
+            return i64::MIN;
+        };
+        let Some(fetcher) = self.fetchers.get_mut(&key) else {
+            return i64::MIN;
+        };
+        fetcher.fetch();
+        let message = fetcher.message();
+        match message.data() {
+            Some(_) => message.monotonic_event_time_ns(),
+            None => i64::MIN,
         }
     }
 
@@ -321,12 +531,52 @@ impl Fetchers {
     }
 }
 
+/// Starts a session: stops what's in the way, starts its app, and once it says it's ready, sends
+/// it `json`.
+async fn start_session(
+    api: Rc<RefCell<Fetchers>>,
+    session: SessionApp,
+    name: String,
+    type_: String,
+    json: String,
+    reply: oneshot::Sender<Result<(), SendError>>,
+) {
+    let before = api.borrow_mut().ready_time();
+    api.borrow_mut().starter(&session.starting());
+    // On the event loop's clock, which is simulated time in a simulation.
+    let (aos, timer) = {
+        let api = api.borrow();
+        (api.aos.clone(), api.ready_timer.clone())
+    };
+    let deadline_ns = aos.monotonic_now_ns() + READY_TIMEOUT.as_nanos() as i64;
+    while api.borrow_mut().ready_time() <= before {
+        let now_ns = aos.monotonic_now_ns();
+        if now_ns > deadline_ns {
+            log::error!("{} didn't start", session.app);
+            let _ = reply.send(Err(SendError::NotReady(session.app.clone())));
+            return;
+        }
+        timer
+            .lock()
+            .await
+            .sleep_until(now_ns + READY_POLL.as_nanos() as i64)
+            .await;
+    }
+    let _ = reply.send(api.borrow_mut().send(&name, &type_, &json));
+}
+
 /// Answers `/api`'s requests, on the event loop's thread where the fetchers live.
-pub async fn serve(mut api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiRequest>) {
+pub async fn serve(api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiRequest>) {
+    let api = Rc::new(RefCell::new(api));
+    // A session robot_server lost track of mustn't leave the robot without the apps it stopped.
+    let session = api.borrow().session.clone();
+    if let Some(session) = &session {
+        api.borrow_mut().starter(&session.ending());
+    }
     while let Some(request) = requests.recv().await {
         match request {
             ApiRequest::Channels { reply } => {
-                let _ = reply.send(api.channels());
+                let _ = reply.send(api.borrow().channels());
             }
             ApiRequest::Latest {
                 name,
@@ -334,7 +584,40 @@ pub async fn serve(mut api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiR
                 max_vector_size,
                 reply,
             } => {
-                let _ = reply.send(api.latest(&name, &type_, max_vector_size));
+                let _ = reply.send(api.borrow_mut().latest(&name, &type_, max_vector_size));
+            }
+            ApiRequest::Send {
+                name,
+                type_,
+                json,
+                reply,
+            } => {
+                let effect = match (&session, api.borrow().mapped(&name, &type_)) {
+                    (Some(session), Some((_, key))) => serde_json::from_str(&json)
+                        .map(|value| session.effect(&key, &value))
+                        .unwrap_or(Effect::None),
+                    _ => Effect::None,
+                };
+                match (effect, &session) {
+                    (Effect::Starts, Some(session)) => {
+                        tokio::task::spawn_local(start_session(
+                            api.clone(),
+                            session.clone(),
+                            name,
+                            type_,
+                            json,
+                            reply,
+                        ));
+                    }
+                    (Effect::Ends, Some(session)) => {
+                        let result = api.borrow_mut().send(&name, &type_, &json);
+                        api.borrow_mut().starter(&session.ending());
+                        let _ = reply.send(result);
+                    }
+                    _ => {
+                        let _ = reply.send(api.borrow_mut().send(&name, &type_, &json));
+                    }
+                }
             }
         }
     }
@@ -382,6 +665,16 @@ mod tests {
                             }
                             ("/empty", _) => Err(LatestError::NoMessage),
                             _ => Err(LatestError::NoChannel),
+                        });
+                    }
+                    ApiRequest::Send {
+                        name, json, reply, ..
+                    } => {
+                        let _ = reply.send(match name.as_str() {
+                            "/calibration" if json.starts_with('{') => Ok(()),
+                            "/calibration" => Err(SendError::NotAMessage),
+                            "/constants" => Err(SendError::NotSendable),
+                            _ => Err(SendError::NoChannel),
                         });
                     }
                 }
@@ -449,6 +742,51 @@ mod tests {
             ),
         ] {
             let (got, body) = get_json(uri).await;
+            assert_eq!(got, status, "{uri}: {body}");
+            assert!(body["error"].is_string(), "{uri}: {body}");
+        }
+    }
+
+    async fn post_json(uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        let response = router(fake_robot())
+            .oneshot(
+                Request::post(uri)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sends_where_it_may() {
+        let (status, body) = post_json(
+            "/api/send?name=/calibration&type=frc.vision.calibration.Command",
+            r#"{"action": "UNDO"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"sent": true}));
+        for (uri, payload, status) in [
+            (
+                "/api/send?name=/calibration&type=frc.vision.calibration.Command",
+                "nope",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/send?name=/constants&type=frc.vision.CameraConstants",
+                "{}",
+                StatusCode::FORBIDDEN,
+            ),
+            ("/api/send?name=/nope&type=x", "{}", StatusCode::NOT_FOUND),
+            ("/api/send?name=/calibration", "{}", StatusCode::BAD_REQUEST),
+        ] {
+            let (got, body) = post_json(uri, payload).await;
             assert_eq!(got, status, "{uri}: {body}");
             assert!(body["error"].is_string(), "{uri}: {body}");
         }

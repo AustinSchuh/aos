@@ -10,6 +10,7 @@ rust_library(
     srcs = [
         "api.rs",
         "lib.rs",
+        "session.rs",
     ],
     crate_name = "robot_server",
     test_data = glob(["testdata/*"]),

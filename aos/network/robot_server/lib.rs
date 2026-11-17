@@ -4,6 +4,7 @@
 //! the AOS event loop's thread.
 
 pub mod api;
+pub mod session;
 
 use std::{
     ffi::CString,
@@ -504,9 +505,10 @@ pub fn start(
     aos: &aos_events_tokio::AosHandle,
     config: aos_configuration_fbs::aos::Configuration<'static>,
     options: Options,
+    api_options: api::ApiOptions,
     listen: Listen,
 ) -> impl std::future::Future<Output = ()> + 'static {
-    let fetchers = api::Fetchers::new(aos, config);
+    let fetchers = api::Fetchers::new(aos, config, api_options);
     let (api_requests, api_incoming) = mpsc::unbounded_channel();
     let router = router(options, api_requests);
     async move {
@@ -596,6 +598,7 @@ pub unsafe extern "C" fn robot_server_add_to_simulation(
             foxglove_ws: "ws://127.0.0.1:8765".to_string(),
             camera_streamer_ws: "ws://127.0.0.1:1190".to_string(),
         },
+        api::ApiOptions::default(),
         Listen::Plain { http },
     );
     simulation.spawn(server);
