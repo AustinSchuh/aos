@@ -11,94 +11,13 @@
 //! Starter runs it as root so it can listen on 443 and 80; it drops to `--user` as soon as it
 //! has.  Runs tokio on its AOS event loop's thread (ADR 0008).
 
-use std::{
-    net::TcpListener as StdTcpListener,
-    path::{Path, PathBuf},
-};
+use std::{net::TcpListener as StdTcpListener, path::Path};
 
 use aos_configuration::read_config_from;
 use aos_events_tokio::TokioShmEventLoop;
 use aos_flatbuffers::Flatbuffer;
 use aos_init::Init;
-use clap::Parser;
-
-/// The robot's HTTPS front door.
-#[derive(Parser, Debug)]
-struct App {
-    /// The AOS configuration.
-    #[arg(long, default_value = "aos_config.json")]
-    config: PathBuf,
-    /// Port for HTTPS: the pages and the websocket proxies.
-    #[arg(long, default_value_t = 443)]
-    https_port: u16,
-    /// Port for plain HTTP: the page that checks whether this computer trusts the robot.
-    #[arg(long, default_value_t = 80)]
-    http_port: u16,
-    /// The user to run as once listening.  Starter starts robot_server as root so it can listen
-    /// on ports below 1024; it refuses to carry on as root without this.
-    #[arg(long, default_value = "")]
-    user: String,
-    /// Where the pages are, as web_proxy's --data_dir.
-    #[arg(long, default_value = "www")]
-    data_dir: PathBuf,
-    /// Where aos_make_tls_cert keeps the certificate.
-    #[arg(long, default_value = "/etc/aos/tls")]
-    tls_dir: PathBuf,
-    /// web_proxy's port; /ws is proxied to its websocket.
-    #[arg(long, default_value_t = 1180)]
-    web_proxy_port: u16,
-    /// The Foxglove server's port; /foxglove is proxied to it.
-    #[arg(long, default_value_t = 8765)]
-    foxglove_port: u16,
-    /// camera_streamer's signalling port; /cameras/ws is proxied to it.
-    #[arg(long, default_value_t = 1190)]
-    camera_streamer_port: u16,
-    /// Channels POST /api/send may send on, as name:type.
-    #[arg(long, value_delimiter = ',')]
-    sendable_channels: Vec<String>,
-    /// An app the page starts and stops with commands, as JSON with an "action", on this channel
-    /// (name:type).  Empty for none.
-    #[arg(long, default_value = "")]
-    session_commands: String,
-    /// The app, as starter names it.
-    #[arg(long, default_value = "")]
-    session_app: String,
-    /// The apps to stop while it runs.
-    #[arg(long, value_delimiter = ',')]
-    session_stops: Vec<String>,
-    /// A channel (name:type) the app sends on regularly, to tell it's ready.
-    #[arg(long, default_value = "")]
-    session_ready: String,
-    /// The actions that start and end a session.
-    #[arg(long, value_delimiter = ',', default_value = "START")]
-    session_start_actions: Vec<String>,
-    #[arg(long, value_delimiter = ',', default_value = "FINISH,CANCEL")]
-    session_end_actions: Vec<String>,
-}
-
-impl App {
-    fn api_options(&self) -> robot_server::api::ApiOptions {
-        use robot_server::session::{parse_channel, SessionApp};
-        let channel = |text: &str, flag: &str| {
-            parse_channel(text).unwrap_or_else(|| panic!("--{flag} {text} isn't name:type"))
-        };
-        robot_server::api::ApiOptions {
-            sendable: self
-                .sendable_channels
-                .iter()
-                .map(|text| channel(text, "sendable_channels"))
-                .collect(),
-            session: (!self.session_commands.is_empty()).then(|| SessionApp {
-                commands: channel(&self.session_commands, "session_commands"),
-                app: self.session_app.clone(),
-                stops: self.session_stops.clone(),
-                ready: channel(&self.session_ready, "session_ready"),
-                start_actions: self.session_start_actions.clone(),
-                end_actions: self.session_end_actions.clone(),
-            }),
-        }
-    }
-}
+use robot_server::Flags as App;
 
 /// Listens on `port` on every address, IPv4 included, ready for tokio.
 fn listen(port: u16, what: &str) -> StdTcpListener {

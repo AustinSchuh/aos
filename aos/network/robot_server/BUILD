@@ -26,6 +26,7 @@ rust_library(
         "//aos/events:tokio_event_loop_rs",
         "@crate_index//:anyhow",
         "@crate_index//:axum",
+        "@crate_index//:clap",
         "@crate_index//:futures",
         "@crate_index//:hyper",
         "@crate_index//:hyper-util",
