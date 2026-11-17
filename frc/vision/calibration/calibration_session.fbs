@@ -67,6 +67,31 @@ table SavedBoard {
   preset:bool (id: 2);
 }
 
+// One measure of one check, over the frames looked at.
+table CheckResult {
+  check:ValidationCheck (id: 0);
+  // What's measured, and in what: "corner error, px", "distance, mm"...
+  measure:string (id: 1);
+  frames:int (id: 2);
+  median:double (id: 3);
+  worst:double (id: 4);
+  // Its mean in each cell of a grid over the image, row-major; negative
+  // where nothing was measured.
+  columns:int (id: 5);
+  rows:int (id: 6);
+  means:[float] (id: 7);
+}
+
+// A calibration's checks.
+table LensValidation {
+  // "current" or "solved".
+  name:string (id: 0);
+  results:[CheckResult] (id: 1);
+  // The rigid pair of AprilTags TWO_TAG measured, and their median distance.
+  tag_ids:[int] (id: 2);
+  tag_distance_m:double (id: 3);
+}
+
 // The whole session, sent after each change, at most once a second.
 table Session {
   session_id:string (id: 0);
@@ -86,6 +111,9 @@ table Session {
   // /constants, if it has one.
   current:CameraCalibration (id: 11);
   solve:Solve (id: 12);
+  // What validation measured, for each calibration checked.
+  validation:[LensValidation] (id: 13);
+  checks:[ValidationCheck] (id: 14);
 }
 
 table CameraBoard {

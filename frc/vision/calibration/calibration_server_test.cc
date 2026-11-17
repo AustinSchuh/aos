@@ -34,7 +34,14 @@ struct Args {
   std::string board_name;
   std::string camera_id;
   bool force = false;
+  std::vector<calibration::ValidationCheck> checks;
+  bool validate_solved = false;
 
+  Args &Checks(std::vector<calibration::ValidationCheck> value, bool solved) {
+    checks = std::move(value);
+    validate_solved = solved;
+    return *this;
+  }
   Args &Camera(int value) {
     camera = value;
     return *this;
@@ -196,6 +203,7 @@ class CalibrationServerTest : public ::testing::Test {
     }
     const auto board_name = fbb->CreateString(args.board_name);
     const auto camera_id = fbb->CreateString(args.camera_id);
+    const auto checks = fbb->CreateVector(args.checks);
     calibration::Command::Builder command(*fbb);
     command.add_action(action);
     command.add_camera(args.camera);
@@ -210,6 +218,8 @@ class CalibrationServerTest : public ::testing::Test {
       command.add_camera_id(camera_id);
     }
     command.add_force(args.force);
+    command.add_checks(checks);
+    command.add_validate_solved(args.validate_solved);
     builder.CheckOk(builder.Send(command.Finish()));
     factory_.RunFor(std::chrono::milliseconds(10));
   }
@@ -233,6 +243,7 @@ class CalibrationServerTest : public ::testing::Test {
                         .www_path = "/calibration",
                         .board_store = tmp_ / "boards.json",
                         .period = std::chrono::milliseconds(100),
+                        .tag_size = 0.1651,
                     });
   }
 
@@ -366,6 +377,39 @@ TEST_F(CalibrationServerTest, CalibratesSavesAndRemembers) {
     EXPECT_EQ(BoardSpecFromFlatbuffer(*solve.calibration()->board()),
               BoardSpec{});
   }
+
+  // Validate the current and solved calibrations on new frames: the solved
+  // one, from these very images, fits; the current one, a little off, less.
+  Command(CommandAction::VALIDATE,
+          Args().Checks({calibration::ValidationCheck::STRAIGHTNESS,
+                         calibration::ValidationCheck::RIGIDITY},
+                        true));
+  EXPECT_EQ(Status().error()->string_view(), "");
+  EXPECT_EQ(Status().state(), SessionState::VALIDATING);
+  Command(CommandAction::CAPTURE);
+  EXPECT_NE(Status().error()->string_view(), "") << "Not while validating";
+  ShowPoses(4);
+  {
+    const calibration::Session &session = Session();
+    ASSERT_EQ(session.validation()->size(), 2u);
+    const auto *current = session.validation()->Get(0);
+    const auto *solved = session.validation()->Get(1);
+    EXPECT_EQ(current->name()->string_view(), "current");
+    EXPECT_EQ(solved->name()->string_view(), "solved");
+    // Straightness, then rigidity's distance and angle.
+    ASSERT_EQ(solved->results()->size(), 3u);
+    const auto *straightness = solved->results()->Get(0);
+    EXPECT_GT(straightness->frames(), 50);
+    EXPECT_LT(straightness->median(), 0.5);
+    EXPECT_EQ(
+        straightness->means()->size(),
+        static_cast<size_t>(straightness->columns() * straightness->rows()));
+    EXPECT_GT(solved->results()->Get(1)->frames(), 0);
+    EXPECT_GT(current->results()->Get(1)->median(),
+              solved->results()->Get(1)->median());
+  }
+  Command(CommandAction::STOP_VALIDATING);
+  EXPECT_EQ(Status().state(), SessionState::SOLVED);
 
   Command(CommandAction::SAVE, Args().Force());
   EXPECT_EQ(Status().error()->string_view(), "");

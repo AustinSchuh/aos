@@ -21,6 +21,9 @@ ABSL_FLAG(std::string, www_folder, "www/calibration",
           "Where robot_server serves calibration files from.");
 ABSL_FLAG(std::string, www_path, "/calibration",
           "The URL path robot_server serves --www_folder at.");
+ABSL_FLAG(double, tag_size, 6.5 * 0.0254,
+          "The AprilTags' size for the two-tag check, in meters, edge to edge "
+          "of their black squares.");
 ABSL_FLAG(std::string, board_store, "/home/pi/calibration/boards.json",
           "Where saved boards and the last choices are kept.");
 
@@ -39,6 +42,7 @@ int main(int argc, char **argv) {
       .www_path = absl::GetFlag(FLAGS_www_path),
       .board_store = absl::GetFlag(FLAGS_board_store),
       .period = std::chrono::milliseconds(100),
+      .tag_size = absl::GetFlag(FLAGS_tag_size),
   };
   for (std::string_view camera :
        absl::StrSplit(absl::GetFlag(FLAGS_cameras), ',', absl::SkipEmpty())) {

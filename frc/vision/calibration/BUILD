@@ -333,7 +333,10 @@ static_flatbuffer(
     name = "calibration_command_fbs",
     srcs = ["calibration_command.fbs"],
     visibility = ["//visibility:public"],
-    deps = ["//frc/vision:calibration_fbs"],
+    deps = [
+        ":calibration_status_fbs",
+        "//frc/vision:calibration_fbs",
+    ],
 )
 
 static_flatbuffer(
@@ -376,6 +379,9 @@ flatbuffer_ts_library(
         "frc/vision/calibration/session.ts",
         "frc/vision/calibration/camera-board.ts",
         "frc/vision/calibration/board-store.ts",
+        "frc/vision/calibration/validation-check.ts",
+        "frc/vision/calibration/check-result.ts",
+        "frc/vision/calibration/lens-validation.ts",
         "frc/vision/calibration/board-spec.ts",
         "frc/vision/calibration/camera-calibration.ts",
         "frc/vision/calibration/transformation-matrix.ts",
@@ -407,6 +413,7 @@ cc_library(
         ":charuco_detector",
         ":intrinsics_calibration_lib",
         ":intrinsics_solver",
+        ":validation",
         "//aos:flatbuffer_merge",
         "//aos:flatbuffers",
         "//aos:json_to_flatbuffer",
@@ -484,5 +491,26 @@ cc_test(
         "//frc/vision/util:charuco_board",
         "//third_party:opencv",
         "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
+cc_library(
+    name = "validation",
+    srcs = ["validation.cc"],
+    hdrs = ["validation.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = ["//third_party:opencv"],
+)
+
+cc_test(
+    name = "validation_test",
+    srcs = ["validation_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":validation",
+        "//aos/testing:googletest",
+        "//frc/vision/util:charuco_board",
+        "//third_party:opencv",
     ],
 )
