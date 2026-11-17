@@ -322,6 +322,27 @@ TEST_F(CalibrationServerTest, CalibratesSavesAndRemembers) {
   Command(CommandAction::SET_BOARD, Args().Board(BoardPresets()[1].spec));
   EXPECT_NE(Status().error()->string_view(), "");
 
+  // The captures' images, to calibrate from offline.
+  Command(CommandAction::EXPORT_IMAGES);
+  EXPECT_EQ(Status().error()->string_view(), "");
+  {
+    const calibration::Session &session = Session();
+    EXPECT_EQ(session.images_exported(), 12);
+    const std::filesystem::path zip =
+        tmp_ / "www" /
+        std::filesystem::path(session.images_download_path()->string_view())
+            .filename();
+    EXPECT_EQ(session.images_download_path()->string_view().substr(0, 13),
+              "/calibration/");
+    ASSERT_TRUE(
+        std::filesystem::exists(tmp_ / "www" / "calibration" / zip.filename()));
+    // 12 PNGs of 1600x1304, compressed: tens of kilobytes each even of these
+    // synthetic images.
+    EXPECT_GT(std::filesystem::file_size(tmp_ / "www" / "calibration" /
+                                         zip.filename()),
+              12u * 20000u);
+  }
+
   Command(CommandAction::UNDO);
   EXPECT_EQ(Status().captures(), 11);
 

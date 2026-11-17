@@ -1,6 +1,7 @@
 #ifndef FRC_VISION_CALIBRATION_CALIBRATION_SERVER_LIB_H_
 #define FRC_VISION_CALIBRATION_CALIBRATION_SERVER_LIB_H_
 
+#include <filesystem>
 #include <future>
 #include <map>
 #include <optional>
@@ -66,6 +67,9 @@ class CalibrationServer {
     CharucoCapture capture;
     cv::Vec3d rvec;
     cv::Vec3d tvec;
+    // Its image, as a PNG in the session's folder; empty if it couldn't be
+    // written.
+    std::string image_file;
   };
 
   // One calibration's checks, over the frames looked at while validating.
@@ -92,6 +96,9 @@ class CalibrationServer {
   absl::Status Start(const calibration::Command &command);
   absl::Status UseBoard(const BoardSpec &board);
   absl::Status Save(bool force);
+  absl::Status ExportImages();
+  // Where this session keeps its captures' images.
+  std::filesystem::path SessionFolder() const;
 
   // Looks at the newest image, and captures it if it's worth keeping.
   void Tick();
@@ -150,6 +157,10 @@ class CalibrationServer {
   CameraLens guess_;
   cv::Size image_size_;
   std::vector<StoredCapture> captures_;
+  // Numbers the session's images.
+  int next_image_ = 0;
+  std::string images_download_path_;
+  int images_exported_ = 0;
   CaptureGate gate_;
   bool capture_next_ = false;
   std::optional<Solved> solved_;

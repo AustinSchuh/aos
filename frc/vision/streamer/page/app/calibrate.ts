@@ -347,6 +347,10 @@ export class CalibratePanel {
     void this.calibration.send({action: 'SAVE', force: this.force});
   }
 
+  exportImages(): void {
+    void this.calibration.send({action: 'EXPORT_IMAGES'});
+  }
+
   finish(): void {
     void this.calibration.send({action: 'FINISH'});
   }
