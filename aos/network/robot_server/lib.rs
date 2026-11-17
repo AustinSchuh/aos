@@ -146,6 +146,86 @@ pub fn tls_config(tls_dir: &Path) -> io::Result<Arc<ServerConfig>> {
     Ok(Arc::new(config))
 }
 
+/// robot_server's flags: its command line, and what a simulation starts it with.
+#[derive(clap::Parser, Debug)]
+#[command(name = "robot_server")]
+pub struct Flags {
+    /// The AOS configuration.
+    #[arg(long, default_value = "aos_config.json")]
+    pub config: PathBuf,
+    /// Port for HTTPS: the pages and the websocket proxies.
+    #[arg(long, default_value_t = 443)]
+    pub https_port: u16,
+    /// Port for plain HTTP: the page that checks whether this computer trusts the robot.
+    #[arg(long, default_value_t = 80)]
+    pub http_port: u16,
+    /// The user to run as once listening.  Starter starts robot_server as root so it can listen
+    /// on ports below 1024; it refuses to carry on as root without this.
+    #[arg(long, default_value = "")]
+    pub user: String,
+    /// Where the pages are, as web_proxy's --data_dir.
+    #[arg(long, default_value = "www")]
+    pub data_dir: PathBuf,
+    /// Where aos_make_tls_cert keeps the certificate.
+    #[arg(long, default_value = "/etc/aos/tls")]
+    pub tls_dir: PathBuf,
+    /// web_proxy's port; /ws is proxied to its websocket.
+    #[arg(long, default_value_t = 1180)]
+    pub web_proxy_port: u16,
+    /// The Foxglove server's port; /foxglove is proxied to it.
+    #[arg(long, default_value_t = 8765)]
+    pub foxglove_port: u16,
+    /// camera_streamer's signalling port; /cameras/ws is proxied to it.
+    #[arg(long, default_value_t = 1190)]
+    pub camera_streamer_port: u16,
+    /// Channels POST /api/send may send on, as name:type.
+    #[arg(long, value_delimiter = ',')]
+    pub sendable_channels: Vec<String>,
+    /// An app the page starts and stops with commands, as JSON with an "action", on this channel
+    /// (name:type).  Empty for none.
+    #[arg(long, default_value = "")]
+    pub session_commands: String,
+    /// The app, as starter names it.
+    #[arg(long, default_value = "")]
+    pub session_app: String,
+    /// The apps to stop while it runs.
+    #[arg(long, value_delimiter = ',')]
+    pub session_stops: Vec<String>,
+    /// A channel (name:type) the app sends on regularly, to tell it's ready.
+    #[arg(long, default_value = "")]
+    pub session_ready: String,
+    /// The actions that start and end a session.
+    #[arg(long, value_delimiter = ',', default_value = "START")]
+    pub session_start_actions: Vec<String>,
+    #[arg(long, value_delimiter = ',', default_value = "FINISH,CANCEL")]
+    pub session_end_actions: Vec<String>,
+}
+
+impl Flags {
+    /// What `/api` may send on, and the app it starts and stops.
+    pub fn api_options(&self) -> api::ApiOptions {
+        use crate::session::{parse_channel, SessionApp};
+        let channel = |text: &str, flag: &str| {
+            parse_channel(text).unwrap_or_else(|| panic!("--{flag} {text} isn't name:type"))
+        };
+        api::ApiOptions {
+            sendable: self
+                .sendable_channels
+                .iter()
+                .map(|text| channel(text, "sendable_channels"))
+                .collect(),
+            session: (!self.session_commands.is_empty()).then(|| SessionApp {
+                commands: channel(&self.session_commands, "session_commands"),
+                app: self.session_app.clone(),
+                stops: self.session_stops.clone(),
+                ready: channel(&self.session_ready, "session_ready"),
+                start_actions: self.session_start_actions.clone(),
+                end_actions: self.session_end_actions.clone(),
+            }),
+        }
+    }
+}
+
 /// Where the HTTPS router finds what it serves.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -557,18 +637,8 @@ pub unsafe extern "C" fn robot_server_add_to_simulation(
 ) -> bool {
     use aos_flatbuffers::Flatbuffer;
     // SAFETY: As the caller promises.
-    let bytes = unsafe { std::slice::from_raw_parts(config, config_size) }.to_vec();
-    // Kept for as long as the process runs, as the server's tasks are.
-    let config: &'static _ = match aos_flatbuffers::NonSizePrefixedFlatbuffer::<
-        aos_configuration_fbs::aos::Configuration<'static>,
-        Vec<u8>,
-    >::new(bytes)
-    {
-        Ok(config) => Box::leak(Box::new(config)),
-        Err(error) => {
-            log::error!("robot_server: the configuration isn't one: {error}");
-            return false;
-        }
+    let Some(config) = (unsafe { leak_config(config, config_size) }) else {
+        return false;
     };
     // SAFETY: As the caller promises.
     let data_dir = match unsafe { std::ffi::CStr::from_ptr(data_dir) }.to_str() {
@@ -603,6 +673,137 @@ pub unsafe extern "C" fn robot_server_add_to_simulation(
     );
     simulation.spawn(server);
     true
+}
+
+/// Why robot_server couldn't start in a simulation: logged, and on stderr, since a C++
+/// simulation may not have set Rust's logging up.
+macro_rules! startup_error {
+    ($($arg:tt)*) => {{
+        log::error!($($arg)*);
+        eprintln!($($arg)*);
+    }};
+}
+
+/// robot_server in a simulation a C++ test or replay assembled, as on the robot: started with
+/// `argv`, robot_server's own command line (`argc` arguments, the first the program's name),
+/// serving HTTPS and HTTP on its ports with the certificate in its `--tls-dir`, with its
+/// `--sendable-channels` and `--session-*`.  `--config` and `--user` are ignored: the
+/// simulation's configuration is `config`, a flatbuffer of `config_size` bytes, and nothing
+/// runs as root.  Returns false, having logged why, if it can't start.
+///
+/// # Safety
+///
+/// `simulation` is a live, unrun `aos_tokio_simulation_t`, `event_loop` one of its event loops,
+/// `config` points to `config_size` bytes, and `argv` to `argc` C strings.
+#[no_mangle]
+pub unsafe extern "C" fn robot_server_add_to_simulation_with_flags(
+    simulation: *mut aos_events_tokio::TokioSimulation,
+    event_loop: *mut aos_events_event_loop_c::aos_event_loop_t,
+    config: *const u8,
+    config_size: usize,
+    argc: std::os::raw::c_int,
+    argv: *const *const std::os::raw::c_char,
+) -> bool {
+    use aos_flatbuffers::Flatbuffer;
+    use clap::Parser;
+    // SAFETY: As the caller promises.
+    let Some(config) = (unsafe { leak_config(config, config_size) }) else {
+        return false;
+    };
+    let mut args = Vec::new();
+    for i in 0..argc.max(0) as usize {
+        // SAFETY: As the caller promises.
+        match unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_str() {
+            Ok(arg) => args.push(arg.to_string()),
+            Err(_) => {
+                startup_error!("robot_server: argument {i} isn't UTF-8");
+                return false;
+            }
+        }
+    }
+    let flags = match Flags::try_parse_from(&args) {
+        Ok(flags) => flags,
+        Err(error) => {
+            startup_error!("robot_server: {error}");
+            return false;
+        }
+    };
+    let bind = |port: u16, what: &str| match std::net::TcpListener::bind(("::", port)) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            startup_error!("robot_server: can't listen for {what} on {port}: {error}");
+            None
+        }
+    };
+    let (Some(https), Some(http)) = (
+        bind(flags.https_port, "HTTPS"),
+        bind(flags.http_port, "HTTP"),
+    ) else {
+        return false;
+    };
+    let tls = match tls_config(&flags.tls_dir) {
+        Ok(tls) => tls,
+        Err(error) => {
+            startup_error!(
+                "robot_server: no certificate in {}: {error}",
+                flags.tls_dir.display()
+            );
+            return false;
+        }
+    };
+    // SAFETY: As the caller promises.
+    let simulation = unsafe { &mut *simulation };
+    // SAFETY: As the caller promises.
+    let aos = unsafe { simulation.setup().handle(event_loop) };
+    let server = start(
+        &aos,
+        config.message(),
+        Options {
+            data_dir: flags.data_dir.clone(),
+            web_proxy_ws: format!("ws://127.0.0.1:{}/ws", flags.web_proxy_port),
+            foxglove_ws: format!("ws://127.0.0.1:{}", flags.foxglove_port),
+            camera_streamer_ws: format!("ws://127.0.0.1:{}", flags.camera_streamer_port),
+        },
+        flags.api_options(),
+        Listen::Tls {
+            https,
+            https_port: flags.https_port,
+            tls,
+            http,
+        },
+    );
+    simulation.spawn(server);
+    true
+}
+
+/// The configuration a simulation hands robot_server, kept for as long as the process runs, as
+/// the server's tasks are; None, having logged why, if it isn't one.
+///
+/// # Safety
+///
+/// `config` points to `config_size` bytes.
+unsafe fn leak_config(
+    config: *const u8,
+    config_size: usize,
+) -> Option<
+    &'static aos_flatbuffers::NonSizePrefixedFlatbuffer<
+        aos_configuration_fbs::aos::Configuration<'static>,
+        Vec<u8>,
+    >,
+> {
+    // SAFETY: As the caller promises.
+    let bytes = unsafe { std::slice::from_raw_parts(config, config_size) }.to_vec();
+    match aos_flatbuffers::NonSizePrefixedFlatbuffer::<
+        aos_configuration_fbs::aos::Configuration<'static>,
+        Vec<u8>,
+    >::new(bytes)
+    {
+        Ok(config) => Some(Box::leak(Box::new(config))),
+        Err(error) => {
+            startup_error!("robot_server: the configuration isn't one: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
