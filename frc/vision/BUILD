@@ -1,5 +1,7 @@
 load("@aos//aos/flatbuffers:ts.bzl", "flatbuffer_ts_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//aos:config.bzl", "aos_config")
 load("//aos/flatbuffers:build_defs.bzl", "DEFAULT_FLATC_ARGS", "flatbuffer_rust_module_library")
 load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
@@ -255,16 +257,55 @@ static_flatbuffer(
     visibility = ["//visibility:public"],
 )
 
+cc_library(
+    name = "field_side_exposure_adjuster_lib",
+    srcs = ["field_side_exposure_adjuster_lib.cc"],
+    hdrs = ["field_side_exposure_adjuster_lib.h"],
+    deps = [
+        ":camera_settings_fbs",
+        "//aos:configuration",
+        "//aos:json_to_flatbuffer",
+        "//aos/events:event_loop",
+        "//frc/input:joystick_state_fbs",
+        "@com_google_absl//absl/log:absl_log",
+    ],
+)
+
 cc_binary(
     name = "field_side_exposure_adjuster",
     srcs = ["field_side_exposure_adjuster.cc"],
     visibility = ["//visibility:public"],
     deps = [
-        ":camera_settings_fbs",
+        ":field_side_exposure_adjuster_lib",
         "//aos:configuration",
         "//aos:init",
         "//aos/events:shm_event_loop",
+        "@com_google_absl//absl/flags:flag",
+    ],
+)
+
+aos_config(
+    name = "field_side_exposure_adjuster_test_config",
+    src = "field_side_exposure_adjuster_test_config_source.json",
+    flatbuffers = [
+        ":camera_settings_fbs",
         "//frc/input:joystick_state_fbs",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = ["//aos/events:aos_config"],
+)
+
+cc_test(
+    name = "field_side_exposure_adjuster_test",
+    srcs = ["field_side_exposure_adjuster_test.cc"],
+    data = [":field_side_exposure_adjuster_test_config"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":field_side_exposure_adjuster_lib",
+        "//aos/events:simulated_event_loop",
+        "//aos/testing:googletest",
+        "//aos/testing:path",
+        "//aos/testing:tmpdir",
     ],
 )
 

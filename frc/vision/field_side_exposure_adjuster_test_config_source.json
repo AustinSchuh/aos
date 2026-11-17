@@ -1,0 +1,26 @@
+{
+  "channels": [
+    {
+      "name": "/frc",
+      "type": "frc.JoystickState"
+    },
+    {
+      "name": "/camera_settings",
+      "type": "frc.vision.CameraStreamSettings",
+      "max_size": 128
+    },
+    {
+      "name": "/camera0",
+      "type": "frc.vision.CameraStreamSettings",
+      "max_size": 128,
+      "frequency": 10
+    },
+    {
+      "name": "/camera1",
+      "type": "frc.vision.CameraStreamSettings",
+      "max_size": 128,
+      "frequency": 10
+    }
+  ],
+  "imports": ["../../aos/events/aos.json"]
+}
