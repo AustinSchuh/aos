@@ -2,16 +2,15 @@ load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
-# Pieces of the CUDA 11.8 toolkit shipped inside the Debian sysroot. Exposed
-# so //tools/cuda can wire them into a rules_cuda toolchain.
+# A file to find the sysroot by, in runfiles: tests running programs against
+# its libraries need its root.
 exports_files(
-    [
-        "usr/bin/ptxas",
-        "usr/lib/cuda/bin/x86_64-unknown-linux-gnu-fatbinary",
-        "usr/lib/cuda/nvvm/libdevice/libdevice.10.bc",
-    ],
+    ["usr/lib/os-release"],
     visibility = ["//visibility:public"],
 )
+
+# TensorRT's links to its builder, which build_rootfs.py leaves out.
+DANGLING = ["usr/lib/x86_64-linux-gnu/do_not_link_against_nvinfer_builder_resource*"]
 
 filegroup(
     name = "sysroot_files",
@@ -28,16 +27,13 @@ filegroup(
         ],
         exclude = [
             "usr/share/**",
-        ],
+        ] + DANGLING,
     ) + glob(
         include = [
             "usr/share/gir-1.0/**",
             "usr/share/fonts/**",
         ],
-    ) + [
-        "usr/bin/fatbinary",
-        "usr/bin/ptxas",
-    ],
+    ),
     visibility = ["//visibility:public"],
 )
 
@@ -181,33 +177,23 @@ filegroup(
             "etc/fonts/**",
         ],
         exclude = ["usr/share/**"] + ["usr/lib/x86_64-linux-gnu/%s" % (lib,) for lib in system_libraries] +
-                  ["lib/x86_64-linux-gnu/%s" % (lib,) for lib in system_libraries],
+                  ["lib/x86_64-linux-gnu/%s" % (lib,) for lib in system_libraries] + DANGLING,
     ) + glob(
         include = [
             "usr/share/gir-1.0/**",
             "usr/share/fonts/**",
         ],
-    ) + [
-        "usr/bin/fatbinary",
-        "usr/bin/ptxas",
-    ],
+    ),
     visibility = ["//visibility:public"],
 )
 
-# This one needs to be done special so we link against the one in the sysroot,
-# but actually use the one from the host.  NVIDIA gets really grumpy when the
-# version of the driver you have installed doesn't match the libraries in use.
 cc_library(
-    name = "cudart",
-    additional_linker_inputs = [
-        "usr/lib/x86_64-linux-gnu/libcuda.so.1",
-        "usr/lib/x86_64-linux-gnu/libcudart.so.11.0",
-    ],
-    linkopts = [
-        "$(location :usr/lib/x86_64-linux-gnu/libcuda.so.1)",
-        "$(location :usr/lib/x86_64-linux-gnu/libcudart.so.11.0)",
-    ],
+    name = "tensorrt",
     visibility = ["//visibility:public"],
+    deps = [
+        ":libnvinfer-headers-dev-headers",
+        ":usr_lib_x86_64-linux-gnu_libnvinfer.so.10.16.1-lib",
+    ],
 )
 
 {{ RULES }}
