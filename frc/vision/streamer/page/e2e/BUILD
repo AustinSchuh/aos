@@ -22,7 +22,7 @@ js_test(
         "@chrome_linux//:chrome",
         # Chrome's libraries and fonts: the test machines have neither.
         "@amd64_debian_sysroot//:sysroot_files",
-        "@amd64_debian_sysroot//:usr/bin/ptxas",
+        "@amd64_debian_sysroot//:usr/lib/os-release",
     ],
     entry_point = "page.test.mjs",
     env = {
@@ -33,7 +33,7 @@ js_test(
         "ROBOT_SIM": "$(rlocationpath //frc/vision/sim:vision_robot_sim)",
         "STARTER_HTML": "$(rlocationpath //frc/www:starter.html)",
         # A file the sysroot exports, to find it by.
-        "SYSROOT_FILE": "$(rlocationpath @amd64_debian_sysroot//:usr/bin/ptxas)",
+        "SYSROOT_FILE": "$(rlocationpath @amd64_debian_sysroot//:usr/lib/os-release)",
         "TEST_CERT": "$(rlocationpath testdata/localhost.crt)",
         "VISION_DIR": "$(rlocationpath //frc/vision/streamer/page:vision)",
     },

@@ -167,6 +167,7 @@ before(async () => {
   });
   origin = `https://localhost:${httpsPort}`;
 
+  // The sysroot holding SYSROOT_FILE, usr/lib/os-release.
   const sysroot = path.resolve(
     path.dirname(runfile(process.env.SYSROOT_FILE)),
     "../..",

@@ -33,6 +33,7 @@ rewrite bcr.bazel.build/(.*) realtimeroboticsgroup.org/build-dependencies/bcr.ba
 rewrite gmplib.org/(.*) realtimeroboticsgroup.org/build-dependencies/gmplib.org/$1
 rewrite download.gnome.org/(.*) realtimeroboticsgroup.org/build-dependencies/download.gnome.org/$1
 rewrite releases.hashicorp.com/(.*) realtimeroboticsgroup.org/build-dependencies/releases.hashicorp.com/$1
+rewrite developer.download.nvidia.com/(.*) realtimeroboticsgroup.org/build-dependencies/developer.download.nvidia.com/$1
 
 allow realtimeroboticsgroup.org
 allow go.dev

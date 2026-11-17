@@ -1,0 +1,7 @@
+{
+    "url": "https://realtimeroboticsgroup.org/build-dependencies/2026-11-17-bookworm-amd64-nvidia-rootfs.tar.zst",
+    "integrity": "sha256-SrgDVc40oSSaQDFTQWgKdrClMp4nCRiiCbwQx0IOoRo=",
+    "overlay": {
+        "BUILD.bazel": "sha256-jBN30fTjnXf5NoEAALG4cP/EHOJuOMmspXdD1alYipk="
+    }
+}

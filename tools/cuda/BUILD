@@ -1,13 +1,13 @@
 """Hermetic CUDA toolchains for rules_cuda.
 
-The CUDA bits we need (`ptxas`, `fatbinary`, libdevice, headers) ship inside
-the per-platform sysroot repos, so we just point rules_cuda's clang
-toolchain at those file labels. Two toolchains are registered, gated by
-`@platforms//cpu`, so Bazel selects the right one for `--platforms`.
+CUDA 13.2 comes from NVIDIA's redistributable archives (`@cuda`, declared in
+MODULE.bazel), not the sysroots: the same toolkit for x86 and the Orin. Its
+host tools (`ptxas`, `fatbinary`, libdevice) are resolved for the exec
+platform, so x86's run whichever the target; its headers and runtime are the
+target's. Every input is a regular Bazel artifact, as remote execution needs.
 
-Compared to the old approach of stitching symlinks into a hermetic repo,
-this keeps every input as a regular Bazel artifact, which is required for
-remote execution to work.
+macOS hosts can't run those x86 tools, so they keep a toolchain that runs
+them in a vfkit VM, from the Orin's sysroot.
 """
 
 load("@platforms//host:constraints.bzl", "HOST_CONSTRAINTS")
@@ -24,59 +24,59 @@ package(default_visibility = ["//visibility:public"])
 _HOST_IS_DARWIN = "@platforms//os:osx" in HOST_CONSTRAINTS
 
 # ---------------------------------------------------------------------------
-# x86_64: Debian sysroot ships CUDA 11.8 under /usr/lib/cuda and /usr/bin.
+# Linux hosts, for any target with a GPU: CUDA 13.2 from @cuda.
 # ---------------------------------------------------------------------------
 
-filegroup(
-    name = "x86_64_files",
-    srcs = [
-        "@amd64_debian_sysroot//:usr/bin/ptxas",
-        "@amd64_debian_sysroot//:usr/lib/cuda/bin/x86_64-unknown-linux-gnu-fatbinary",
-        "@amd64_debian_sysroot//:usr/lib/cuda/nvvm/libdevice/libdevice.10.bc",
-    ],
-)
-
 cuda_toolkit_info(
-    name = "x86_64_toolkit_info",
-    bin2c = "@rules_cuda//cuda/dummy:bin2c",
-    fatbinary = "@amd64_debian_sysroot//:usr/lib/cuda/bin/x86_64-unknown-linux-gnu-fatbinary",
-    libdevice = "@amd64_debian_sysroot//:usr/lib/cuda/nvvm/libdevice/libdevice.10.bc",
-    link_stub = "@rules_cuda//cuda/dummy:link.stub",
-    nvlink = "@rules_cuda//cuda/dummy:nvlink",
+    name = "linux_toolkit_info",
+    bin2c = "@cuda//:bin2c",
+    fatbinary = "@cuda//:fatbinary",
+    # rules_cuda derives --cuda-path from libdevice's grandparent.
+    libdevice = "@cuda//:libdevice.10.bc",
+    link_stub = "@cuda//:link.stub",
+    nvlink = "@cuda//:nvlink",
     path = "",
-    ptxas = "@amd64_debian_sysroot//:usr/bin/ptxas",
-    version = "11.8",
+    ptxas = "@cuda//:ptxas",
+    version = "13.2",
 )
 
 cuda_toolchain_config_clang(
-    name = "x86_64_clang_config",
-    cuda_toolkit = ":x86_64_toolkit_info",
+    name = "linux_clang_config",
+    cuda_toolkit = ":linux_toolkit_info",
     toolchain_identifier = "clang",
 )
 
 cuda_toolchain(
-    name = "x86_64_clang",
-    compiler_files = [":x86_64_files"],
+    name = "linux_clang",
+    compiler_files = [
+        "@cuda//:nvcc_all_files",
+        "@cuda//:nvvm_all_files",
+    ],
     compiler_use_cc_toolchain = True,
-    toolchain_config = ":x86_64_clang_config",
+    toolchain_config = ":linux_clang_config",
 )
 
 toolchain(
-    name = "x86_64_clang_toolchain",
-    target_compatible_with = [
+    name = "linux_clang_toolchain",
+    exec_compatible_with = [
         "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//os:linux",
         "//tools/platforms/gpu:nvidia",
     ],
     target_settings = [
         "@rules_cuda//cuda:is_enabled",
         "@rules_cuda//cuda:compiler_is_clang",
     ],
-    toolchain = ":x86_64_clang",
+    toolchain = ":linux_clang",
     toolchain_type = "@rules_cuda//cuda:toolchain_type",
 )
 
 # ---------------------------------------------------------------------------
-# aarch64: Yocto sysroot ships CUDA 13.2 under /usr/local/cuda-13.2.
+# macOS hosts, for the Orin: the Yocto sysroot's CUDA 13.2, its x86 host tools
+# run in a vfkit VM.
 # ---------------------------------------------------------------------------
 
 # Synthetic CUDA root used by the aarch64 toolchain. `cuda_tool_wrapper.sh`
@@ -239,6 +239,7 @@ cuda_toolchain(
 
 toolchain(
     name = "aarch64_clang_toolchain",
+    exec_compatible_with = ["@platforms//os:osx"],
     target_compatible_with = [
         "@platforms//cpu:arm64",
         "//tools/platforms/gpu:nvidia",
