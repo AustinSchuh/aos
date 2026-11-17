@@ -14,6 +14,9 @@ ABSL_FLAG(uint32_t, blue_exposure, 20,
           "Exposure on blue, until one is saved, in 100 us units.");
 ABSL_FLAG(std::string, settings_file, "/home/pi/camera_settings.json",
           "Where the exposure and gain the page sets are saved.");
+ABSL_FLAG(std::string, www_file, "www/camera_settings/camera_settings.json",
+          "Where the robot's whole camera settings are written, while any "
+          "are saved, for robot_server to serve and to check in.");
 
 int main(int argc, char **argv) {
   aos::InitGoogle(&argc, &argv);
@@ -23,6 +26,7 @@ int main(int argc, char **argv) {
   frc::vision::ExposureAdjuster adjuster(
       &event_loop, {.settings_file = absl::GetFlag(FLAGS_settings_file),
                     .red_exposure = absl::GetFlag(FLAGS_red_exposure),
-                    .blue_exposure = absl::GetFlag(FLAGS_blue_exposure)});
+                    .blue_exposure = absl::GetFlag(FLAGS_blue_exposure),
+                    .www_file = absl::GetFlag(FLAGS_www_file)});
   event_loop.Run();
 }

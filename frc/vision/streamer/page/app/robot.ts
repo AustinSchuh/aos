@@ -36,6 +36,12 @@ async function latest(
   }
 }
 
+/**
+ * Where robot_server serves the robot's own camera settings, written by
+ * field_side_exposure_adjuster's --www_file while it has any.
+ */
+const OWN_SETTINGS_PATH = '/camera_settings/camera_settings.json';
+
 /** The robot's node, whose cameras' calibrations to show. */
 export const NODE = 'orin';
 
@@ -64,6 +70,12 @@ export class Robot implements OnDestroy {
   sent: {exposure100us?: number; gain?: number} = {};
   /** Why the last change of exposure or gain failed. */
   settingsError = '';
+  /**
+   * The robot's own camera settings, which differ from constants.json, as
+   * field_side_exposure_adjuster offers them to check in; null while it has
+   * none.
+   */
+  ownSettingsPath: string | null = null;
 
   private polling = true;
   private watchingSettings = false;
@@ -156,11 +168,12 @@ export class Robot implements OnDestroy {
     });
   }
 
-  /** What the cameras were last sent, from the first camera that has been. */
+  /** What the cameras were last sent, and whether the robot has its own. */
   private async pollSettings(): Promise<void> {
     if (!this.watchingSettings) {
       return;
     }
+    void this.pollOwnSettings();
     const cameras = this.cameras.length > 0 ? this.cameras : [0, 1, 2, 3];
     for (const camera of cameras) {
       const sent = await latest(
@@ -182,6 +195,26 @@ export class Robot implements OnDestroy {
       });
       return;
     }
+  }
+
+  /** Whether the robot offers its own settings, as long as it has any. */
+  private async pollOwnSettings(): Promise<void> {
+    let own: string | null = null;
+    try {
+      const response = await fetch(OWN_SETTINGS_PATH, {
+        method: 'HEAD',
+        cache: 'no-store',
+      });
+      own = response.ok ? OWN_SETTINGS_PATH : null;
+    } catch {
+      own = null;
+    }
+    this.zone.run(() => (this.ownSettingsPath = own));
+  }
+
+  /** Forgets the robot's own exposure and gain: back to constants.json's. */
+  useConstantsSettings(): Promise<void> {
+    return this.setCameraSettings({}).then(() => this.pollSettings());
   }
 
   /** The constants, retried until the robot has them. */

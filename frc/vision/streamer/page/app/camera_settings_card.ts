@@ -110,6 +110,12 @@ export class CameraSettingsCard implements OnDestroy {
     void this.robot.setCameraSettings({gain});
   }
 
+  useConstants(): void {
+    this.held = null;
+    this.manual = null;
+    void this.robot.useConstantsSettings();
+  }
+
   private manualExposure(): number {
     return (
       this.manual ??

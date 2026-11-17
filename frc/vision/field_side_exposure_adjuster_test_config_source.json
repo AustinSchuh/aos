@@ -5,6 +5,11 @@
       "type": "frc.JoystickState"
     },
     {
+      "name": "/constants",
+      "type": "frc.vision.CameraConstants",
+      "max_size": 4096
+    },
+    {
       "name": "/camera_settings",
       "type": "frc.vision.CameraStreamSettings",
       "max_size": 128
