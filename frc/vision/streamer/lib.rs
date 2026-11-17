@@ -2,7 +2,7 @@
 //! every viewer over WebRTC, with a box drawn on each AprilTag.  See the "Video" section of
 //! the vision UI design.
 
-pub use camera_streamer_core::{draw, frame, join, overlay, signalling, tag_box};
+pub use camera_streamer_core::{annotations, draw, frame, join, overlay, signalling, tag_box};
 
 pub mod pipeline;
 pub mod streamer;

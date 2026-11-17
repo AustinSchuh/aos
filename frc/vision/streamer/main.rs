@@ -16,7 +16,9 @@ use std::rc::Rc;
 
 use aos_configuration::read_config_from;
 use aos_events_tokio::TokioShmEventLoop;
+use aos_flatbuffers::Flatbuffer;
 use aos_init::Init;
+use camera_streamer::annotations::annotations_overlay;
 use camera_streamer::join::JoinOptions;
 use camera_streamer::pipeline::Settings;
 use camera_streamer::signalling::{FromBrowser, ToBrowser};
@@ -158,6 +160,18 @@ fn main() {
         .expect("Failed to start the GStreamer pipeline"),
     ));
 
+    // calibration_server's corners, on robots whose config has them.
+    let corner_cameras: Vec<u32> = app
+        .cameras
+        .iter()
+        .copied()
+        .filter(|camera| {
+            config.message().channels().iter().flatten().any(|channel| {
+                channel.name() == Some(&format!("/camera{camera}/calibration"))
+                    && channel.type_() == Some("foxglove.ImageAnnotations")
+            })
+        })
+        .collect();
     TokioShmEventLoop::new(&config).run(move |aos| {
         let watches: Vec<_> = app
             .cameras
@@ -175,7 +189,30 @@ fn main() {
         // The calibrations: whatever was sent before we started, then any changes.
         let mut constants_fetcher = aos.make_fetcher("/constants", "frc.vision.CameraConstants");
         let mut constants = aos.make_watch("/constants", "frc.vision.CameraConstants");
+        let corner_watches: Vec<_> = corner_cameras
+            .iter()
+            .map(|&camera| {
+                (
+                    camera,
+                    aos.make_watch(
+                        &format!("/camera{camera}/calibration"),
+                        "foxglove.ImageAnnotations",
+                    ),
+                )
+            })
+            .collect();
         async move {
+            for (camera, mut watch) in corner_watches {
+                let streamer = streamer.clone();
+                tokio::task::spawn_local(async move {
+                    loop {
+                        let message = watch.next().await;
+                        if let Some(corners) = message.data().and_then(annotations_overlay) {
+                            streamer.borrow_mut().on_corners(camera, corners);
+                        }
+                    }
+                });
+            }
             if constants_fetcher.fetch() {
                 if let Some(data) = constants_fetcher.message().data() {
                     streamer.borrow_mut().on_constants(data);
