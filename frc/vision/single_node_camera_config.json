@@ -108,6 +108,13 @@
       "frequency": 125
     },
     {
+      "name": "/camera_settings",
+      "type": "frc.vision.CameraStreamSettings",
+      "source_node": "orin",
+      "max_size": 128,
+      "frequency": 10
+    },
+    {
       "name": "/camera0",
       "type": "frc.vision.CameraStreamSettings",
       "source_node": "orin",
