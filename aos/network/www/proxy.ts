@@ -88,6 +88,9 @@ class ChannelRequest {
 export class Connection {
   private webSocketConnection: WebSocket | null = null;
   private rtcPeerConnection: RTCPeerConnection | null = null;
+  // web_proxy's ICE candidates that came before its answer, which a peer
+  // connection refuses until it has the answer.
+  private pendingCandidates: RTCIceCandidateInit[] | null = [];
   private dataChannel: RTCDataChannel | null = null;
   private webSocketUrl: string;
 
@@ -293,6 +296,7 @@ export class Connection {
   // We now have a websocket, so start setting up the peer connection. We only
   // want a DataChannel, so create it and then create an offer to send.
   onWebSocketOpen(): void {
+    this.pendingCandidates = [];
     this.rtcPeerConnection = new RTCPeerConnection({
       iceServers: [{urls: ['stun:stun.l.google.com:19302']}],
     });
@@ -328,9 +332,17 @@ export class Connection {
           console.log('got something other than an answer back');
           break;
         }
-        this.rtcPeerConnection.setRemoteDescription(
-          new RTCSessionDescription({type: 'answer', sdp: sdpFb.payload()}),
-        );
+        {
+          const pending = this.pendingCandidates ?? [];
+          this.pendingCandidates = null;
+          // A peer connection adds candidates in order after the answer.
+          this.rtcPeerConnection.setRemoteDescription(
+            new RTCSessionDescription({type: 'answer', sdp: sdpFb.payload()}),
+          );
+          for (const candidate of pending) {
+            this.rtcPeerConnection.addIceCandidate(candidate);
+          }
+        }
         break;
       case Payload.WebSocketIce:
         const iceFb = message.payload(new WebSocketIce());
@@ -338,7 +350,11 @@ export class Connection {
         candidate.candidate = iceFb.candidate();
         candidate.sdpMid = iceFb.sdpMid();
         candidate.sdpMLineIndex = iceFb.sdpMLineIndex();
-        this.rtcPeerConnection.addIceCandidate(candidate);
+        if (this.pendingCandidates !== null) {
+          this.pendingCandidates.push(candidate);
+        } else {
+          this.rtcPeerConnection.addIceCandidate(candidate);
+        }
         break;
       default:
         console.log('got an unknown message');
