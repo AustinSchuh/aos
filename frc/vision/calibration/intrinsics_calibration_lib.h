@@ -79,6 +79,16 @@ class IntrinsicsCalibration {
   // Return how many captures we've made so far
   int NumCaptures() const { return all_charuco_ids_.size(); };
 
+  // The captures so far, and the images' size.
+  std::vector<CharucoCapture> Captures() const {
+    std::vector<CharucoCapture> captures;
+    for (size_t i = 0; i < all_charuco_ids_.size(); ++i) {
+      captures.push_back({all_charuco_ids_[i], all_charuco_corners_[i]});
+    }
+    return captures;
+  }
+  cv::Size ImageSize() const { return image_size_; }
+
   // Allow setting of ids and corners, for testing purposes
   void SetCharucoIds(std::vector<std::vector<int>> &charuco_ids) {
     all_charuco_ids_ = charuco_ids;

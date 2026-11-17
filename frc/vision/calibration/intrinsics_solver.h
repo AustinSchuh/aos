@@ -9,6 +9,27 @@
 
 namespace frc::vision {
 
+// How a lens bends light, as a solve models it.
+enum class LensModel {
+  // OpenCV's: k1, k2, p1, p2, k3.
+  kOpenCv5,
+  // OpenCV's rational model: k1, k2, p1, p2, k3, k4, k5, k6, the radial
+  // part a ratio of polynomials.
+  kOpenCvRational,
+  // Kannala-Brandt, as OpenCV's fisheye module has it: the distorted angle a
+  // polynomial in the angle from the axis, k1..k4.
+  kKannalaBrandt,
+};
+
+struct SolveOptions {
+  LensModel model = LensModel::kOpenCvRational;
+  // For the rational model, a prior pulling the denominator's terms, k4..k6,
+  // toward 0 with this standard deviation, so they only grow where the data
+  // needs them: unconstrained, numerator and denominator trade off, and the
+  // fit wanders to coefficients that fold inside the image.  0 for none.
+  double denominator_sigma = 0.0;
+};
+
 // One capture of a ChArUco board: the ids of the inner corners found, and
 // where they are in the image, not undistorted.
 struct CharucoCapture {
@@ -17,10 +38,11 @@ struct CharucoCapture {
 };
 
 struct IntrinsicsSolution {
+  LensModel model;
   // 3x3, CV_64F.
   cv::Mat camera_matrix;
-  // 5 coefficients, or for the rational model all 14 of OpenCV's (0 past
-  // the eighth), CV_64F.
+  // As OpenCV has them for the model: 5; for the rational model all 14 (0
+  // past the eighth); for Kannala-Brandt 4.  CV_64F.
   cv::Mat dist_coeffs;
   // RMS reprojection error over every corner, in pixels.
   double reprojection_error;
@@ -49,7 +71,23 @@ absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
     const cv::Ptr<cv::aruco::CharucoBoard> &board,
     const std::vector<CharucoCapture> &captures, cv::Size image_size,
     const cv::Mat &camera_matrix, const cv::Mat &dist_coeffs,
+    const SolveOptions &options);
+
+// As above, with OpenCV's rational model if `rational_model`, else its 5.
+absl::StatusOr<IntrinsicsSolution> SolveIntrinsics(
+    const cv::Ptr<cv::aruco::CharucoBoard> &board,
+    const std::vector<CharucoCapture> &captures, cv::Size image_size,
+    const cv::Mat &camera_matrix, const cv::Mat &dist_coeffs,
     bool rational_model);
+
+// How well `solution` fits captures it wasn't solved from: each board's pose
+// fitted with the intrinsics held, then the RMS of every corner's error, in
+// pixels.  What a fit's own error can't show: a model fitting its captures'
+// noise.
+absl::StatusOr<double> HeldOutError(
+    const cv::Ptr<cv::aruco::CharucoBoard> &board,
+    const std::vector<CharucoCapture> &captures,
+    const IntrinsicsSolution &solution);
 
 }  // namespace frc::vision
 

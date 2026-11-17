@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <map>
 #include <numbers>
 #include <random>
 
@@ -21,6 +22,7 @@
 #include "aos/testing/random_seed.h"
 #include "aos/testing/tmpdir.h"
 #include "aos/util/math.h"
+#include "frc/vision/calibration/calibration_validator.h"
 #include "frc/vision/calibration/intrinsics_calibration_lib.h"
 #include "tools/cpp/runfiles/runfiles.h"
 
@@ -385,4 +387,116 @@ TEST(IntrinsicCalculationTest, ImagePlayback) {
   EXPECT_LT(calibrator.GetReprojectionError(), 1.0);
   EXPECT_GT(calibrator.NumCaptures(), 50);
 }
+
+// Each lens model, fitted to half of 99 real captures of a wide (about 97
+// degree) lens and measured against the other half: what a fit's own error
+// can't show.  OpenCV's 5 terms can't describe the lens.  The rational model
+// and Kannala-Brandt fit it equally well, but the rational model's 8 terms
+// trade off and fold outside the data (calibration_validator refuses them)
+// unless a prior holds the denominator near 0, which costs accuracy;
+// Kannala-Brandt's 4 terms stay small.  Logs a line per model.
+TEST(IntrinsicCalculationTest, CompareModels) {
+  // The images are of the large board, with its coarse pattern.
+  absl::SetFlag(&FLAGS_coarse_pattern, true);
+  absl::SetFlag(&FLAGS_large_board, true);
+  absl::SetFlag(&FLAGS_dict5x5_9x14_board, false);
+  absl::SetFlag(&FLAGS_override_hostname, "orin-971-1");
+  absl::SetFlag(&FLAGS_use_rational_model, true);
+  aos::FlatbufferDetachedBuffer<aos::Configuration> config =
+      aos::configuration::ReadConfig(
+          ArtifactPath("frc/vision/calibration/intrinsics_test_config.bfbs"));
+  aos::ShmEventLoop event_loop(&config.message());
+  std::unique_ptr<aos::ExitHandle> exit_handle = event_loop.MakeExitHandle();
+  IntrinsicsCalibration calibrator(
+      &event_loop, "orin-971-1", "/orin1/camera0", "24-00",
+      ArtifactPath("frc/vision/test_calib_files/"
+                   "calibration_orin-971-1_cam-24-00_8parameter.json"),
+      false, "/tmp", exit_handle.get());
+  absl::SetFlag(&FLAGS_visualize, false);
+  using bazel::tools::cpp::runfiles::Runfiles;
+  std::string error;
+  std::unique_ptr<Runfiles> runfiles(
+      Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY, &error));
+  std::filesystem::path path(
+      runfiles->Rlocation("intrinsic_calibration_test_images/img_000001.png"));
+  absl::SetFlag(&FLAGS_image_load_path, path.parent_path().string());
+  calibrator.LoadImagesFromPath(path.parent_path());
+  const std::vector<CharucoCapture> captures = calibrator.Captures();
+  std::vector<CharucoCapture> train, test;
+  for (size_t i = 0; i < captures.size(); ++i) {
+    (i % 2 == 0 ? train : test).push_back(captures[i]);
+  }
+  const cv::Mat guess = calibrator.GetCharucoExtractor().camera_matrix();
+  struct Variant {
+    std::string name;
+    SolveOptions options;
+  };
+  std::map<std::string, double> held_out;
+  for (const Variant &variant : std::vector<Variant>{
+           {"5-term", {LensModel::kOpenCv5, 0.0}},
+           {"rational", {LensModel::kOpenCvRational, 0.0}},
+           {"rational, prior 1", {LensModel::kOpenCvRational, 1.0}},
+           {"rational, prior 0.1", {LensModel::kOpenCvRational, 0.1}},
+           {"rational, prior 0.01", {LensModel::kOpenCvRational, 0.01}},
+           {"kannala-brandt", {LensModel::kKannalaBrandt, 0.0}},
+       }) {
+    // Half, all, and half again starting from no distortion, as a camera with
+    // no calibration would.
+    for (const auto [all, from_zero] :
+         {std::pair{false, false}, std::pair{true, false},
+          std::pair{false, true}}) {
+      absl::StatusOr<IntrinsicsSolution> solution = SolveIntrinsics(
+          calibrator.GetCharucoExtractor().board(), all ? captures : train,
+          calibrator.ImageSize(), guess,
+          from_zero ? cv::Mat::zeros(1, 8, CV_64F)
+                    : calibrator.GetCharucoExtractor().dist_coeffs(),
+          variant.options);
+      if (!solution.ok()) {
+        ABSL_LOG(INFO) << "MODEL " << variant.name
+                       << (all ? " (all)" : " (half)")
+                       << (from_zero ? " from no distortion" : "") << ": "
+                       << solution.status();
+        continue;
+      }
+      std::string valid = "n/a";
+      if (variant.options.model != LensModel::kKannalaBrandt) {
+        aos::FlatbufferDetachedBuffer<calibration::CameraCalibration> built =
+            IntrinsicsCalibration::BuildCalibration(
+                solution->camera_matrix, solution->dist_coeffs,
+                aos::realtime_clock::epoch(), "orin1", "/orin1/camera0",
+                "24-00", 971, solution->reprojection_error);
+        const absl::Status status =
+            ValidateCalibration(built.message(), calibrator.ImageSize().width,
+                                calibrator.ImageSize().height);
+        valid = status.ok() ? "valid" : "INVALID";
+      }
+      std::stringstream line;
+      line << "MODEL " << variant.name << (all ? " (all)" : " (half)")
+           << (from_zero ? " from no distortion" : "") << ": fit "
+           << solution->reprojection_error;
+      if (!all) {
+        const absl::StatusOr<double> error = HeldOutError(
+            calibrator.GetCharucoExtractor().board(), test, *solution);
+        ASSERT_TRUE(error.ok()) << error.status();
+        line << ", held out " << *error;
+        if (!from_zero) {
+          held_out[variant.name] = *error;
+        }
+      }
+      line << ", " << valid << ", K "
+           << solution->camera_matrix.at<double>(0, 0) << " "
+           << solution->camera_matrix.at<double>(1, 1) << " "
+           << solution->camera_matrix.at<double>(0, 2) << " "
+           << solution->camera_matrix.at<double>(1, 2) << ", d "
+           << solution->dist_coeffs.reshape(1, 1).colRange(
+                  0, std::min<int>(8, solution->dist_coeffs.total()));
+      ABSL_LOG(INFO) << line.str();
+    }
+  }
+  EXPECT_GT(held_out["5-term"], 1.0);
+  EXPECT_LT(held_out["rational"], 0.5);
+  EXPECT_LT(held_out["kannala-brandt"], 0.5);
+  EXPECT_LT(held_out["kannala-brandt"], held_out["rational"] * 1.05);
+}
+
 }  // namespace frc::vision
