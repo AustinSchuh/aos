@@ -24,7 +24,9 @@ enum class LensModel {
 };
 
 struct SolveOptions {
-  LensModel model = LensModel::kOpenCvRational;
+  // Kannala-Brandt: it fits a wide lens as well as the rational model, with
+  // half the terms and no fold outside the data (CompareModels).
+  LensModel model = LensModel::kKannalaBrandt;
   // For the rational model, a prior pulling the denominator's terms, k4..k6,
   // toward 0 with this standard deviation, so they only grow where the data
   // needs them: unconstrained, numerator and denominator trade off, and the

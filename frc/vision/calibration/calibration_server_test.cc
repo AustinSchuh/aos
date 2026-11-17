@@ -345,6 +345,10 @@ TEST_F(CalibrationServerTest, CalibratesSavesAndRemembers) {
     EXPECT_NEAR(intrinsics->Get(5), 650.0, 10.0);
     EXPECT_EQ(BoardSpecFromFlatbuffer(*solve.calibration()->board()),
               BoardSpec{});
+    // New calibrations are Kannala-Brandt's.
+    EXPECT_EQ(solve.calibration()->distortion_model(),
+              calibration::DistortionModel::KANNALA_BRANDT);
+    EXPECT_EQ(solve.calibration()->dist_coeffs()->size(), 4u);
   }
 
   // Validate the current and solved calibrations on new frames: the solved
