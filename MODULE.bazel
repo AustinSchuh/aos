@@ -290,6 +290,15 @@ single_version_override(
 
 bazel_dep(name = "rawrtc", version = "0.5.2")
 
+# Gather loopback addresses when RAWRTC_GATHER_LOOPBACK is set, so web_proxy
+# can reach a browser in a test's sandbox, which has only loopback.
+single_version_override(
+    module_name = "rawrtc",
+    patch_strip = 1,
+    patches = ["//third_party:rawrtc/0001-Gather-loopback-addresses-when-asked.patch"],
+    version = "0.5.2",
+)
+
 # Use zlib's crc32 instead of re's, which collides with it at link time.
 single_version_override(
     module_name = "rawrtc_re",
