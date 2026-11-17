@@ -191,29 +191,25 @@ impl Pipeline {
         }
     }
 
-    /// Encodes one I420 frame for `camera`, captured at `capture_ns` on the monotonic clock.
-    /// Its RTP timestamp comes from the capture time, not when it's encoded, so processing
-    /// jitter doesn't change playback timing.
-    pub fn push(&self, camera: u32, frame: Vec<u8>, capture_ns: i64) {
+    /// Encodes one I420 frame for `camera`, captured at `capture_ns` and pushed at `now_ns`,
+    /// both on the event loop's monotonic clock.  Its RTP timestamp comes from the capture time,
+    /// not when it's encoded, so processing jitter doesn't change playback timing.
+    pub fn push(&self, camera: u32, frame: Vec<u8>, capture_ns: i64, now_ns: i64) {
         let Some(encoder) = self.encoders.get(&camera) else {
             return;
         };
-        // GStreamer's system clock is the monotonic clock too, so running time = capture time -
-        // the pipeline's base time.
-        let Some(base) = self.pipeline.base_time() else {
+        // The event loop's clock isn't GStreamer's (a simulation's starts at 0), so only the
+        // frame's age crosses over: its running time is that long before now's.
+        let Some(running) = self.pipeline.current_running_time() else {
             return;
         };
-        let Some(pts) = u64::try_from(capture_ns)
-            .ok()
-            .and_then(|capture| capture.checked_sub(base.nseconds()))
-        else {
-            return;
-        };
+        let age = gst::ClockTime::from_nseconds(now_ns.saturating_sub(capture_ns).max(0) as u64);
+        let pts = running.saturating_sub(age);
         let mut buffer = gst::Buffer::from_mut_slice(frame);
         buffer
             .get_mut()
             .expect("A new buffer is writable")
-            .set_pts(gst::ClockTime::from_nseconds(pts));
+            .set_pts(pts);
         // A full appsrc drops the frame by itself; anything else is the pipeline shutting down.
         let _ = encoder.appsrc.push_buffer(buffer);
     }

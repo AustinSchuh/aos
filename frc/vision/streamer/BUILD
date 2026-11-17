@@ -28,13 +28,15 @@ rust_library(
 )
 
 # Streams the cameras to the browser over WebRTC; see lib.rs.  A real pipeline
-# needs the x264, webrtc and nice plugins, which only the Orin has, so this is
-# built for the Orin only.
+# needs the x264, webrtc and nice plugins, from the sysroot.  x86's links once
+# the amd64 sysroot has libbz2-dev (and runs once it has the plugins):
+# frc/amd64/build_rootfs.py.
 rust_library(
     name = "camera_streamer_lib",
     srcs = [
         "lib.rs",
         "pipeline.rs",
+        "server.rs",
         "streamer.rs",
     ],
     crate_name = "camera_streamer",
@@ -44,7 +46,16 @@ rust_library(
     ],
     deps = [
         ":camera_streamer_core",
+        "//aos:configuration_rust_fbs",
+        "//aos:flatbuffers_rs",
+        "//aos/events:event_loop_c_rs",
+        "//aos/events:tokio_event_loop_rs",
+        "//frc/vision:vision_rust_fbs",
+        "@aos_flatbuffers//rust:flatbuffers",
         "@crate_index//:anyhow",
+        "@crate_index//:clap",
+        "@crate_index//:env_logger",
+        "@crate_index//:futures",
         "@crate_index//:gstreamer",
         "@crate_index//:gstreamer-app",
         "@crate_index//:gstreamer-sdp",
@@ -52,6 +63,7 @@ rust_library(
         "@crate_index//:gstreamer-webrtc",
         "@crate_index//:log",
         "@crate_index//:tokio",
+        "@crate_index//:tokio-tungstenite",
     ],
 )
 

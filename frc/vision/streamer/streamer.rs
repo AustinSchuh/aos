@@ -226,8 +226,8 @@ impl Streamer {
         }
     }
 
-    /// Draws each ready frame's overlays and encodes it.
-    fn send(&self, camera: u32, ready: Vec<Ready<Frame>>) {
+    /// Draws each ready frame's overlays and encodes it, at `now_ns`.
+    fn send(&self, camera: u32, ready: Vec<Ready<Frame>>, now_ns: i64) {
         let Some(size) = self.pipeline.encoder_size(camera) else {
             return;
         };
@@ -256,7 +256,7 @@ impl Streamer {
                     draw::draw(&mut frame, corners, scale);
                 }
             }
-            self.pipeline.push(camera, frame.i420, capture_ns);
+            self.pipeline.push(camera, frame.i420, capture_ns, now_ns);
         }
     }
 
@@ -326,7 +326,7 @@ impl Streamer {
             capture_ns,
             now_ns,
         );
-        self.send(camera, ready);
+        self.send(camera, ready, now_ns);
         self.start_waiting_sessions(now_ns);
     }
 
@@ -359,7 +359,7 @@ impl Streamer {
             }
         };
         let ready = state.join.add_overlay(overlay, now_ns);
-        self.send(camera, ready);
+        self.send(camera, ready, now_ns);
     }
 
     /// calibration_server's corners found in one of `camera`'s images.
@@ -380,7 +380,7 @@ impl Streamer {
     pub fn expire(&mut self, camera: u32, now_ns: i64) {
         if let Some(state) = self.cameras.get_mut(&camera) {
             let ready = state.join.expire(now_ns);
-            self.send(camera, ready);
+            self.send(camera, ready, now_ns);
         }
     }
 
