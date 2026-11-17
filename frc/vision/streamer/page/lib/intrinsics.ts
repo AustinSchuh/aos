@@ -18,6 +18,8 @@ export interface Calibration {
   k: number[];
   /** The distortion coefficients, without the zeros on the end. */
   dist: number[];
+  /** Whether they're Kannala-Brandt's k1..k4, rather than OpenCV's. */
+  kannalaBrandt: boolean;
   reprojectionError: number | null;
 }
 
@@ -91,6 +93,7 @@ export function parseCalibration(entry: unknown): Calibration | null {
     cy: k[5]!,
     k,
     dist: withoutTrailingZeros(numbers(c['dist_coeffs']) ?? []),
+    kannalaBrandt: c['distortion_model'] === 'KANNALA_BRANDT',
     reprojectionError: typeof error === 'number' ? error : null,
   };
 }

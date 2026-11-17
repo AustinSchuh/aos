@@ -2,8 +2,8 @@
 //! pose the localizer gets, which shows at a glance when it is wrong.
 //!
 //! Poses are in the undistorted camera's frame, as the detector estimates them, so drawing one on
-//! the raw image means projecting it with the camera's intrinsics and then distorting it with
-//! OpenCV's model, as frc/orin/distortion.h's ReDistort does.  The box's edges are split up so they
+//! the raw image means projecting it with the camera's intrinsics and then distorting it with the
+//! calibration's model (OpenCV's, or Kannala-Brandt's), as frc/orin/distortion.h's ReDistort does.  The box's edges are split up so they
 //! bend with the lens.
 
 use camera_constants_rust_fbs::frc::vision as constants;
@@ -11,15 +11,17 @@ use target_map_rust_fbs::frc::vision as target_map;
 
 use crate::overlay::{Lines, Overlay, Rgba};
 
-/// A camera's pinhole intrinsics and OpenCV distortion, from its calibration.
+/// A camera's pinhole intrinsics and distortion, from its calibration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Intrinsics {
     pub fx: f64,
     pub fy: f64,
     pub cx: f64,
     pub cy: f64,
-    /// k1, k2, p1, p2, k3, k4, k5, k6: the 5 or 8 parameter model, zeros for those missing.
+    /// OpenCV's k1, k2, p1, p2, k3, k4, k5, k6: the 5 or 8 parameter model, zeros for those
+    /// missing; or with `kannala_brandt`, Kannala-Brandt's k1..k4 and zeros.
     pub dist: [f64; 8],
+    pub kannala_brandt: bool,
 }
 
 impl Intrinsics {
@@ -47,6 +49,8 @@ impl Intrinsics {
             fy: k.get(4) as f64,
             cy: k.get(5) as f64,
             dist,
+            kannala_brandt: calibration.distortion_model()
+                == constants::calibration::DistortionModel::KANNALA_BRANDT,
         })
     }
 
@@ -57,6 +61,19 @@ impl Intrinsics {
             return None;
         }
         let (x, y) = (p[0] / p[2], p[1] / p[2]);
+        if self.kannala_brandt {
+            // The distorted angle from the axis, a polynomial in the angle.
+            let [k1, k2, k3, k4, ..] = self.dist;
+            let r = (x * x + y * y).sqrt();
+            let scale = if r < 1e-12 {
+                1.0
+            } else {
+                let theta = r.atan();
+                let t2 = theta * theta;
+                theta * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))) / r
+            };
+            return Some((self.fx * x * scale + self.cx, self.fy * y * scale + self.cy));
+        }
         let [k1, k2, p1, p2, k3, k4, k5, k6] = self.dist;
         let r2 = x * x + y * y;
         let radial =
@@ -243,6 +260,7 @@ mod tests {
         cx: 800.0,
         cy: 650.0,
         dist: [0.0; 8],
+        kannala_brandt: false,
     };
 
     /// A TargetMap of tags at `positions`, each with orientation `wxyz`.
@@ -392,6 +410,20 @@ mod tests {
     }
 
     #[test]
+    fn kannala_brandt_projects_by_the_angle() {
+        // With no coefficients, the distorted radius is the angle: a point 45 degrees off the
+        // axis lands at pi / 4 focal lengths, not 1.
+        let mut lens = CAMERA.clone();
+        lens.kannala_brandt = true;
+        let (u, v) = lens.project([1.0, 0.0, 1.0]).unwrap();
+        assert!((u - (800.0 + 1000.0 * std::f64::consts::FRAC_PI_4)).abs() < 1e-9);
+        assert!((v - 650.0).abs() < 1e-9);
+        // k1 > 0 pushes it out.
+        lens.dist[0] = 0.1;
+        assert!(lens.project([1.0, 0.0, 1.0]).unwrap().0 > u);
+    }
+
+    #[test]
     fn nearer_edges_are_drawn_over_farther_ones() {
         // Two tags, the second nearer, and turned so its own edges are at different depths.
         let tilt = (0.3f64 / 2.0).cos();
@@ -441,11 +473,36 @@ mod tests {
     }
 
     fn camera_constants(calibrations: &[(&str, i32, [f32; 9], &[f32])]) -> Vec<u8> {
+        camera_constants_with_model(
+            &calibrations
+                .iter()
+                .map(|&(node, camera, k, dist)| {
+                    (
+                        node,
+                        camera,
+                        k,
+                        dist,
+                        constants::calibration::DistortionModel::OPENCV,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn camera_constants_with_model(
+        calibrations: &[(
+            &str,
+            i32,
+            [f32; 9],
+            &[f32],
+            constants::calibration::DistortionModel,
+        )],
+    ) -> Vec<u8> {
         use constants::calibration as cal;
         let mut fbb = FlatBufferBuilder::new();
         let calibrations: Vec<_> = calibrations
             .iter()
-            .map(|&(node, camera, k, dist)| {
+            .map(|&(node, camera, k, dist, model)| {
                 let node_name = fbb.create_string(node);
                 let intrinsics = fbb.create_vector(&k);
                 let dist_coeffs = fbb.create_vector(dist);
@@ -456,6 +513,7 @@ mod tests {
                         camera_number: camera,
                         intrinsics: Some(intrinsics),
                         dist_coeffs: Some(dist_coeffs),
+                        distortion_model: model,
                         ..Default::default()
                     },
                 )
@@ -490,5 +548,20 @@ mod tests {
         assert_eq!(Intrinsics::find(&data, "imu", 0).unwrap().fx, 1200.0);
         assert_eq!(Intrinsics::find(&data, "orin", 2), None);
         assert_eq!(Intrinsics::find(&[], "orin", 0), None);
+        assert!(!zero.kannala_brandt);
+
+        let fisheye = camera_constants_with_model(&[(
+            "orin",
+            0,
+            k(650.0),
+            &[0.025, 0.001, 0.004, -0.002],
+            constants::calibration::DistortionModel::KANNALA_BRANDT,
+        )]);
+        let lens = Intrinsics::find(&fisheye, "orin", 0).unwrap();
+        assert!(lens.kannala_brandt);
+        assert_eq!(
+            lens.dist[..4],
+            [0.025f32, 0.001, 0.004, -0.002].map(f64::from)
+        );
     }
 }

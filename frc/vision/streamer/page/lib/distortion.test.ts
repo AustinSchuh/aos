@@ -74,3 +74,32 @@ test('without a size, the principal point is the middle', () => {
   assert.deepEqual(imageSize(lens, null, null), [1601, 1300]);
   assert.deepEqual(imageSize(lens, 1600, 1304), [1600, 1304]);
 });
+
+test('kannala-brandt distorts by the angle, and inverts', () => {
+  // No coefficients: a point 45 degrees off the axis lands at pi / 4.
+  const [xd, yd] = distort([], 1, 0, true);
+  assert.ok(Math.abs(xd - Math.PI / 4) < 1e-12);
+  assert.equal(yd, 0);
+  const dist = [0.025, 0.001, 0.004, -0.002];
+  for (const [x, y] of [
+    [0.3, -0.2],
+    [2.5, 1.5],
+  ] as [number, number][]) {
+    const [dx, dy] = distort(dist, x, y, true);
+    const back = undistort(dist, dx, dy, true);
+    assert.ok(back !== null);
+    assert.ok(Math.abs(back[0] - x) < 1e-6 && Math.abs(back[1] - y) < 1e-6);
+  }
+  // The wide lens's corners move a long way: 75 degrees off the axis.
+  const lens: Lens = {
+    fx: 648,
+    fy: 648,
+    cx: 766,
+    cy: 557,
+    dist,
+    kannalaBrandt: true,
+  };
+  const d = displacement(lens, 0, 0);
+  assert.ok(d !== null);
+  assert.ok(d[0] < -100 && d[1] < -100);
+});

@@ -1,7 +1,11 @@
 import {strict as assert} from 'node:assert';
 import {test} from 'node:test';
 
-import {calibrations, withoutTrailingZeros} from './intrinsics.js';
+import {
+  calibrations,
+  parseCalibration,
+  withoutTrailingZeros,
+} from './intrinsics.js';
 
 // The test robot's /constants (team 0), as /api/latest gives them, cut
 // down.  Its calibrations have no ID, date or error; these are made up.
@@ -74,4 +78,21 @@ test('anything else reads as no calibrations', () => {
 test('trailing zeros go, the others stay', () => {
   assert.deepEqual(withoutTrailingZeros([1, 0, 2, 0, 0]), [1, 0, 2]);
   assert.deepEqual(withoutTrailingZeros([0, 0]), []);
+});
+
+test('a calibration says which model it is', () => {
+  const k = [648, 0, 766, 0, 648, 557, 0, 0, 1];
+  assert.equal(
+    parseCalibration({node_name: 'orin', intrinsics: k})!.kannalaBrandt,
+    false,
+  );
+  assert.equal(
+    parseCalibration({
+      node_name: 'orin',
+      intrinsics: k,
+      distortion_model: 'KANNALA_BRANDT',
+      dist_coeffs: [0.025, 0.001, 0.004, -0.002],
+    })!.kannalaBrandt,
+    true,
+  );
 });
