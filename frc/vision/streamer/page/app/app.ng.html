@@ -10,6 +10,13 @@
     </button>
     <button
       type="button"
+      [class.active]="tab === 'calibrate'"
+      (click)="show('calibrate')"
+    >
+      Calibrate
+    </button>
+    <button
+      type="button"
       [class.active]="tab === 'settings'"
       (click)="show('settings')"
     >
@@ -23,6 +30,13 @@
   </span>
 </header>
 
+<div class="banner" *ngIf="calibration.running && tab !== 'calibrate'">
+  Calibrating camera {{ calibration.status?.camera }}: AprilTag detection is
+  off.
+  <button type="button" (click)="show('calibrate')">Resume</button>
+  <button type="button" (click)="cancelCalibration()">Cancel</button>
+</div>
+
 <main class="feeds" *ngIf="tab === 'feeds'">
   <camera-tile
     *ngFor="let camera of cameras"
@@ -30,6 +44,10 @@
     [stream]="streams.videoFor(camera).stream"
     [line]="line(camera)"
   ></camera-tile>
+</main>
+
+<main class="calibrate" *ngIf="tab === 'calibrate'">
+  <calibrate-panel [cameras]="cameras"></calibrate-panel>
 </main>
 
 <main class="settings" *ngIf="tab === 'settings'">

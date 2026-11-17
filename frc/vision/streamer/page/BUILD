@@ -23,6 +23,7 @@ ng_application(
     html_assets = ["styles.css"],
     tsconfig = ":tsconfig",
     deps = [
+        "//:node_modules/@angular/forms",
         "//aos/network/www:proxy",
         "//frc/vision:turbojpeg_decoder_status_ts_fbs",
         "//frc/vision/streamer/page/lib",

@@ -51,34 +51,46 @@ export function calibrations(constants: unknown, node: string): Calibration[] {
   }
   const result: Calibration[] = [];
   for (const entry of list) {
-    if (typeof entry !== 'object' || entry === null) {
-      continue;
+    const calibration = parseCalibration(entry);
+    if (calibration !== null && calibration.node === node) {
+      result.push(calibration);
     }
-    const c = entry as Record<string, unknown>;
-    const k = numbers(c['intrinsics']);
-    if (c['node_name'] !== node || k === null || k.length !== 9) {
-      continue;
-    }
-    const timestamp = c['calibration_timestamp'];
-    const error = c['reprojection_error'];
-    const team = c['team_number'];
-    result.push({
-      camera: typeof c['camera_number'] === 'number' ? c['camera_number'] : 0,
-      cameraId: typeof c['camera_id'] === 'string' ? c['camera_id'] : '',
-      node,
-      team: typeof team === 'number' ? team : null,
-      date:
-        typeof timestamp === 'number' && timestamp > 0
-          ? new Date(timestamp / 1e6)
-          : null,
-      fx: k[0]!,
-      cx: k[2]!,
-      fy: k[4]!,
-      cy: k[5]!,
-      k,
-      dist: withoutTrailingZeros(numbers(c['dist_coeffs']) ?? []),
-      reprojectionError: typeof error === 'number' ? error : null,
-    });
   }
   return result.sort((a, b) => a.camera - b.camera);
+}
+
+/**
+ * One CameraCalibration, as /api/latest gives it, or null without a full camera matrix (or a
+ * node).
+ */
+export function parseCalibration(entry: unknown): Calibration | null {
+  if (typeof entry !== 'object' || entry === null) {
+    return null;
+  }
+  const c = entry as Record<string, unknown>;
+  const k = numbers(c['intrinsics']);
+  const node = c['node_name'];
+  if (typeof node !== 'string' || k === null || k.length !== 9) {
+    return null;
+  }
+  const timestamp = c['calibration_timestamp'];
+  const error = c['reprojection_error'];
+  const team = c['team_number'];
+  return {
+    camera: typeof c['camera_number'] === 'number' ? c['camera_number'] : 0,
+    cameraId: typeof c['camera_id'] === 'string' ? c['camera_id'] : '',
+    node,
+    team: typeof team === 'number' ? team : null,
+    date:
+      typeof timestamp === 'number' && timestamp > 0
+        ? new Date(timestamp / 1e6)
+        : null,
+    fx: k[0]!,
+    cx: k[2]!,
+    fy: k[4]!,
+    cy: k[5]!,
+    k,
+    dist: withoutTrailingZeros(numbers(c['dist_coeffs']) ?? []),
+    reprojectionError: typeof error === 'number' ? error : null,
+  };
 }
