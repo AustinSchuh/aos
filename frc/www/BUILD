@@ -2,6 +2,8 @@ load("//tools/build_rules:js.bzl", "rollup_bundle", "ts_project")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["starter.html"])
+
 filegroup(
     name = "starter_files",
     srcs = [
