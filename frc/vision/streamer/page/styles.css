@@ -277,6 +277,28 @@ intrinsics-card dd,
   color: var(--muted);
 }
 
+.camera-settings .own {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--warn) 60%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, var(--panel));
+}
+
+.camera-settings .own a,
+.camera-settings button.link {
+  color: var(--accent);
+}
+
+.camera-settings button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 .camera-settings .error {
   color: var(--bad);
   margin: 6px 0 0;

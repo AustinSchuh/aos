@@ -4,6 +4,7 @@
 #include "gtest/gtest.h"
 
 #include "aos/events/simulated_event_loop.h"
+#include "aos/json_to_flatbuffer.h"
 #include "aos/testing/path.h"
 #include "aos/testing/tmpdir.h"
 #include "frc/vision/field_side_exposure_adjuster_lib.h"
@@ -18,6 +19,7 @@ class ExposureAdjusterTest : public ::testing::Test {
             "frc/vision/field_side_exposure_adjuster_test_config.json"))),
         factory_(&config_.message()),
         settings_file_(aos::testing::TestTmpDir() + "/camera_settings.json"),
+        www_file_(aos::testing::TestTmpDir() + "/www/camera_settings.json"),
         test_loop_(factory_.MakeEventLoop("test")),
         page_sender_(
             test_loop_->MakeSender<CameraStreamSettings>("/camera_settings")),
@@ -25,6 +27,29 @@ class ExposureAdjusterTest : public ::testing::Test {
         camera0_(test_loop_->MakeFetcher<CameraStreamSettings>("/camera0")),
         camera1_(test_loop_->MakeFetcher<CameraStreamSettings>("/camera1")) {
     std::filesystem::remove(settings_file_);
+    std::filesystem::remove(www_file_);
+  }
+
+  // The robot's constants: 1600x1304, 6 ms, gain 1.
+  void SendConstants() {
+    auto sender = test_loop_->MakeSender<CameraConstants>("/constants");
+    auto builder = sender.MakeBuilder();
+    CameraStreamSettings::Builder settings(*builder.fbb());
+    settings.add_image_width(1600);
+    settings.add_image_height(1304);
+    settings.add_exposure_100us(60);
+    settings.add_gain(1);
+    const auto offset = settings.Finish();
+    CameraConstants::Builder constants(*builder.fbb());
+    constants.add_default_camera_stream_settings(offset);
+    builder.CheckOk(builder.Send(constants.Finish()));
+  }
+
+  std::string WwwFile() {
+    std::ifstream file(www_file_);
+    std::stringstream contents;
+    contents << file.rdbuf();
+    return contents.str();
   }
 
   // A new adjuster, as when it's restarted.
@@ -35,7 +60,8 @@ class ExposureAdjusterTest : public ::testing::Test {
         adjuster_loop_.get(),
         ExposureAdjuster::Options{.settings_file = settings_file_,
                                   .red_exposure = 30,
-                                  .blue_exposure = 40});
+                                  .blue_exposure = 40,
+                                  .www_file = www_file_});
   }
 
   void SetFromPage(std::optional<uint32_t> exposure,
@@ -61,6 +87,7 @@ class ExposureAdjusterTest : public ::testing::Test {
   aos::FlatbufferDetachedBuffer<aos::Configuration> config_;
   aos::SimulatedEventLoopFactory factory_;
   const std::string settings_file_;
+  const std::string www_file_;
   std::unique_ptr<aos::EventLoop> test_loop_;
   aos::Sender<CameraStreamSettings> page_sender_;
   aos::Sender<JoystickState> joystick_sender_;
@@ -70,11 +97,25 @@ class ExposureAdjusterTest : public ::testing::Test {
   std::unique_ptr<ExposureAdjuster> adjuster_;
 };
 
-// With nothing saved and no alliance, the cameras keep the constants'.
+// With nothing saved, no alliance and no constants, the cameras keep what
+// they have.
 TEST_F(ExposureAdjusterTest, SendsNothingUntilTold) {
   Start();
   RunFor(std::chrono::milliseconds(2500));
   EXPECT_FALSE(camera0_.Fetch());
+  EXPECT_FALSE(std::filesystem::exists(www_file_));
+}
+
+// With nothing saved and no alliance, the cameras get the constants'.
+TEST_F(ExposureAdjusterTest, SendsTheConstants) {
+  SendConstants();
+  Start();
+  RunFor(std::chrono::milliseconds(1500));
+  ASSERT_TRUE(camera0_.Fetch());
+  EXPECT_EQ(camera0_->exposure_100us(), 60u);
+  EXPECT_EQ(camera0_->gain(), 1u);
+  // Nothing of the robot's own to check in.
+  EXPECT_FALSE(std::filesystem::exists(www_file_));
 }
 
 // Until one is saved, the exposure is the alliance's, as it always was.
@@ -131,6 +172,35 @@ TEST_F(ExposureAdjusterTest, SavesAuto) {
   Start();
   EXPECT_EQ(adjuster_->exposure_100us(), 0u);
   EXPECT_EQ(adjuster_->gain(), std::nullopt);
+}
+
+// What's saved is offered whole, the constants' with the saved exposure and
+// gain, to check in; going back to the constants forgets it.
+TEST_F(ExposureAdjusterTest, OffersWhatsSavedAndForgetsIt) {
+  SendConstants();
+  Start();
+  RunFor(std::chrono::milliseconds(100));
+  SetFromPage(25, std::nullopt);
+  RunFor(std::chrono::milliseconds(10));
+  const aos::FlatbufferDetachedBuffer<CameraStreamSettings> offered =
+      aos::JsonToFlatbuffer<CameraStreamSettings>(WwwFile());
+  ASSERT_FALSE(offered.span().empty()) << WwwFile();
+  EXPECT_EQ(offered.message().image_width(), 1600u);
+  EXPECT_EQ(offered.message().image_height(), 1304u);
+  EXPECT_EQ(offered.message().exposure_100us(), 25u);
+  EXPECT_EQ(offered.message().gain(), 1u);
+  ASSERT_TRUE(camera0_.Fetch());
+  EXPECT_EQ(camera0_->exposure_100us(), 25u);
+  EXPECT_EQ(camera0_->gain(), 1u);
+
+  // An empty message: back to the constants'.
+  SetFromPage(std::nullopt, std::nullopt);
+  RunFor(std::chrono::milliseconds(10));
+  EXPECT_FALSE(std::filesystem::exists(settings_file_));
+  EXPECT_FALSE(std::filesystem::exists(www_file_));
+  EXPECT_EQ(adjuster_->exposure_100us(), std::nullopt);
+  ASSERT_TRUE(camera0_.Fetch());
+  EXPECT_EQ(camera0_->exposure_100us(), 60u);
 }
 
 }  // namespace

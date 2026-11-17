@@ -263,8 +263,10 @@ cc_library(
     hdrs = ["field_side_exposure_adjuster_lib.h"],
     visibility = ["//frc/vision/sim:__pkg__"],
     deps = [
+        ":camera_constants_fbs",
         ":camera_settings_fbs",
         "//aos:configuration",
+        "//aos:flatbuffer_merge",
         "//aos:json_to_flatbuffer",
         "//aos/events:event_loop",
         "//frc/input:joystick_state_fbs",
@@ -289,6 +291,7 @@ aos_config(
     name = "field_side_exposure_adjuster_test_config",
     src = "field_side_exposure_adjuster_test_config_source.json",
     flatbuffers = [
+        ":camera_constants_fbs",
         ":camera_settings_fbs",
         "//frc/input:joystick_state_fbs",
     ],
@@ -303,6 +306,7 @@ cc_test(
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":field_side_exposure_adjuster_lib",
+        "//aos:json_to_flatbuffer",
         "//aos/events:simulated_event_loop",
         "//aos/testing:googletest",
         "//aos/testing:path",

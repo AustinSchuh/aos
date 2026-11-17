@@ -36,9 +36,24 @@
     />
   </div>
   <p class="error" *ngIf="robot.settingsError">{{ robot.settingsError }}</p>
+  <ng-container *ngIf="robot.ownSettingsPath as path; else fromConstants">
+    <p class="own">
+      This robot's exposure and gain differ from constants.json.
+      <a [href]="path" download="camera_settings.json">Download them</a>
+      to commit as its
+      frc/vision/constants/camera_settings_&lt;team&gt;-&lt;robot&gt;.json, or
+      <button type="button" class="link" (click)="useConstants()">
+        use constants.json's
+      </button>
+      ({{ defaults }}).
+    </p>
+  </ng-container>
+  <ng-template #fromConstants>
+    <p class="source">From constants.json: {{ defaults }}.</p>
+  </ng-template>
   <p class="source">
-    Every camera's. Saved on the robot, so they hold across restarts and
-    deploys; a camera takes the nearest it can. Until set, the constants': {{
-    defaults }}.
+    Every camera's. What's set here is saved on the robot, so it holds across
+    restarts and deploys, until it's checked in; a camera takes the nearest it
+    can.
   </p>
 </section>

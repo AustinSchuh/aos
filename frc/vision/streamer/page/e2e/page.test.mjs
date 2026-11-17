@@ -352,6 +352,33 @@ test("auto exposure is saved as 0, and the gain alongside", async () => {
   await waitForSaved((s) => s?.exposure_100us === 60, "back to manual");
 });
 
+test("the robot's own settings download to check in, or go back to constants.json's", async () => {
+  await tab("Settings");
+  // What the last test left: its own exposure and gain.
+  await page.waitFor(`document.querySelector(".camera-settings .own a")`, {
+    what: "the offer to check them in",
+  });
+  const offered = await page.evaluate(`(async () => {
+    const href = document.querySelector(".camera-settings .own a").getAttribute("href");
+    return await (await fetch(href)).json();
+  })()`);
+  // Whole, as constants.jinja2.json includes it: the test robot's image
+  // size, with the exposure and gain set.
+  assert.equal(offered.image_width, 1456);
+  assert.equal(offered.image_height, 1088);
+  assert.equal(offered.exposure_100us, 60);
+  assert.equal(offered.gain, 2);
+  await screenshot("own-settings");
+
+  await page.clickButton("use constants.json's");
+  await waitForSaved((s) => s === null, "the robot to forget them");
+  await page.waitFor(
+    `!document.querySelector(".camera-settings .own") &&
+     document.querySelector("#gain").value === "0"`,
+    {what: "constants.json's settings"},
+  );
+});
+
 test("calibrating: start, captures, export, download, cancel", async () => {
   await tab("Calibrate");
   await page.waitFor(

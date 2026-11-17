@@ -330,7 +330,9 @@ int Main() {
       exposure_loop.get(),
       {.settings_file = (state_dir / "camera_settings.json").string(),
        .red_exposure = 30,
-       .blue_exposure = 30});
+       .blue_exposure = 30,
+       .www_file =
+           (data_dir / "camera_settings/camera_settings.json").string()});
 
   std::unique_ptr<aos::EventLoop> starter_loop =
       factory.MakeEventLoop("starter", node);
