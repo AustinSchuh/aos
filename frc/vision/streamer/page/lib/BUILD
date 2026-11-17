@@ -7,6 +7,7 @@ package(default_visibility = ["//frc/vision/streamer/page:__subpackages__"])
 # components so it can be tested on Node.
 
 LIB_SRCS = [
+    "calibration.ts",
     "format.ts",
     "distortion.ts",
     "intrinsics.ts",

@@ -1,0 +1,357 @@
+<section class="card calibrate-start" *ngIf="!running">
+  <h2>Calibrate a camera</h2>
+  <p>
+    Starting stops every camera's AprilTag detection until you finish or cancel,
+    and lets calibration_server use the cameras.
+  </p>
+  <div class="row">
+    <label>
+      Camera
+      <select [ngModel]="cameraChoice" (ngModelChange)="camera = +$event">
+        <option *ngFor="let c of cameras" [ngValue]="c">Camera {{ c }}</option>
+      </select>
+    </label>
+    <label>
+      Captures to collect
+      <input type="number" min="10" max="500" [(ngModel)]="targetCaptures" />
+    </label>
+    <button
+      type="button"
+      class="primary"
+      (click)="start()"
+      [disabled]="calibration.busy || cameraChoice === null"
+    >
+      Start
+    </button>
+  </div>
+  <p class="warn" *ngIf="calibration.error">{{ calibration.error }}</p>
+</section>
+
+<ng-container *ngIf="running && calibration.status as status">
+  <section class="card calibrate-live">
+    <div class="calibrate-head">
+      <h2>Calibrating camera {{ status.camera }}</h2>
+      <span class="calibrate-state">{{ status.state | lowercase }}</span>
+      <span class="spacer"></span>
+      <button type="button" (click)="finish()" [disabled]="calibration.busy">
+        Finish
+      </button>
+      <button type="button" (click)="cancel()" [disabled]="calibration.busy">
+        Cancel
+      </button>
+    </div>
+    <camera-tile
+      [camera]="status.camera"
+      [stream]="stream(status.camera)"
+      [line]="status.corners + ' corners'"
+    ></camera-tile>
+    <p class="guidance" [class.ok]="status.verdict === 'CAPTURED'">
+      {{ guidance }}
+    </p>
+    <div class="progress">
+      <div
+        class="progress-bar"
+        [style.width.%]="(100 * status.captures) / status.targetCaptures"
+      ></div>
+    </div>
+    <div class="row">
+      <span>{{ status.captures }} of {{ status.targetCaptures }} captures</span>
+      <span class="spacer"></span>
+      <button
+        type="button"
+        (click)="capture()"
+        [disabled]="calibration.busy || status.state === 'SOLVING'"
+      >
+        Capture now
+      </button>
+      <button
+        type="button"
+        (click)="undo()"
+        [disabled]="calibration.busy || status.captures === 0"
+      >
+        Undo
+      </button>
+      <button
+        type="button"
+        class="primary"
+        (click)="solve()"
+        [disabled]="
+          calibration.busy || status.captures < 4 || status.state === 'SOLVING'
+        "
+      >
+        {{ status.state === 'SOLVING' ? 'Solving…' : 'Solve' }}
+      </button>
+    </div>
+    <p class="warn" *ngIf="calibration.error || status.error">
+      {{ calibration.error || status.error }}
+    </p>
+  </section>
+
+  <section class="card" *ngIf="session as session">
+    <h2>Where the captures are</h2>
+    <samples-view
+      [captures]="captures"
+      [width]="session.imageWidth"
+      [height]="session.imageHeight"
+      [residuals]="residuals"
+      [selected]="selected"
+      [dropping]="dropping"
+      (pick)="pick($event)"
+    ></samples-view>
+    <h3>Board poses</h3>
+    <svg
+      class="pose-plot"
+      viewBox="0 0 100 100"
+      role="img"
+      aria-label="Each capture's tilt against its distance"
+    >
+      <line x1="8" y1="92" x2="96" y2="92" class="axis" />
+      <line x1="8" y1="8" x2="8" y2="92" class="axis" />
+      <circle
+        *ngFor="let p of poses; let i = index"
+        [attr.cx]="plotX(p.tiltDeg)"
+        [attr.cy]="plotY(p.distance)"
+        r="1.6"
+        [class.selected]="i === selected"
+        (click)="pick(i)"
+      ></circle>
+      <text x="52" y="99" class="axis-label">tilt, 0–60°</text>
+      <text x="3" y="50" class="axis-label" transform="rotate(-90 3 50)">
+        distance, 0–4 m
+      </text>
+    </svg>
+    <p class="source">
+      Tilt the board up to 45° and use the whole range of distances the robot
+      sees tags at.
+    </p>
+  </section>
+
+  <section class="card" *ngIf="session as session">
+    <h2>Board</h2>
+    <ng-container *ngIf="board as form">
+      <div class="board-form">
+        <label>
+          Squares across
+          <input
+            type="number"
+            min="3"
+            [(ngModel)]="form.squaresX"
+            [disabled]="!canChangeBoard"
+          />
+        </label>
+        <label>
+          Squares down
+          <input
+            type="number"
+            min="3"
+            [(ngModel)]="form.squaresY"
+            [disabled]="!canChangeBoard"
+          />
+        </label>
+        <label>
+          Square, measured (mm)
+          <input
+            type="number"
+            step="0.01"
+            [(ngModel)]="form.squareMm"
+            [disabled]="!canChangeBoard"
+          />
+        </label>
+        <label>
+          Marker, measured (mm)
+          <input
+            type="number"
+            step="0.01"
+            [(ngModel)]="form.markerMm"
+            [disabled]="!canChangeBoard"
+          />
+        </label>
+        <label>
+          Dictionary
+          <select [(ngModel)]="form.dictionary" [disabled]="!canChangeBoard">
+            <option *ngFor="let d of dictionaries" [value]="d">{{ d }}</option>
+          </select>
+        </label>
+      </div>
+      <p class="warn" *ngIf="boardProblem">{{ boardProblem }}</p>
+      <p class="source" *ngIf="!canChangeBoard">
+        The captures are of this board: undo them to change it.
+      </p>
+      <div class="row">
+        <button
+          type="button"
+          (click)="applyBoard()"
+          [disabled]="!boardChanged || !!boardProblem || !canChangeBoard"
+        >
+          Use this board
+        </button>
+        <input placeholder="Name" [(ngModel)]="boardName" />
+        <button
+          type="button"
+          (click)="saveBoard()"
+          [disabled]="!boardName.trim() || !!boardProblem"
+        >
+          Save board
+        </button>
+      </div>
+    </ng-container>
+    <h3>Boards</h3>
+    <ul class="board-list">
+      <li *ngFor="let saved of session.boards">
+        <button
+          type="button"
+          class="link"
+          (click)="choose(saved)"
+          [disabled]="!canChangeBoard"
+        >
+          {{ saved.name }}
+        </button>
+        <button
+          type="button"
+          class="link"
+          *ngIf="!saved.preset"
+          (click)="deleteBoard(saved.name)"
+        >
+          delete
+        </button>
+      </li>
+    </ul>
+    <div class="board-picture" *ngIf="session.boardImagePath">
+      <img [src]="session.boardImagePath" alt="The board, to print" />
+      <div class="row">
+        <span>{{ boardSize }}</span>
+        <span class="spacer"></span>
+        <button type="button" (click)="printBoard()">Print at 100%</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" *ngIf="session as session">
+    <h2>Camera</h2>
+    <div class="row">
+      <label>
+        Camera id (YY-NN)
+        <input [ngModel]="cameraIdField" (ngModelChange)="cameraId = $event" />
+      </label>
+      <button
+        type="button"
+        (click)="setCameraId()"
+        [disabled]="!cameraIdValid || cameraId === session.cameraId"
+      >
+        Set
+      </button>
+    </div>
+    <div class="row">
+      <label>
+        Captures to collect
+        <input
+          type="number"
+          min="10"
+          max="500"
+          [ngModel]="session.targetCaptures"
+          (ngModelChange)="targetCaptures = +$event"
+        />
+      </label>
+      <button type="button" (click)="setTarget()">Set</button>
+    </div>
+  </section>
+
+  <section class="card calibrate-solve" *ngIf="session?.solve as solve">
+    <h2>Solve</h2>
+    <p class="warn" *ngIf="solve.error">{{ solve.error }}</p>
+    <ng-container *ngIf="solve.calibration as result">
+      <p class="source" *ngIf="!solveCurrent">
+        Solved from {{ solve.captures }} captures; they've changed since.
+      </p>
+      <dl>
+        <dt>Reprojection error</dt>
+        <dd>{{ solve.reprojectionError | number: '1.3-3' }} px</dd>
+        <dt>fx, fy</dt>
+        <dd>
+          {{ result.fx | number: '1.1-1' }}, {{ result.fy | number: '1.1-1' }}
+        </dd>
+        <dt>cx, cy</dt>
+        <dd>
+          {{ result.cx | number: '1.1-1' }}, {{ result.cy | number: '1.1-1' }}
+        </dd>
+        <dt>Validation</dt>
+        <dd [class.warn]="!solve.valid">
+          {{ solve.valid ? 'passes' : solve.validationError }}
+        </dd>
+      </dl>
+
+      <h3>Each capture's error (click to mark for dropping)</h3>
+      <div class="error-bars">
+        <button
+          type="button"
+          *ngFor="let error of solve.captureErrors; let i = index"
+          class="error-bar"
+          [class.dropping]="dropping.has(i)"
+          [class.selected]="i === selected"
+          [style.height.%]="(100 * error) / maxCaptureError"
+          [title]="'Capture ' + (i + 1) + ': ' + (error | number: '1.2-2') + ' px'"
+          (click)="toggleDrop(i); pick(i)"
+        ></button>
+      </div>
+      <div class="row">
+        <span>{{ dropping.size }} marked</span>
+        <span class="spacer"></span>
+        <button
+          type="button"
+          (click)="drop()"
+          [disabled]="dropping.size === 0 || calibration.busy"
+        >
+          Drop marked captures
+        </button>
+      </div>
+
+      <h3>Distortion, current and new</h3>
+      <div class="distortion-compare">
+        <div *ngIf="session?.current as current">
+          <h3>Current</h3>
+          <distortion-map
+            [lens]="current"
+            [width]="session!.imageWidth"
+            [height]="session!.imageHeight"
+            [scaleMax]="distortionScale()"
+          ></distortion-map>
+        </div>
+        <div>
+          <h3>New</h3>
+          <distortion-map
+            [lens]="result"
+            [width]="session!.imageWidth"
+            [height]="session!.imageHeight"
+            [scaleMax]="distortionScale()"
+          ></distortion-map>
+        </div>
+      </div>
+
+      <div class="row">
+        <label *ngIf="!solve.valid">
+          <input type="checkbox" [(ngModel)]="force" />
+          Save anyway
+        </label>
+        <span class="spacer"></span>
+        <button
+          type="button"
+          class="primary"
+          (click)="save()"
+          [disabled]="
+            calibration.busy ||
+            !solveCurrent ||
+            (!solve.valid && !force) ||
+            !cameraIdValid
+          "
+        >
+          Save
+        </button>
+      </div>
+      <p *ngIf="solve.downloadPath">
+        Saved on the robot as {{ solve.savedPath }}.
+        <a [href]="solve.downloadPath" download>Download it</a>
+        to commit to frc/vision/constants and add to constants.jinja2.json.
+      </p>
+    </ng-container>
+  </section>
+</ng-container>

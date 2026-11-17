@@ -241,6 +241,261 @@ intrinsics-card dd,
   font-variant-numeric: tabular-nums;
 }
 
+/* The Calibrate tab. */
+main.calibrate {
+  flex: 1;
+  overflow: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
+  align-content: start;
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+calibrate-panel {
+  display: contents;
+}
+
+main.calibrate .calibrate-live camera-tile {
+  aspect-ratio: 1600 / 1304;
+  margin: 8px 0;
+}
+
+main.calibrate h3 {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 12px 0 4px;
+  font-weight: 600;
+}
+
+main.calibrate button,
+.banner button {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+main.calibrate button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+}
+
+main.calibrate button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+main.calibrate button.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: 0 4px;
+}
+
+main.calibrate input,
+main.calibrate select {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  padding: 3px 6px;
+  max-width: 100%;
+}
+
+main.calibrate input[type="number"] {
+  width: 6em;
+}
+
+main.calibrate label {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.calibrate-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.calibrate-head h2 {
+  margin: 0;
+}
+
+.calibrate-state {
+  color: var(--muted);
+}
+
+.guidance {
+  font-size: 16px;
+  margin: 4px 0;
+}
+
+.guidance.ok {
+  color: var(--ok);
+}
+
+.progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  max-width: 100%;
+  background: var(--accent);
+}
+
+.board-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.board-list {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.board-picture img {
+  width: 100%;
+  margin-top: 8px;
+  background: #fff;
+  border-radius: 4px;
+}
+
+samples-view {
+  display: block;
+}
+
+samples-view canvas {
+  display: block;
+  width: 100%;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.samples-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border-radius: 2px;
+  vertical-align: -1px;
+}
+
+.swatch.empty {
+  background: var(--warn);
+  opacity: 0.4;
+}
+
+.swatch.dot {
+  background: var(--accent);
+  border-radius: 50%;
+}
+
+.swatch.arrow {
+  height: 2px;
+  background: var(--text);
+}
+
+.pose-plot {
+  width: 100%;
+  max-width: 320px;
+  display: block;
+}
+
+.pose-plot .axis {
+  stroke: var(--line);
+  stroke-width: 0.5;
+}
+
+.pose-plot .axis-label {
+  fill: var(--muted);
+  font-size: 4px;
+  text-anchor: middle;
+}
+
+.pose-plot circle {
+  fill: var(--accent);
+  cursor: pointer;
+}
+
+.pose-plot circle.selected {
+  fill: var(--ok);
+}
+
+.error-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 80px;
+}
+
+main.calibrate .error-bars .error-bar {
+  flex: 1;
+  min-width: 3px;
+  padding: 0;
+  border: none;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+}
+
+main.calibrate .error-bars .error-bar.selected {
+  background: var(--ok);
+}
+
+main.calibrate .error-bars .error-bar.dropping {
+  background: var(--bad);
+}
+
+.distortion-compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: color-mix(in srgb, var(--warn) 20%, var(--panel));
+  border-bottom: 1px solid var(--warn);
+}
+
 @media (max-width: 700px) {
   main.feeds {
     grid-template-columns: minmax(0, 1fr);

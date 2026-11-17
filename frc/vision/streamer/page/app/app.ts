@@ -9,10 +9,11 @@ import {
   tileLine,
 } from '../lib/format.js';
 import {sharedMax} from '../lib/distortion.js';
+import {CalibrationSession} from './calibration';
 import {NODE, Robot} from './robot';
 import {CameraStreams} from './streams';
 
-type Tab = 'feeds' | 'settings';
+type Tab = 'feeds' | 'calibrate' | 'settings';
 
 /** The vision page: the cameras' feeds, and their settings and calibrations. */
 @Component({
@@ -28,6 +29,7 @@ export class App implements OnInit {
   constructor(
     readonly streams: CameraStreams,
     readonly robot: Robot,
+    readonly calibration: CalibrationSession,
   ) {}
 
   ngOnInit(): void {
@@ -48,6 +50,11 @@ export class App implements OnInit {
     const visible = document.visibilityState === 'visible';
     this.streams.setWatching(visible);
     this.robot.setPolling(visible && this.tab === 'feeds');
+    this.calibration.setActive(visible && this.tab === 'calibrate');
+  }
+
+  cancelCalibration(): void {
+    void this.calibration.send({action: 'CANCEL'});
   }
 
   get connected(): boolean {
