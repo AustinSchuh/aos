@@ -181,20 +181,20 @@ std::map<uint32_t, BlobInfo> CheckUnionfind(unionfind_t *uf,
       uint32_t v = unionfind_get_representative(uf, y * width + x);
       uint32_t v_remapped;
       {
-        auto it = cuda_id_count.emplace(union_markers.at<uint32_t>(y, x), 1);
+        auto it = cuda_id_count.emplace(union_markers.ptr<uint32_t>(y)[x], 1);
         if (!it.second) {
           ++it.first->second;
         }
       }
       auto it = id_remap.find(v);
       if (it == id_remap.end()) {
-        v_remapped = union_markers.at<uint32_t>(y, x);
+        v_remapped = union_markers.ptr<uint32_t>(y)[x];
         id_remap.insert(std::make_pair(v, v_remapped));
       } else {
         v_remapped = it->second;
       }
 
-      ABSL_CHECK_EQ(v_remapped, union_markers.at<uint32_t>(y, x))
+      ABSL_CHECK_EQ(v_remapped, union_markers.ptr<uint32_t>(y)[x])
           << "At " << x << ", " << y;
     }
   }
@@ -209,7 +209,7 @@ std::map<uint32_t, BlobInfo> CheckUnionfind(unionfind_t *uf,
   for (size_t y = 0; y < height; ++y) {
     for (size_t x = 0; x < width; ++x) {
       auto it = blob_sizes.emplace(
-          union_markers.at<uint32_t>(y, x),
+          union_markers.ptr<uint32_t>(y)[x],
           BlobInfo{
               .size = 1,
               .min_x = x,
@@ -234,7 +234,7 @@ std::map<uint32_t, BlobInfo> CheckUnionfind(unionfind_t *uf,
 
   for (size_t y = 0; y < height; ++y) {
     for (size_t x = 0; x < width; ++x) {
-      const uint32_t blob_id = union_markers.at<uint32_t>(y, x);
+      const uint32_t blob_id = union_markers.ptr<uint32_t>(y)[x];
       const BlobInfo &blob_info = blob_sizes[blob_id];
       if (threshold.at<uint8_t>(y, x) == 127) {
         ABSL_CHECK_EQ(0u, union_markers_size[blob_id])
@@ -833,7 +833,7 @@ class CudaAprilTagDetector {
     for (size_t y = 1; y < height - 1; ++y) {
       for (size_t x = 1; x < width - 1; ++x) {
         const uint8_t v0 = thresholded_cuda_.at<uint8_t>(y, x);
-        const uint64_t rep0 = union_markers_.at<uint32_t>(y, x);
+        const uint64_t rep0 = union_markers_.ptr<uint32_t>(y)[x];
         const auto blob0 = blob_sizes.find(rep0)->second;
 
         size_t offset = 0;
@@ -842,7 +842,7 @@ class CudaAprilTagDetector {
                               std::pair<ssize_t, ssize_t>{0, 1},
                               std::pair<ssize_t, ssize_t>{-1, 1}}) {
           const uint8_t v1 = thresholded_cuda_.at<uint8_t>(y + dy, x + dx);
-          const uint32_t rep1 = union_markers_.at<uint32_t>(y + dy, x + dx);
+          const uint32_t rep1 = union_markers_.ptr<uint32_t>(y + dy)[x + dx];
           const auto blob1 = blob_sizes.find(rep1)->second;
 
           // OK, blob 1, 1 is special.  We only do it if blocks 2 and the blob
@@ -861,11 +861,11 @@ class CudaAprilTagDetector {
             const uint8_t v1_block_left =
                 thresholded_cuda_.at<uint8_t>(y + 0, x - 1);
             const uint32_t rep1_block_left =
-                union_markers_.at<uint32_t>(y + 0, x - 1);
+                union_markers_.ptr<uint32_t>(y + 0)[x - 1];
             const uint8_t v1_block_2 =
                 thresholded_cuda_.at<uint8_t>(y + 1, x + 0);
             const uint32_t rep1_block_2 =
-                union_markers_.at<uint32_t>(y + 1, x + 0);
+                union_markers_.ptr<uint32_t>(y + 1)[x + 0];
             if (v1_block_left != 127 && v1_block_2 != 127 &&
                 (v1_block_left + v1_block_2) == 255 &&
                 blob_sizes.find(rep1_block_left)->second.size >= 25 &&
@@ -2685,7 +2685,7 @@ class CudaAprilTagDetector {
         for (int x = 0; x < union_markers_.cols; ++x) {
           const uint32_t april_robotics_id =
               unionfind_get_representative(uf, y * width_ / 2 + x);
-          const uint32_t index = union_markers_.at<uint32_t>(y, x);
+          const uint32_t index = union_markers_.ptr<uint32_t>(y)[x];
 
           bool one_to_one_blob_match = false;
 
