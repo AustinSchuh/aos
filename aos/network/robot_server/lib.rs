@@ -7,6 +7,7 @@ pub mod api;
 pub mod condition;
 pub mod mcp;
 pub mod session;
+pub mod triggers;
 
 use std::{
     ffi::CString,

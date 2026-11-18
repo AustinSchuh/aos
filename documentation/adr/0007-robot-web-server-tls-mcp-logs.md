@@ -6,7 +6,7 @@ Accepted.
 
 - **Implemented outside this repository**, in meta-frc4646 `eb9e0a7` and `6752256`: the team CA (`make_team_ca.sh`, `install_team_ca.sh`), the server certificate and a robot's fallback CA (`make_tls_cert.sh`, `aos-tls.service`, run again by `change_hostname.sh`), and `trust_orin.py`.
 - **Implemented here**, in `aos/network/robot_server`: HTTPS on 443 with the certificate from `/etc/aos/tls`, reloaded when it changes; the `www` pages; `/ws` proxied to `web_proxy`; `/foxglove` proxied to the Foxglove server; the trust page on port 80; and `GET /api`, each channel's latest message as JSON. `aos/network/www/proxy.ts` connects over `wss://` from an https page.
-- **Implemented here, in part:** MCP at `/mcp`, with `list_channels` and `get_latest`.
+- **Implemented here, in part:** MCP at `/mcp`, with `list_channels`, `get_latest` and `wait_for`.
 - **Not yet implemented:** MCP's other tools, `/logs`, and `wss://` in `frc/image_streamer`'s pages.
 - **Deferred:** replacing `web_proxy`'s WebRTC (rawrtc) with Rust.
 
@@ -138,6 +138,10 @@ Channels whose messages can be over 256 KiB (images), or that are read by pinnin
 #### MCP
 
 Served at `/mcp` over streamable HTTP, by about 300 lines of axum and serde_json in `mcp.rs` rather than rmcp, the official Rust MCP SDK (see Tried, and why not). A server with only tools needs a small part of the protocol: `initialize`, `ping`, `tools/list` and `tools/call`, each a POST answered with one JSON response. There are no sessions and no server-to-client stream, which the transport allows. Like `/api`'s, its handlers ask the event loop's thread for what's on the channels.
+
+`wait_for(channel, condition, timeout_s, edge)` waits for a condition on a channel's messages, such as `abs(wrap(heading - goal)) > radians(5)`, `changed(state)` or `stale(1s)`. Conditions are a subset of CEL's syntax, which models already write, with math, trig and time functions (`condition.rs`). Each is compiled against the channel's reflection schema before waiting, so a misspelt field or enum value comes back at once, underlined, with suggestions; evaluating one reads the message's bytes through the compiled offsets, bounds checked, without JSON. By default it waits for the condition to become true. It answers with the message it came true on and the one before; on a timeout, with the last message and each field's smallest, largest and last value, to show how close it came.
+
+Waits poll their channels every 100 ms on one AOS timer, AOS's usual polling: channels keep at least two seconds of messages, so none go by unseen, and debugging doesn't need it sooner. They read with the fetchers `/api` has, made before the event loop runs; `get_latest` on a channel being waited on takes the waits' messages in first, rather than fetch past them. A wait that falls behind the channel's queue anyway counts what it missed rather than dying (`fetch_next_or_gone()`). Sixteen at once, for up to five minutes each.
 
 Requests carrying an `Origin` must come from the robot's own pages, so another site's page in a student's browser can't drive the tools.
 

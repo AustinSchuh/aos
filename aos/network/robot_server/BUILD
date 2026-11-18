@@ -14,6 +14,7 @@ rust_library(
         "lib.rs",
         "mcp.rs",
         "session.rs",
+        "triggers.rs",
     ],
     crate_name = "robot_server",
     test_data = glob(["testdata/*"]) + [":condition_test_fbs_reflection_out"],

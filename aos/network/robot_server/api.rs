@@ -24,7 +24,7 @@ use std::{cell::RefCell, collections::HashMap, ffi::CStr, rc::Rc, time::Duration
 use aos_configuration::{AsChannel, ChannelExt, ConfigurationExt, Node};
 use aos_configuration_fbs::aos::{Channel, Configuration, ReadMethod};
 use aos_events_event_loop_c::aos_configuration_node_name;
-use aos_events_tokio::{AosHandle, RawFetcher, RawSender, Timer};
+use aos_events_tokio::{AosHandle, FetchedNext, RawFetcher, RawSender, Timer};
 
 use axum::{
     extract::Query,
@@ -34,9 +34,11 @@ use axum::{
     Router,
 };
 
+use crate::condition::Condition;
 use crate::session::{Effect, SessionApp, StarterCommand};
+use crate::triggers::{Arrived, Report, Started, Trigger};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// The largest message a channel may hold for its latest to be fetchable.
 pub const MAX_FETCHABLE_SIZE: u32 = 256 * 1024;
@@ -108,6 +110,23 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often a session's start looks for its app being ready.
 const READY_POLL: Duration = Duration::from_millis(100);
 
+/// How often waits look at their channels' new messages: AOS's usual polling, which is soon
+/// enough for debugging.  Channels keep at least two seconds of messages, so none go by unseen.
+pub const WAIT_POLL: Duration = Duration::from_millis(100);
+/// The most waits at once, and the longest one.
+pub const MAX_WAITS: usize = 16;
+pub const MAX_WAIT: Duration = Duration::from_secs(300);
+
+/// How a wait ended, with the messages it reports as JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaitResult {
+    pub report: Report,
+    /// The message the condition came true on, and the one before it (or the last one seen,
+    /// if it timed out).
+    pub message: Option<String>,
+    pub before: Option<String>,
+}
+
 /// What a handler asks of the event loop's thread.
 #[derive(Debug)]
 pub enum ApiRequest {
@@ -126,6 +145,52 @@ pub enum ApiRequest {
         json: String,
         reply: oneshot::Sender<Result<(), SendError>>,
     },
+    /// Waits for `condition` on a channel's messages: see [`crate::triggers`].  An error says
+    /// why it couldn't start.
+    Wait {
+        name: String,
+        type_: String,
+        condition: String,
+        timeout: Duration,
+        edge: bool,
+        max_vector_size: usize,
+        reply: oneshot::Sender<Result<WaitResult, String>>,
+    },
+}
+
+/// A wait in progress, on a channel.
+struct Wait {
+    key: ChannelKey,
+    channel: &'static aos_configuration::Channel,
+    max_vector_size: usize,
+    trigger: Trigger,
+    reply: oneshot::Sender<Result<WaitResult, String>>,
+}
+
+/// Answers a wait on `channel` with `report`.
+fn finish_wait(
+    channel: &aos_configuration::Channel,
+    max_vector_size: usize,
+    reply: oneshot::Sender<Result<WaitResult, String>>,
+    report: Report,
+) {
+    let json = |kept: &Option<crate::triggers::Kept>| {
+        kept.as_ref()
+            .and_then(|kept| channel.message_to_json(&kept.data, max_vector_size))
+    };
+    let result = WaitResult {
+        message: json(&report.message),
+        before: json(&report.before),
+        report,
+    };
+    let _ = reply.send(Ok(result));
+}
+
+impl Wait {
+    /// Ends the wait, answering with `report`.
+    fn finish(self, report: Report) {
+        finish_wait(self.channel, self.max_vector_size, self.reply, report);
+    }
 }
 
 fn json_response(status: StatusCode, body: String) -> Response {
@@ -353,6 +418,11 @@ pub struct Fetchers {
     /// What a session's start waits on, while its app gets ready.  Made before the event loop
     /// runs, as AOS's timers must be, and shared by any starts at once.
     ready_timer: Rc<tokio::sync::Mutex<Timer>>,
+    /// The waits in progress, the timer they're polled on (taken by [`serve()`]'s task), and
+    /// what wakes that task when there are some again.
+    waits: Vec<Wait>,
+    wait_timer: Option<Timer>,
+    waits_started: Rc<Notify>,
 }
 
 impl Fetchers {
@@ -405,6 +475,164 @@ impl Fetchers {
             starter,
             aos: aos.clone(),
             ready_timer: Rc::new(tokio::sync::Mutex::new(aos.make_timer())),
+            waits: Vec::new(),
+            wait_timer: Some(aos.make_timer()),
+            waits_started: Rc::new(Notify::new()),
+        }
+    }
+
+    /// Why `key`, which has no fetcher, has none.
+    fn why_not_fetchable(&self, wanted: &ChannelKey) -> String {
+        self.config
+            .channels()
+            .iter()
+            .flatten()
+            .find(|entry| key(entry) == *wanted)
+            .and_then(|entry| not_fetchable(&entry, self.node))
+            .unwrap_or_default()
+    }
+
+    /// Takes the messages `key`'s fetcher hasn't yet into the waits on it, ending those whose
+    /// condition comes true.  After, the fetcher holds the latest message.
+    fn drain(&mut self, key: &ChannelKey, now_ns: i64) {
+        let Some(fetcher) = self.fetchers.get_mut(key) else {
+            return;
+        };
+        loop {
+            match fetcher.fetch_next_or_gone() {
+                FetchedNext::NothingNew => break,
+                FetchedNext::Fetched => {}
+                // Fell behind: carry on from the latest, and the waits count the gap.
+                FetchedNext::Gone => {
+                    fetcher.fetch();
+                }
+            }
+            let message = fetcher.message();
+            let Some(data) = message.data() else {
+                break;
+            };
+            let arrived = Arrived {
+                data,
+                monotonic_ns: message.monotonic_event_time_ns(),
+                realtime_ns: message.realtime_event_time_ns(),
+                queue_index: message.queue_index(),
+            };
+            let mut i = 0;
+            while i < self.waits.len() {
+                if self.waits[i].key == *key {
+                    if let Some(report) = self.waits[i].trigger.message(arrived, now_ns) {
+                        self.waits.swap_remove(i).finish(report);
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Looks at every waited-on channel's new messages, and the time.
+    fn poll_waits(&mut self) {
+        let now_ns = self.aos.monotonic_now_ns();
+        // Nobody's waiting for these any more.
+        self.waits.retain(|wait| !wait.reply.is_closed());
+        let mut keys: Vec<ChannelKey> = self.waits.iter().map(|wait| wait.key.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        for key in &keys {
+            self.drain(key, now_ns);
+        }
+        let mut i = 0;
+        while i < self.waits.len() {
+            if let Some(report) = self.waits[i].trigger.tick(now_ns) {
+                self.waits.swap_remove(i).finish(report);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Starts waiting for `source` on `name` `type_`, or says why it can't.
+    #[allow(clippy::too_many_arguments)]
+    fn start_wait(
+        &mut self,
+        name: &str,
+        type_: &str,
+        source: &str,
+        timeout: Duration,
+        edge: bool,
+        max_vector_size: usize,
+        reply: oneshot::Sender<Result<WaitResult, String>>,
+    ) {
+        if self.waits.len() >= MAX_WAITS {
+            let _ = reply.send(Err(format!(
+                "There are {MAX_WAITS} waits already; wait for one to finish"
+            )));
+            return;
+        }
+        let Some((channel, wanted)) = self.mapped(name, type_) else {
+            let _ = reply.send(Err(format!(
+                "There's no channel {name} {type_}.  list_channels finds them."
+            )));
+            return;
+        };
+        if !self.fetchers.contains_key(&wanted) {
+            let why = self.why_not_fetchable(&wanted);
+            let _ = reply.send(Err(format!("{name} {type_} can't be read here: {why}")));
+            return;
+        }
+        let schema = self
+            .config
+            .channels()
+            .iter()
+            .flatten()
+            .find(|entry| key(entry) == wanted)
+            .and_then(|entry| entry.schema());
+        let Some(schema) = schema else {
+            let _ = reply.send(Err(format!("{name} {type_} has no schema")));
+            return;
+        };
+        let condition = match Condition::compile(source, &schema) {
+            Ok(condition) => condition,
+            Err(error) => {
+                let _ = reply.send(Err(format!(
+                    "The condition doesn't compile:\n{}",
+                    error.render(source)
+                )));
+                return;
+            }
+        };
+        let now_ns = self.aos.monotonic_now_ns();
+        // Start from the latest message, without skipping any another wait on the channel
+        // hasn't seen yet.
+        if self.waits.iter().any(|wait| wait.key == wanted) {
+            self.drain(&wanted, now_ns);
+        } else {
+            self.fetchers
+                .get_mut(&wanted)
+                .expect("Checked above")
+                .fetch();
+        }
+        let fetcher = &self.fetchers[&wanted];
+        let message = fetcher.message();
+        let latest = message.data().map(|data| Arrived {
+            data,
+            monotonic_ns: message.monotonic_event_time_ns(),
+            realtime_ns: message.realtime_event_time_ns(),
+            queue_index: message.queue_index(),
+        });
+        let timeout_ns = timeout.min(MAX_WAIT).as_nanos() as i64;
+        match Trigger::start(condition, edge, now_ns, timeout_ns, latest) {
+            Started::Done(report) => finish_wait(channel, max_vector_size, reply, report),
+            Started::Waiting(trigger) => {
+                self.waits.push(Wait {
+                    key: wanted,
+                    channel,
+                    max_vector_size,
+                    trigger,
+                    reply,
+                });
+                self.waits_started.notify_one();
+            }
         }
     }
 
@@ -507,20 +735,22 @@ impl Fetchers {
             channel.name().unwrap_or_default().to_string(),
             channel.type_().unwrap_or_default().to_string(),
         );
-        let Some(fetcher) = self.fetchers.get_mut(&channel_key) else {
-            let entry = self
-                .config
-                .channels()
-                .iter()
-                .flatten()
-                .find(|entry| key(entry) == channel_key)
-                .ok_or(LatestError::NoChannel)?;
+        if !self.fetchers.contains_key(&channel_key) {
             return Err(LatestError::NotFetchable(
-                not_fetchable(&entry, self.node).unwrap_or_default(),
+                self.why_not_fetchable(&channel_key),
             ));
-        };
-        fetcher.fetch();
-        let message = fetcher.message();
+        }
+        if self.waits.iter().any(|wait| wait.key == channel_key) {
+            // fetch() would skip messages the waits haven't seen.
+            let now_ns = self.aos.monotonic_now_ns();
+            self.drain(&channel_key, now_ns);
+        } else {
+            self.fetchers
+                .get_mut(&channel_key)
+                .expect("Checked above")
+                .fetch();
+        }
+        let message = self.fetchers[&channel_key].message();
         let data = message.data().ok_or(LatestError::NoMessage)?;
         Ok(Latest {
             monotonic_event_time_ns: message.monotonic_event_time_ns(),
@@ -567,9 +797,27 @@ async fn start_session(
     let _ = reply.send(api.borrow_mut().send(&name, &type_, &json));
 }
 
+/// Polls the waits every [`WAIT_POLL`] while there are any.
+async fn poll_waits(api: Rc<RefCell<Fetchers>>, mut timer: Timer, waits_started: Rc<Notify>) {
+    loop {
+        if api.borrow().waits.is_empty() {
+            waits_started.notified().await;
+            continue;
+        }
+        let now_ns = api.borrow().aos.monotonic_now_ns();
+        timer
+            .sleep_until(now_ns + WAIT_POLL.as_nanos() as i64)
+            .await;
+        api.borrow_mut().poll_waits();
+    }
+}
+
 /// Answers `/api`'s requests, on the event loop's thread where the fetchers live.
-pub async fn serve(api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiRequest>) {
+pub async fn serve(mut api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiRequest>) {
+    let timer = api.wait_timer.take().expect("serve() runs once");
+    let waits_started = api.waits_started.clone();
     let api = Rc::new(RefCell::new(api));
+    tokio::task::spawn_local(poll_waits(api.clone(), timer, waits_started));
     // A session robot_server lost track of mustn't leave the robot without the apps it stopped.
     let session = api.borrow().session.clone();
     if let Some(session) = &session {
@@ -587,6 +835,25 @@ pub async fn serve(api: Fetchers, mut requests: mpsc::UnboundedReceiver<ApiReque
                 reply,
             } => {
                 let _ = reply.send(api.borrow_mut().latest(&name, &type_, max_vector_size));
+            }
+            ApiRequest::Wait {
+                name,
+                type_,
+                condition,
+                timeout,
+                edge,
+                max_vector_size,
+                reply,
+            } => {
+                api.borrow_mut().start_wait(
+                    &name,
+                    &type_,
+                    &condition,
+                    timeout,
+                    edge,
+                    max_vector_size,
+                    reply,
+                );
             }
             ApiRequest::Send {
                 name,
@@ -669,6 +936,9 @@ mod tests {
                             ("/empty", _) => Err(LatestError::NoMessage),
                             _ => Err(LatestError::NoChannel),
                         });
+                    }
+                    ApiRequest::Wait { reply, .. } => {
+                        let _ = reply.send(Err("Not in this test".into()));
                     }
                     ApiRequest::Send {
                         name, json, reply, ..

@@ -15,6 +15,8 @@ use axum::{
     routing::post,
     Router,
 };
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,8 +35,9 @@ nodes (computers), each node has its own channels and clocks; this server is on 
 
 Start with list_channels, filtered by a word from what you're looking for, rather than guessing \
 names.  get_latest reads a channel's newest message as JSON, with how old it is; an old message \
-means whatever sends it may have stopped.  Large channels (images) and channels read by pinning \
-can't be fetched.";
+means whatever sends it may have stopped.  wait_for waits for a condition on a channel's \
+messages, such as a field crossing a threshold, a state changing, or the channel going quiet.  \
+Large channels (images) and channels read by pinning can't be read.";
 
 /// A JSON-RPC error's code, for each kind of mistake.
 const INVALID_REQUEST: i64 = -32600;
@@ -127,8 +130,170 @@ fn tools() -> Value {
                 "required": ["channel"]
             },
             "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "wait_for",
+            "title": "Wait for a condition on a channel",
+            "description": WAIT_FOR_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "The channel's name, like /drivetrain."
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "The channel's type, if its name has several."
+                    },
+                    "condition": {
+                        "type": "string",
+                        "description": "What to wait for, on the channel's message's fields, \
+                            like \"abs(left_velocity) > 0.5 && state == 'RUNNING'\"."
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": api::MAX_WAIT.as_secs(),
+                        "description": "How long to wait, in seconds.  Default 30."
+                    },
+                    "edge": {
+                        "type": "boolean",
+                        "description": "Wait for the condition to become true (the default), \
+                            rather than return at once if it's true already."
+                    },
+                    "max_vector_size": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Leave out vectors longer than this.  Default 100."
+                    }
+                },
+                "required": ["channel", "condition"]
+            },
+            "annotations": {"readOnlyHint": true}
         }
     ])
+}
+
+const WAIT_FOR_DESCRIPTION: &str = "\
+Waits until a condition on a channel's messages comes true, or the timeout, checking every \
+message (polled every 100 ms).  Returns the message it came true on and the one before it, or \
+on a timeout, the last message and the smallest, largest and last value of each field the \
+condition reads, to show how close it came.  Also says how many messages it checked, and \
+whether it was true at the start.
+
+By default it waits for the condition to become true: if it's true already, it waits for it \
+to go false and come true again (edge=false returns at once instead).
+
+The condition is an expression in CEL's syntax over the message's fields, which are checked \
+against the channel's schema before waiting: a misspelt field or enum value is an error, \
+with suggestions.
+- Fields: count, left.velocity, wheels[0].position.  An unset field reads as its default; \
+has(path) says whether it's set.  A table or string that isn't set, or an index past the end, \
+makes the condition false for that message.
+- Enums compare with their values' names: state == 'INTAKING'.
+- Operators: ?: || && == != < <= > >= + - * / % ! and unary -.  Comparisons don't chain \
+(write a < b && b < c).  Integers are exact; / always divides as floats.
+- Functions: abs sqrt exp log log10 sign pow(x, y) hypot(x, y); sin cos tan asin acos atan \
+atan2(y, x) (radians); degrees radians wrap(a) (to (-pi, pi]); floor ceil round trunc; \
+min(a, b, ...) max(...) clamp(x, lo, hi) near(a, b, tolerance); isnan isinf isfinite; \
+size(vector or string).  Constants pi, inf, nan.
+- Over time: changed(path) and delta(path) compare with the message before; rate(path) is \
+delta per second; age() is how old the message is, in seconds; stale(500ms) is true when \
+nothing has arrived for that long (units ns, us, ms, s): it catches a process that stopped.
+
+Examples: \"abs(wrap(heading - goal_heading)) > radians(5)\", \"changed(state)\", \
+\"stale(1s)\", \"has(target) && near(target.distance, 2.0, 0.1)\".";
+
+fn seconds(ns: i64) -> f64 {
+    (ns as f64 / 1e6).round() / 1e3
+}
+
+/// A message the robot wrote as JSON, as a JSON value: as text if it isn't standard JSON (a
+/// nan or an inf in it).
+fn message_value(json: &str) -> Value {
+    serde_json::from_str(json).unwrap_or_else(|_| Value::String(json.to_string()))
+}
+
+async fn wait_for(requests: &mpsc::UnboundedSender<ApiRequest>, arguments: &Value) -> ToolResult {
+    let (name, type_) = match channel_of(requests, arguments).await {
+        Ok(channel) => channel,
+        Err(error) => return error,
+    };
+    let Some(condition) = arguments["condition"].as_str() else {
+        return ToolResult::error("Say what to wait for: {\"condition\": \"count > 3\"}");
+    };
+    let timeout = match &arguments["timeout_s"] {
+        Value::Null => Duration::from_secs(30),
+        value => match value.as_f64() {
+            Some(seconds) if seconds >= 0.0 => {
+                Duration::from_secs_f64(seconds.min(api::MAX_WAIT.as_secs_f64()))
+            }
+            _ => return ToolResult::error("timeout_s is a number of seconds, like 30"),
+        },
+    };
+    let edge = arguments["edge"].as_bool().unwrap_or(true);
+    let max_vector_size = match &arguments["max_vector_size"] {
+        Value::Null => api::DEFAULT_MAX_VECTOR_SIZE,
+        value => match value.as_u64() {
+            Some(size) => size as usize,
+            None => return ToolResult::error("max_vector_size is a count, like 10"),
+        },
+    };
+    let result = ask(requests, |reply| ApiRequest::Wait {
+        name: name.clone(),
+        type_: type_.clone(),
+        condition: condition.to_string(),
+        timeout,
+        edge,
+        max_vector_size,
+        reply,
+    })
+    .await;
+    let result = match result {
+        None => return ToolResult::error(GONE),
+        Some(Err(why)) => return ToolResult::error(why),
+        Some(Ok(result)) => result,
+    };
+    let report = &result.report;
+    let sent = |kept: &Option<crate::triggers::Kept>, json: &Option<String>| match (kept, json) {
+        (Some(kept), Some(json)) => json!({
+            "monotonic_event_time_ns": kept.monotonic_ns,
+            "realtime_event_time_ns": kept.realtime_ns,
+            "message": message_value(json),
+        }),
+        _ => Value::Null,
+    };
+    let mut answer = json!({
+        "channel": name,
+        "type": type_,
+        "condition": condition,
+        "matched": report.matched,
+        "true_at_start": report.true_at_start,
+        "waited_s": seconds(report.waited_ns),
+        "checked": report.checked,
+    });
+    if report.missed > 0 {
+        answer["missed"] = json!(report.missed);
+    }
+    if report.errors > 0 {
+        answer["unevaluable"] = json!(report.errors);
+        answer["first_reason"] = json!(report.first_error);
+    }
+    if report.matched {
+        answer["message"] = sent(&report.message, &result.message);
+        answer["before"] = sent(&report.before, &result.before);
+    } else {
+        answer["last"] = sent(&report.before, &result.before);
+    }
+    answer["fields"] = report
+        .fields
+        .iter()
+        .map(|field| {
+            json!({"field": field.field, "last": field.last, "min": field.min, "max": field.max})
+        })
+        .collect();
+    ToolResult::ok(answer.to_string())
 }
 
 /// Asks the event loop's thread, or None if it isn't answering.
@@ -298,6 +463,7 @@ async fn answer(
             let result = match params["name"].as_str() {
                 Some("list_channels") => list_channels(requests, arguments).await,
                 Some("get_latest") => get_latest(requests, arguments).await,
+                Some("wait_for") => wait_for(requests, arguments).await,
                 Some(other) => {
                     return rpc_error(id, INVALID_PARAMS, &format!("There's no tool {other}"))
                 }
@@ -445,6 +611,45 @@ mod tests {
                             _ => Err(LatestError::NoChannel),
                         });
                     }
+                    ApiRequest::Wait {
+                        condition,
+                        timeout,
+                        reply,
+                        ..
+                    } => {
+                        let kept = |count: i32| crate::triggers::Kept {
+                            data: vec![],
+                            monotonic_ns: count as i64 * 1000,
+                            realtime_ns: count as i64 * 2000,
+                            queue_index: count as u32,
+                        };
+                        let matched = condition == "count > 2";
+                        let _ = reply.send(if condition == "cuont > 2" {
+                            Err("The condition doesn't compile: no cuont".into())
+                        } else {
+                            Ok(api::WaitResult {
+                                report: crate::triggers::Report {
+                                    matched,
+                                    true_at_start: false,
+                                    waited_ns: timeout.as_nanos() as i64,
+                                    checked: 3,
+                                    missed: 0,
+                                    errors: 0,
+                                    first_error: None,
+                                    message: matched.then(|| kept(3)),
+                                    before: Some(kept(2)),
+                                    fields: vec![crate::condition::FieldSummary {
+                                        field: "count".into(),
+                                        last: Some("2".into()),
+                                        min: Some(1.0),
+                                        max: Some(2.0),
+                                    }],
+                                },
+                                message: matched.then(|| "{\"count\":3}".to_string()),
+                                before: Some("{\"count\":2}".to_string()),
+                            })
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -527,7 +732,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["list_channels", "get_latest"]);
+        assert_eq!(names, ["list_channels", "get_latest", "wait_for"]);
         for tool in response["result"]["tools"].as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert!(tool["description"].as_str().unwrap().len() > 20, "{tool}");
@@ -599,6 +804,54 @@ mod tests {
             ),
         ] {
             let (text, is_error) = call("get_latest", arguments.clone()).await;
+            assert!(is_error, "{arguments}: {text}");
+            assert!(text.contains(wanted), "{arguments}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_condition() {
+        let (text, is_error) = call(
+            "wait_for",
+            json!({"channel": "/constants", "condition": "count > 2", "timeout_s": 2}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"channel": "/constants", "type": "frc.Constants", "condition": "count > 2",
+                   "matched": true, "true_at_start": false, "waited_s": 2.0, "checked": 3,
+                   "message": {"monotonic_event_time_ns": 3000, "realtime_event_time_ns": 6000,
+                               "message": {"count": 3}},
+                   "before": {"monotonic_event_time_ns": 2000, "realtime_event_time_ns": 4000,
+                              "message": {"count": 2}},
+                   "fields": [{"field": "count", "last": "2", "min": 1.0, "max": 2.0}]})
+        );
+
+        let (text, is_error) = call(
+            "wait_for",
+            json!({"channel": "/constants", "condition": "count > 9"}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let answer: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(answer["matched"], false);
+        assert_eq!(answer["waited_s"], 30.0);
+        assert_eq!(answer["last"]["message"], json!({"count": 2}));
+        assert!(answer.get("message").is_none());
+
+        for (arguments, wanted) in [
+            (
+                json!({"channel": "/constants", "condition": "cuont > 2"}),
+                "no cuont",
+            ),
+            (json!({"channel": "/constants"}), "Say what to wait for"),
+            (
+                json!({"channel": "/constants", "condition": "count > 2", "timeout_s": "soon"}),
+                "timeout_s is a number",
+            ),
+        ] {
+            let (text, is_error) = call("wait_for", arguments.clone()).await;
             assert!(is_error, "{arguments}: {text}");
             assert!(text.contains(wanted), "{arguments}: {text}");
         }

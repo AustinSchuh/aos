@@ -1933,15 +1933,16 @@ impl Summary {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    pub(crate) use condition_test_rust_fbs::aos::robot_server::testing::State;
     use condition_test_rust_fbs::aos::robot_server::testing::{
-        Segment, State, Status, StatusArgs, Vec2, Wheel, WheelArgs,
+        Segment, Status, StatusArgs, Vec2, Wheel, WheelArgs,
     };
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::root_as_schema;
 
-    fn schema_bytes() -> Vec<u8> {
+    pub(crate) fn schema_bytes() -> Vec<u8> {
         std::fs::read(aos_testing_path::artifact_path(std::path::Path::new(
             "aos/network/robot_server/condition_test.bfbs",
         )))
@@ -1950,25 +1951,25 @@ mod tests {
 
     /// What a test message holds; the rest of Status is left unset.
     #[derive(Default)]
-    struct Fields {
-        state: Option<State>,
-        zeroed: bool,
-        count: i32,
-        big: u64,
-        heading: f64,
-        maybe: Option<i32>,
-        label: Option<&'static str>,
-        left: Option<(f64, f32)>,
-        wheels: Vec<f64>,
-        values: Vec<i32>,
-        points: Vec<(f64, f64)>,
-        states: Vec<State>,
-        names: Vec<&'static str>,
-        pose: Option<(f64, f64)>,
-        segment: Option<[i32; 3]>,
+    pub(crate) struct Fields {
+        pub(crate) state: Option<State>,
+        pub(crate) zeroed: bool,
+        pub(crate) count: i32,
+        pub(crate) big: u64,
+        pub(crate) heading: f64,
+        pub(crate) maybe: Option<i32>,
+        pub(crate) label: Option<&'static str>,
+        pub(crate) left: Option<(f64, f32)>,
+        pub(crate) wheels: Vec<f64>,
+        pub(crate) values: Vec<i32>,
+        pub(crate) points: Vec<(f64, f64)>,
+        pub(crate) states: Vec<State>,
+        pub(crate) names: Vec<&'static str>,
+        pub(crate) pose: Option<(f64, f64)>,
+        pub(crate) segment: Option<[i32; 3]>,
     }
 
-    fn message(fields: Fields) -> Vec<u8> {
+    pub(crate) fn message(fields: Fields) -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::new();
         let label = fields.label.map(|s| fbb.create_string(s));
         let left = fields.left.map(|(position, velocity)| {
