@@ -1,0 +1,13 @@
+{
+  "channels": [
+    {
+      "name": "/short",
+      "type": "aos.examples.Ping",
+      "frequency": 10,
+      "channel_storage_duration": 100000000
+    }
+  ],
+  "imports": [
+    "aos.json"
+  ]
+}

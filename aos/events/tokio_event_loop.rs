@@ -58,14 +58,16 @@ use tokio::{io::unix::AsyncFd, sync::Notify};
 
 use aos_events_event_loop_c::{
     aos_aio_create, aos_aio_destroy, aos_aio_poll, aos_aio_prepare_to_wait, aos_aio_should_run,
-    aos_aio_t, aos_aio_wait_fd, aos_context_t, aos_error_code, aos_error_destroy, aos_error_t,
+    aos_aio_t, aos_aio_wait_fd, aos_const_fetch_result_good, aos_const_fetch_result_overwrote,
+    aos_const_fetch_result_too_old, aos_context_t, aos_error_code, aos_error_destroy, aos_error_t,
     aos_event_loop_add_timer, aos_event_loop_destroy, aos_event_loop_make_fetcher,
     aos_event_loop_make_no_arg_watcher, aos_event_loop_make_sender, aos_event_loop_monotonic_now,
     aos_event_loop_node, aos_event_loop_t, aos_exit_handle_destroy, aos_exit_handle_exit,
     aos_exit_handle_t, aos_fetcher_context, aos_fetcher_destroy, aos_fetcher_fetch,
-    aos_fetcher_fetch_next, aos_fetcher_t, aos_monotonic_clock_now, aos_node_t, aos_sender_destroy,
-    aos_sender_send_copy, aos_sender_t, aos_shm_event_loop_create_on_aio,
-    aos_shm_event_loop_make_exit_handle, aos_shm_event_loop_shutdown, aos_shm_event_loop_startup,
+    aos_fetcher_fetch_next, aos_fetcher_fetch_next_with_status, aos_fetcher_t,
+    aos_monotonic_clock_now, aos_node_t, aos_sender_destroy, aos_sender_send_copy, aos_sender_t,
+    aos_shm_event_loop_create_on_aio, aos_shm_event_loop_make_exit_handle,
+    aos_shm_event_loop_shutdown, aos_shm_event_loop_startup,
     aos_simulated_event_loop_factory_end_slice,
     aos_simulated_event_loop_factory_finish_external_run,
     aos_simulated_event_loop_factory_is_running, aos_simulated_event_loop_factory_make_exit_handle,
@@ -906,6 +908,24 @@ impl<'a> Message<'a> {
     pub fn realtime_event_time_ns(&self) -> i64 {
         self.context.realtime_event_time
     }
+
+    /// Its index in the channel's queue: one more than the message before it.
+    pub fn queue_index(&self) -> u32 {
+        self.context.queue_index
+    }
+}
+
+/// What [`RawFetcher::fetch_next_or_gone()`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchedNext {
+    /// The next message, now the fetcher's.
+    Fetched,
+    /// Nothing newer has been sent.
+    NothingNew,
+    /// The next message is no longer in the channel's queue: the fetcher fell further behind
+    /// than the channel stores.  The fetcher hasn't moved; [`RawFetcher::fetch()`] skips to the
+    /// latest.
+    Gone,
 }
 
 /// An AOS fetcher. `!Send`.
@@ -929,9 +949,33 @@ impl RawFetcher {
     }
 
     /// Fetches the next message after the last one fetched. Returns whether there was one.
+    /// Kills the process if the next message is no longer in the queue; see
+    /// [`RawFetcher::fetch_next_or_gone()`].
     pub fn fetch_next(&mut self) -> bool {
         // SAFETY: As above.
         unsafe { aos_fetcher_fetch_next(self.fetcher) }
+    }
+
+    /// Fetches the next message after the last one fetched, saying so rather than dying if it's
+    /// no longer in the queue.
+    pub fn fetch_next_or_gone(&mut self) -> FetchedNext {
+        // SAFETY: As above.
+        let result = unsafe { aos_fetcher_fetch_next_with_status(self.fetcher) };
+        // SAFETY: Constants.
+        let (good, too_old, overwrote) = unsafe {
+            (
+                aos_const_fetch_result_good(),
+                aos_const_fetch_result_too_old(),
+                aos_const_fetch_result_overwrote(),
+            )
+        };
+        if result == good {
+            FetchedNext::Fetched
+        } else if result == too_old || result == overwrote {
+            FetchedNext::Gone
+        } else {
+            FetchedNext::NothingNew
+        }
     }
 
     /// The last message fetched.
@@ -1235,6 +1279,86 @@ mod tests {
                 }
             });
             assert_eq!(result.unwrap().unwrap(), b"three");
+        });
+    }
+
+    /// A fetcher further behind than the channel stores finds the next message gone, rather
+    /// than dying, and fetch() then skips to the latest.  /short stores one message (10 Hz for
+    /// 100 ms), and senders may only overwrite messages older than that, so the sender waits
+    /// between sends.  Two event loops on two threads, as above.
+    #[test]
+    fn fetch_next_or_gone_survives_falling_behind() {
+        init();
+        let config = read_config_from(&artifact_path(Path::new(
+            "aos/events/tokio_event_loop_test_config.json",
+        )))
+        .unwrap();
+        let (fetched_tx, fetched_rx) = std::sync::mpsc::channel::<()>();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let config = &config;
+            scope.spawn(move || {
+                let event_loop = TokioShmEventLoop::new(config);
+                event_loop.run(|aos| {
+                    let aos = aos.clone();
+                    let mut sender = aos.make_sender("/short", "aos.examples.Ping");
+                    async move {
+                        let mut errors = 0;
+                        errors += sender.send_copy(b"first");
+                        sent_tx.send(()).unwrap();
+                        fetched_rx.recv().unwrap();
+                        for message in [b"second".as_slice(), b"third", b"last"] {
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                            errors += sender.send_copy(message);
+                        }
+                        assert_eq!(errors, 0);
+                        sent_tx.send(()).unwrap();
+                        aos.exit();
+                    }
+                });
+            });
+            let event_loop = TokioShmEventLoop::new(config);
+            let result = event_loop.run(|aos| {
+                let mut fetcher = aos.make_fetcher("/short", "aos.examples.Ping");
+                async move {
+                    // Asserting in here would hide the failure: the event loop's destruction
+                    // checks first.  Say what happened instead.
+                    sent_rx.recv().unwrap();
+                    let fetched_first = fetcher.fetch();
+                    let first = fetcher.message().queue_index();
+                    let first_data = fetcher.message().data().map(<[u8]>::to_vec);
+                    let before = fetcher.fetch_next_or_gone();
+                    fetched_tx.send(()).unwrap();
+                    sent_rx.recv().unwrap();
+                    let behind = fetcher.fetch_next_or_gone();
+                    let stayed = fetcher.message().queue_index() == first;
+                    let fetched_last = fetcher.fetch();
+                    let last = fetcher.message();
+                    (
+                        fetched_first,
+                        first_data,
+                        before,
+                        behind,
+                        stayed,
+                        fetched_last,
+                        last.data().map(<[u8]>::to_vec),
+                        last.queue_index().wrapping_sub(first),
+                    )
+                }
+            });
+            assert_eq!(
+                result.unwrap(),
+                (
+                    true,
+                    Some(b"first".to_vec()),
+                    FetchedNext::NothingNew,
+                    FetchedNext::Gone,
+                    true,
+                    true,
+                    Some(b"last".to_vec()),
+                    3
+                )
+            );
         });
     }
 

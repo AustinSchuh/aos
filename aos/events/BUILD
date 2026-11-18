@@ -1148,11 +1148,20 @@ rust_library(
 
 # Tokio as a guest on an event loop's thread; see tokio_event_loop.rs and
 # documentation/adr/0008-tokio-on-the-event-loop-thread.md.
+# A channel that stores one message, which a fetcher easily falls behind.
+aos_config(
+    name = "tokio_event_loop_test_config",
+    src = "tokio_event_loop_test.json",
+    flatbuffers = ["//aos/testing/ping_pong:ping_fbs"],
+    deps = [":aos_config"],
+)
+
 rust_library(
     name = "tokio_event_loop_rs",
     srcs = ["tokio_event_loop.rs"],
     crate_name = "aos_events_tokio",
     test_data = [
+        ":tokio_event_loop_test_config",
         "//aos/testing/ping_pong:multinode_pingpong_test_combined_config",
         "//aos/testing/ping_pong:pingpong_config",
     ],

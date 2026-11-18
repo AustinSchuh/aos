@@ -100,6 +100,7 @@ typedef void (*aos_shm_event_loop_fd_callback_t)(void *user_data,
 // aos_const_error_status_code_* are aos::ErrorType::StatusCode vales.
 // aos_const_scheduling_policy_* are aos::SchedulingPolicy values.
 // aos_const_realtime_policy_* are aos::RealtimePolicy values.
+// aos_const_fetch_result_* are aos::RawFetcher::Result values.
 int aos_const_raw_sender_error_ok(void);
 int aos_const_raw_sender_error_messages_sent_too_fast(void);
 int aos_const_raw_sender_error_invalid_redzone(void);
@@ -111,6 +112,11 @@ int aos_const_scheduling_policy_fifo(void);
 int aos_const_scheduling_policy_rr(void);
 int aos_const_realtime_policy_realtime_mode_deny_malloc(void);
 int aos_const_realtime_policy_no_mode(void);
+int aos_const_fetch_result_good(void);
+int aos_const_fetch_result_nothing_new(void);
+int aos_const_fetch_result_too_old(void);
+int aos_const_fetch_result_filtered(void);
+int aos_const_fetch_result_overwrote(void);
 
 void aos_event_loop_destroy(aos_event_loop_t *self);
 // Creates a fetcher on the specified channel and returns it.
@@ -249,8 +255,13 @@ void aos_fetcher_destroy(aos_fetcher_t *self);
 // was fetched.
 bool aos_fetcher_fetch(aos_fetcher_t *self);
 // Fetches the next message on the channel. Returns true if a new message was
-// fetched.
+// fetched. Dies if the next message is no longer in the queue.
 bool aos_fetcher_fetch_next(aos_fetcher_t *self);
+// Fetches the next message on the channel, if there is one. Returns one of the
+// aos_const_fetch_result_* values: too_old or overwrote if the next message is
+// no longer in the queue, where aos_fetcher_fetch_next() would die, leaving
+// the fetcher where it was. aos_fetcher_fetch() then skips to the latest.
+int aos_fetcher_fetch_next_with_status(aos_fetcher_t *self);
 // Returns the context for the current message.
 aos_context_t aos_fetcher_context(aos_fetcher_t *self);
 

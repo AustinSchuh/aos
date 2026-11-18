@@ -65,6 +65,21 @@ int aos_const_raw_sender_error_messages_sent_too_fast(void) {
 int aos_const_raw_sender_error_invalid_redzone(void) {
   return static_cast<int>(aos::RawSender::Error::kInvalidRedzone);
 }
+int aos_const_fetch_result_good(void) {
+  return static_cast<int>(aos::RawFetcher::Result::GOOD);
+}
+int aos_const_fetch_result_nothing_new(void) {
+  return static_cast<int>(aos::RawFetcher::Result::NOTHING_NEW);
+}
+int aos_const_fetch_result_too_old(void) {
+  return static_cast<int>(aos::RawFetcher::Result::TOO_OLD);
+}
+int aos_const_fetch_result_filtered(void) {
+  return static_cast<int>(aos::RawFetcher::Result::FILTERED);
+}
+int aos_const_fetch_result_overwrote(void) {
+  return static_cast<int>(aos::RawFetcher::Result::OVERWROTE);
+}
 int aos_const_error_status_code_ok(void) {
   return static_cast<int>(aos::ErrorType::StatusCode::kOk);
 }
@@ -104,6 +119,13 @@ bool aos_fetcher_fetch_next(aos_fetcher_t *self) {
   aos::RawFetcher *fetcher =
       reinterpret_cast<aos::RawFetcher *>(ABSL_DIE_IF_NULL(self));
   return fetcher->FetchNext();
+}
+
+int aos_fetcher_fetch_next_with_status(aos_fetcher_t *self) {
+  aos::RawFetcher *fetcher =
+      reinterpret_cast<aos::RawFetcher *>(ABSL_DIE_IF_NULL(self));
+  return static_cast<int>(fetcher->FetchNextIfWithStatus(
+      [](const aos::Context &) { return true; }));
 }
 
 aos_context_t aos_fetcher_context(aos_fetcher_t *self) {
