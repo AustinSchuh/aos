@@ -384,8 +384,18 @@ impl Streamer {
         }
     }
 
-    /// Logs, for each camera, how many frames got their overlays since the last call.
+    /// Logs, for each camera, how many frames it encoded and got their overlays since the last
+    /// call, and what each viewer's been sent.
     pub fn log_statistics(&mut self) {
+        self.pipeline.log_statistics();
+        let mut ids: Vec<_> = self.viewers.keys().copied().collect();
+        ids.sort();
+        for id in ids {
+            if let Some(session) = &self.viewers[&id].session {
+                self.pipeline
+                    .log_session_statistics(format!("Viewer {id}"), session);
+            }
+        }
         for camera in self.cameras() {
             let join = &mut self.cameras.get_mut(&camera).expect("Listed").join;
             if join.drawn + join.missed + join.unmatched > 0 {

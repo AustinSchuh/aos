@@ -144,6 +144,9 @@ export class Browser {
     const page = new Page(this, sessionId, targetId);
     await this.send("Runtime.enable", {}, sessionId);
     await this.send("Page.enable", {}, sessionId);
+    // In front, as a tab being used is: a page in the background is hidden
+    // (document.visibilityState), and the vision page stops its video there.
+    await this.send("Page.bringToFront", {}, sessionId);
     await this.send("Page.navigate", {url}, sessionId);
     return page;
   }

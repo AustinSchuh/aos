@@ -1,12 +1,9 @@
 // End to end tests of the vision page: the built page, in headless Chrome,
 // against the robot simulated (//frc/vision/sim:vision_robot_sim), which runs
-// robot_server, web_proxy, calibration_server and the exposure adjuster as on
-// the robot, with fake cameras and a fake starter.
-//
-// camera_streamer can't run on x86 until the amd64 sysroot has its GStreamer
-// plugins (frc/amd64/build_rootfs.py), so a stand-in on its port tells the page
-// which cameras there are, through robot_server's /cameras/ws as on the robot;
-// there's no video.
+// robot_server, web_proxy, calibration_server, camera_streamer and the exposure
+// adjuster as on the robot, with fake cameras and a fake starter.  It and
+// Chrome run on the amd64 sysroot's libraries, and camera_streamer on its
+// GStreamer plugins: the test machines have neither.
 //
 // The robot keeps its state across the tests, as a robot does, so they run in
 // order.  Each saves screenshots, and the robot's log, to the test's
@@ -14,9 +11,7 @@
 
 import {strict as assert} from "node:assert";
 import {spawn} from "node:child_process";
-import crypto from "node:crypto";
 import fs from "node:fs";
-import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +23,20 @@ const RUNFILES = process.env.JS_BINARY__RUNFILES;
 const runfile = (rlocation) => path.join(RUNFILES, rlocation);
 const OUTPUTS = process.env.TEST_UNDECLARED_OUTPUTS_DIR;
 const CAMERAS = [0, 2];
+// camera_streamer's pipeline (frc/vision/streamer/pipeline.rs), and webrtcbin's.
+// The simulated robot streams VP8: Chromium decodes it, but not H.264.
+const GSTREAMER_PLUGINS = [
+  "app",
+  "coreelements",
+  "vpx",
+  "rtp",
+  "rtpmanager",
+  "webrtc",
+  "nice",
+  "dtls",
+  "srtp",
+  "sctp",
+];
 
 // In the page: the Starter tab's rows, {name: state}, or null before any.
 const STARTER_STATES = `(() => {
@@ -43,7 +52,6 @@ const STARTER_STATES = `(() => {
 
 let robot;
 let robotLog = "";
-let cameraStreamer;
 let browser;
 let page;
 let origin;
@@ -66,39 +74,6 @@ function copyFiles(from, to) {
       fs.copyFileSync(file, path.join(to, name));
     }
   }
-}
-
-/**
- * camera_streamer's signalling, as far as saying which cameras it has: what the
- * page needs before it asks for video.
- */
-function startCameraStreamerStandIn(port) {
-  const server = http.createServer((request, response) => {
-    response.writeHead(404).end();
-  });
-  server.on("upgrade", (request, socket) => {
-    const accept = crypto
-      .createHash("sha1")
-      .update(
-        request.headers["sec-websocket-key"] +
-          "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
-      )
-      .digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-    const payload = Buffer.from(
-      JSON.stringify({type: "cameras", cameras: CAMERAS}),
-    );
-    socket.write(Buffer.concat([Buffer.from([0x81, payload.length]), payload]));
-    socket.on("data", () => {});
-    socket.on("error", () => {});
-  });
-  return new Promise((resolve) =>
-    server.listen(port, "127.0.0.1", () => resolve(server)),
-  );
 }
 
 before(async () => {
@@ -131,7 +106,23 @@ before(async () => {
     freePort(),
     freePort(),
   ]);
-  cameraStreamer = await startCameraStreamerStandIn(streamerPort);
+  // The sysroot holding SYSROOT_FILE, usr/lib/os-release.
+  const sysroot = path.resolve(
+    path.dirname(runfile(process.env.SYSROOT_FILE)),
+    "../..",
+  );
+  const libraries = path.join(sysroot, "usr/lib/x86_64-linux-gnu");
+  // camera_streamer's GStreamer plugins, and only those: GStreamer loads
+  // every plugin it finds to list what's in it.
+  const plugins = path.join(root, "gstreamer-plugins");
+  fs.mkdirSync(plugins);
+  for (const plugin of GSTREAMER_PLUGINS) {
+    const file = `libgst${plugin}.so`;
+    fs.symlinkSync(
+      path.join(libraries, "gstreamer-1.0", file),
+      path.join(plugins, file),
+    );
+  }
   robot = spawn(
     runfile(process.env.ROBOT_SIM),
     [
@@ -146,7 +137,20 @@ before(async () => {
       `--camera_streamer_port=${streamerPort}`,
       `--cameras=${CAMERAS.join(",")}`,
     ],
-    {stdio: ["ignore", "pipe", "pipe"]},
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        LD_LIBRARY_PATH: [libraries, process.env.LD_LIBRARY_PATH]
+          .filter(Boolean)
+          .join(":"),
+        GST_PLUGIN_SYSTEM_PATH_1_0: plugins,
+        // Its plugin registry, scanned in process: the scanner it would fork
+        // is at the sysroot's path, not on the machine.
+        GST_REGISTRY_1_0: path.join(root, "gstreamer-registry.bin"),
+        GST_REGISTRY_FORK: "no",
+      },
+    },
   );
   robot.stderr.on("data", (chunk) => (robotLog += chunk));
   await new Promise((resolve, reject) => {
@@ -166,19 +170,12 @@ before(async () => {
     });
   });
   origin = `https://localhost:${httpsPort}`;
-
-  // The sysroot holding SYSROOT_FILE, usr/lib/os-release.
-  const sysroot = path.resolve(
-    path.dirname(runfile(process.env.SYSROOT_FILE)),
-    "../..",
-  );
   browser = await Browser.launch(runfile(process.env.CHROME), sysroot);
 });
 
 after(async () => {
   await browser?.close();
   robot?.kill("SIGINT");
-  cameraStreamer?.close();
   if (OUTPUTS) {
     fs.writeFileSync(path.join(OUTPUTS, "robot.log"), robotLog);
     fs.writeFileSync(
@@ -246,6 +243,37 @@ test("the feeds show a tile for each camera", async () => {
     {what: "two camera tiles"},
   );
   assert.deepEqual(names, ["Camera 0", "Camera 2"]);
+});
+
+test("the feeds play each camera's video, from camera_streamer", async () => {
+  // Playing, at half size: camera_streamer's 800x652 of the fake cameras'
+  // 1600x1304, and moving on.
+  const sizes = await page.waitFor(
+    `(() => {
+      const videos = [...document.querySelectorAll('video')];
+      if (videos.length !== 2 ||
+          videos.some((v) => v.videoWidth === 0 || v.currentTime === 0)) {
+        return null;
+      }
+      return videos.map((v) => [v.videoWidth, v.videoHeight]);
+    })()`,
+    {what: "both cameras' video", timeoutMs: 30000},
+  );
+  assert.deepEqual(sizes, [
+    [800, 652],
+    [800, 652],
+  ]);
+  // Frames keep coming: each video's decoded more of them since.
+  const decoded = `[...document.querySelectorAll('video')]
+    .map((v) => v.getVideoPlaybackQuality().totalVideoFrames)`;
+  const earlier = await page.evaluate(decoded);
+  await page.waitFor(
+    `(() => {
+      const now = ${decoded};
+      return now.every((n, i) => n > ${JSON.stringify(earlier)}[i]);
+    })()`,
+    {what: "more frames", timeoutMs: 10000},
+  );
   await screenshot("feeds");
 });
 
@@ -269,6 +297,43 @@ test("every tab shows its own view", async () => {
       `only the ${label} tab's view shows`,
     );
   }
+});
+
+test("the video stays connected while another tab shows", async () => {
+  await page.waitFor(
+    `(() => {
+      const videos = [...document.querySelectorAll('video')];
+      if (videos.length !== 2 || videos.some((v) => v.currentTime === 0)) {
+        return null;
+      }
+      window.streamsBefore = videos.map((v) => v.srcObject);
+      return true;
+    })()`,
+    {what: "both cameras' video", timeoutMs: 30000},
+  );
+  await tab("Settings");
+  await page.waitFor(`document.querySelector('main.settings')`, {
+    what: "the Settings tab",
+  });
+  // Long enough for a closed session's new offer to have come.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  await tab("Feeds");
+  // The same streams, not new ones from a new connection.
+  assert.equal(
+    await page.waitFor(
+      `(() => {
+        const videos = [...document.querySelectorAll('video')];
+        if (videos.length !== 2) {
+          return null;
+        }
+        return videos.every((v, i) => v.srcObject === window.streamsBefore[i])
+          ? "the same streams"
+          : "new streams";
+      })()`,
+      {what: "the feeds again"},
+    ),
+    "the same streams",
+  );
 });
 
 test("the starter tab shows starter's applications, through web_proxy", async () => {
@@ -463,6 +528,83 @@ test("calibrating: start, captures, export, download, cancel", async () => {
     {what: "the detectors back", timeoutMs: 20000},
   );
   await screenshot("cancelled");
+});
+
+// The UDP sockets the robot has open, its WebRTC connections' candidates, by
+// local address and port, sorted.
+function robotUdpSockets() {
+  const addresses = new Map();
+  for (const table of ["udp", "udp6"]) {
+    const lines = fs
+      .readFileSync(`/proc/${robot.pid}/net/${table}`, "utf8")
+      .trim()
+      .split("\n")
+      .slice(1);
+    for (const line of lines) {
+      const fields = line.trim().split(/\s+/);
+      const [address, port] = fields[1].split(":");
+      addresses.set(fields[9], `${address}:${parseInt(port, 16)}`);
+    }
+  }
+  const open = [];
+  for (const fd of fs.readdirSync(`/proc/${robot.pid}/fd`)) {
+    let target;
+    try {
+      target = fs.readlinkSync(`/proc/${robot.pid}/fd/${fd}`);
+    } catch {
+      continue; // Closed since it was listed.
+    }
+    const inode = /^socket:\[(\d+)\]$/.exec(target)?.[1];
+    if (inode && addresses.has(inode)) {
+      open.push(addresses.get(inode));
+    }
+  }
+  return open.sort();
+}
+
+// The robot's UDP sockets once they've stopped changing for a second.
+async function settledUdpSockets() {
+  let last = robotUdpSockets();
+  let since = Date.now();
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const open = robotUdpSockets();
+    if (open.join() !== last.join()) {
+      last = open;
+      since = Date.now();
+    } else if (Date.now() - since >= 1000) {
+      return open;
+    }
+  }
+  throw new Error(`The robot's UDP sockets never settled: ${last}`);
+}
+
+test("a closed page's connections close, and their sockets with them", async () => {
+  await page.close();
+  page = null;
+  const before = await settledUdpSockets();
+
+  // One page's connections: web_proxy's and camera_streamer's.
+  page = await browser.open(`${origin}/vision/`);
+  await page.waitFor(
+    `document.querySelector('.status.ok') &&
+      [...document.querySelectorAll('video')].filter((v) => v.currentTime > 0)
+        .length === 2`,
+    {what: "the page connected, and its video playing", timeoutMs: 30000},
+  );
+  const open = robotUdpSockets();
+  assert.ok(
+    open.length > before.length,
+    `${open.length} UDP sockets open, as many as before: ${open}`,
+  );
+
+  // A browser keeps checking a connection's candidates as it goes, and the
+  // robot mustn't be left listening, or answering with what it freed.
+  await page.close();
+  page = null;
+  assert.deepEqual(await settledUdpSockets(), before);
+  assert.equal(robot.exitCode, null, "The robot died");
 });
 
 test("the page throws nothing", () => {

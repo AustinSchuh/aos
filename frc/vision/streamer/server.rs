@@ -9,9 +9,10 @@ use std::rc::Rc;
 
 use crate::annotations::annotations_overlay;
 use crate::join::JoinOptions;
-use crate::pipeline::Settings;
+use crate::pipeline::{Codec, Settings};
 use crate::signalling::{FromBrowser, ToBrowser};
 use crate::streamer::{Options, Streamer};
+use anyhow::Context;
 use aos_flatbuffers::Flatbuffer;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
@@ -32,7 +33,10 @@ pub struct Flags {
     /// Port, on localhost, for the signalling websocket; robot_server proxies it.
     #[arg(long, default_value_t = 1190)]
     pub port: u16,
-    /// x264's target, in kbit/s, for each camera: four cameras are 2.4 Mbit/s a viewer.
+    /// What to encode the cameras with.
+    #[arg(long, value_enum, default_value_t = Codec::H264)]
+    pub codec: Codec,
+    /// The encoder's target, in kbit/s, for each camera: four cameras are 2.4 Mbit/s a viewer.
     #[arg(long, default_value_t = 600)]
     pub bitrate_kbps: u32,
     /// Stream at most this many frames a second of each camera.
@@ -46,6 +50,10 @@ pub struct Flags {
     pub min_port: u32,
     #[arg(long, default_value_t = 5830)]
     pub max_port: u32,
+    /// Gather ICE candidates on loopback too, as well as every other interface: for a browser on
+    /// this machine when there's nothing else, as in a test's sandbox.
+    #[arg(long)]
+    pub ice_loopback: bool,
     /// The longest a frame waits for its overlays (the boxes on the tags in /cameraN/gray
     /// frc.vision.TargetMap) before it is sent without them.
     #[arg(long, default_value_t = 50)]
@@ -60,6 +68,48 @@ pub struct Flags {
 }
 
 type Shared = Rc<RefCell<Streamer>>;
+
+/// Every interface's addresses, loopback's too: IPv4, and IPv6 but link-local (which would need
+/// its interface named).
+fn interface_addresses() -> anyhow::Result<Vec<String>> {
+    let mut addresses = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills in `list`, which is freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to list the interfaces");
+    }
+    let mut entry = list;
+    while !entry.is_null() {
+        // SAFETY: A node of the list getifaddrs made, whose address, if any, is a sockaddr of its
+        // family.
+        unsafe {
+            let address = (*entry).ifa_addr;
+            if !address.is_null() {
+                match (*address).sa_family as i32 {
+                    libc::AF_INET => {
+                        let address = &*(address as *const libc::sockaddr_in);
+                        addresses.push(
+                            std::net::Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr))
+                                .to_string(),
+                        );
+                    }
+                    libc::AF_INET6 => {
+                        let address = &*(address as *const libc::sockaddr_in6);
+                        let address = std::net::Ipv6Addr::from(address.sin6_addr.s6_addr);
+                        if !address.is_unicast_link_local() {
+                            addresses.push(address.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            entry = (*entry).ifa_next;
+        }
+    }
+    // SAFETY: From getifaddrs, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    Ok(addresses)
+}
 
 /// Serves one browser's signalling websocket until it closes.
 async fn session(stream: TcpStream, id: u64, streamer: Shared) {
@@ -127,10 +177,18 @@ pub fn serve(
     let streamer: Shared = Rc::new(RefCell::new(Streamer::new(
         Options {
             settings: Settings {
+                codec: flags.codec,
                 bitrate_kbps: flags.bitrate_kbps,
                 keyframe_interval: (2.0 * flags.max_fps).round() as u32,
                 min_port: flags.min_port,
                 max_port: flags.max_port,
+                ice_addresses: if flags.ice_loopback {
+                    let addresses = interface_addresses()?;
+                    log::info!("ICE gathers on {addresses:?}");
+                    addresses
+                } else {
+                    Vec::new()
+                },
             },
             half_size: flags.half_size,
             max_fps: flags.max_fps,

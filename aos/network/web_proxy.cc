@@ -530,11 +530,7 @@ void ApplicationConnection::OnIce(const WebSocketIce *ice) {
 void ApplicationConnection::LocalCandidate(
     struct rawrtc_peer_connection_ice_candidate *const candidate,
     char const *const url) {
-  struct rawrtc_ice_candidate *ortc_candidate = nullptr;
   if (candidate) {
-    CHECK_RAWRTC(rawrtc_peer_connection_ice_candidate_get_ortc_candidate(
-        &ortc_candidate, candidate));
-
     flatbuffers::FlatBufferBuilder fbb;
     char *sdpp = nullptr;
     CHECK_RAWRTC(

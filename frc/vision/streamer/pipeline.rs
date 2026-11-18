@@ -5,6 +5,7 @@
 //! appsrc (I420) -> x264enc -> h264 caps -> tee --+---------------------------+
 //!   ...one encoder per watched camera            |                           |
 //!                                     queue -> rtph264pay -> caps --+   (other viewers)
+//!   (or vp8enc and rtpvp8pay, with --codec=vp8)
 //!                                     ...one branch per camera      +--> webrtcbin (send only)
 //! ```
 //!
@@ -12,10 +13,11 @@
 //! a video track each, bundled onto one ICE and DTLS transport: one peer connection per viewer
 //! rather than one per camera.  An encoder only gets frames while someone watches its camera.
 //! A new session forces a keyframe on its cameras so it can start straight away; the browser's
-//! PLIs reach an encoder through its rtph264pay as force-key-unit events.
+//! PLIs reach an encoder through its payloader as force-key-unit events.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,16 +33,29 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::signalling::ToBrowser;
 
+/// What the cameras are encoded with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Codec {
+    /// H.264 Main, from x264.
+    H264,
+    /// VP8, from libvpx: every browser decodes it, Chromium without its proprietary codecs too.
+    Vp8,
+}
+
 /// How the encoders and WebRTC are set up.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// x264's target, in kbit/s, for each camera.
+    pub codec: Codec,
+    /// The encoder's target, in kbit/s, for each camera.
     pub bitrate_kbps: u32,
     /// A keyframe at least this often, in frames.
     pub keyframe_interval: u32,
     /// The UDP ports WebRTC may use, inclusive.
     pub min_port: u32,
     pub max_port: u32,
+    /// The addresses to gather ICE candidates on, or none for libnice's own: every interface's
+    /// but loopback's.
+    pub ice_addresses: Vec<String>,
 }
 
 fn element(factory: &str) -> anyhow::Result<gst::Element> {
@@ -52,6 +67,9 @@ fn element(factory: &str) -> anyhow::Result<gst::Element> {
 /// One camera's encoder, from appsrc to the tee its viewers' branches hang off.
 struct Encoder {
     appsrc: gst_app::AppSrc,
+    /// Frames pushed since the last statistics, and of those, how many appsrc refused.
+    pushed: Cell<u64>,
+    refused: Cell<u64>,
     encoder: gst::Element,
     tee: gst::Element,
     elements: Vec<gst::Element>,
@@ -60,11 +78,24 @@ struct Encoder {
 
 /// One camera's branch of a session: from its encoder's tee into the session's webrtcbin.
 struct Branch {
+    camera: u32,
     tee: gst::Element,
     tee_pad: gst::Pad,
     /// Its webrtcbin's request pad, which must be released for webrtcbin to be freed.
     sink: gst::Pad,
     elements: Vec<gst::Element>,
+    /// Frames into the branch from its tee, and RTP packets out of it into webrtcbin.
+    frames_in: Arc<AtomicU64>,
+    packets_out: Arc<AtomicU64>,
+}
+
+/// Counts the buffers through `pad` into `count`.
+fn count_buffers(pad: &gst::Pad, count: &Arc<AtomicU64>) {
+    let count = count.clone();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        count.fetch_add(1, Ordering::Relaxed);
+        gst::PadProbeReturn::Ok
+    });
 }
 
 /// One viewer's peer connection: a webrtcbin carrying `cameras`, one video track each, in order.
@@ -137,28 +168,52 @@ impl Pipeline {
             .max_buffers(2)
             .leaky_type(gst_app::AppLeakyType::Downstream)
             .build();
-        let encoder = element("x264enc")?;
-        encoder.set_property_from_str("tune", "zerolatency");
-        // superfast and Main (CABAC) match ultrafast and constrained baseline's picture in a
-        // third of the bits, for about half again the CPU (7.4 ms rather than 4.4 ms a frame on
-        // an Orin Nano's core at 600 kbit/s).  Still no B-frames, so no more latency.  Not High:
-        // Chrome's WebRTC doesn't offer to decode it, and its 8x8 transforms gain almost
-        // nothing here (SSIM 0.844 rather than 0.842 at 600 kbit/s).
-        encoder.set_property_from_str("speed-preset", "superfast");
-        encoder.set_property("bitrate", self.settings.bitrate_kbps);
-        encoder.set_property("key-int-max", self.settings.keyframe_interval);
-        encoder.set_property("bframes", 0u32);
-        let h264 = element("capsfilter")?;
-        h264.set_property(
-            "caps",
-            gst::Caps::builder("video/x-h264")
-                .field("profile", "main")
-                .field("stream-format", "byte-stream")
-                .build(),
-        );
+        let (encoder, encoded) = match self.settings.codec {
+            Codec::H264 => {
+                let encoder = element("x264enc")?;
+                encoder.set_property_from_str("tune", "zerolatency");
+                // superfast and Main (CABAC) match ultrafast and constrained baseline's picture
+                // in a third of the bits, for about half again the CPU (7.4 ms rather than 4.4 ms
+                // a frame on an Orin Nano's core at 600 kbit/s).  Still no B-frames, so no more
+                // latency.  Not High: Chrome's WebRTC doesn't offer to decode it, and its 8x8
+                // transforms gain almost nothing here (SSIM 0.844 rather than 0.842 at
+                // 600 kbit/s).
+                encoder.set_property_from_str("speed-preset", "superfast");
+                encoder.set_property("bitrate", self.settings.bitrate_kbps);
+                encoder.set_property("key-int-max", self.settings.keyframe_interval);
+                encoder.set_property("bframes", 0u32);
+                (
+                    encoder,
+                    gst::Caps::builder("video/x-h264")
+                        .field("profile", "main")
+                        .field("stream-format", "byte-stream")
+                        .build(),
+                )
+            }
+            Codec::Vp8 => {
+                let encoder = element("vp8enc")?;
+                // Realtime: each frame out as soon as it's in, at a constant bitrate.
+                encoder.set_property("deadline", 1i64);
+                encoder.set_property("lag-in-frames", 0i32);
+                encoder.set_property_from_str("end-usage", "cbr");
+                encoder.set_property("cpu-used", 8i32);
+                encoder.set_property(
+                    "target-bitrate",
+                    i32::try_from(self.settings.bitrate_kbps.saturating_mul(1000))
+                        .unwrap_or(i32::MAX),
+                );
+                encoder.set_property(
+                    "keyframe-max-dist",
+                    i32::try_from(self.settings.keyframe_interval).unwrap_or(i32::MAX),
+                );
+                (encoder, gst::Caps::builder("video/x-vp8").build())
+            }
+        };
+        let caps = element("capsfilter")?;
+        caps.set_property("caps", encoded);
         let tee = element("tee")?;
         tee.set_property("allow-not-linked", true);
-        let elements = vec![appsrc.clone().upcast(), encoder.clone(), h264, tee.clone()];
+        let elements = vec![appsrc.clone().upcast(), encoder.clone(), caps, tee.clone()];
         self.pipeline.add_many(&elements)?;
         gst::Element::link_many(&elements)?;
         for element in &elements {
@@ -168,6 +223,8 @@ impl Pipeline {
             camera,
             Encoder {
                 appsrc,
+                pushed: Cell::new(0),
+                refused: Cell::new(0),
                 encoder,
                 tee,
                 elements,
@@ -211,7 +268,69 @@ impl Pipeline {
             .expect("A new buffer is writable")
             .set_pts(pts);
         // A full appsrc drops the frame by itself; anything else is the pipeline shutting down.
-        let _ = encoder.appsrc.push_buffer(buffer);
+        encoder.pushed.set(encoder.pushed.get() + 1);
+        if encoder.appsrc.push_buffer(buffer).is_err() {
+            encoder.refused.set(encoder.refused.get() + 1);
+        }
+    }
+
+    /// Logs, and restarts, each encoder's count of frames pushed.
+    pub fn log_statistics(&self) {
+        let mut cameras: Vec<_> = self.encoders.keys().copied().collect();
+        cameras.sort();
+        for camera in cameras {
+            let encoder = &self.encoders[&camera];
+            log::info!(
+                "Camera {camera}: {} frames to encode, {} refused",
+                encoder.pushed.replace(0),
+                encoder.refused.replace(0)
+            );
+        }
+    }
+
+    /// Logs what `session` has sent of each track, as `viewer`'s, once webrtcbin says.
+    pub fn log_session_statistics(&self, viewer: String, session: &Session) {
+        for branch in &session.branches {
+            log::info!(
+                "{viewer}: camera {}: {} frames in, {} RTP packets to webrtcbin",
+                branch.camera,
+                branch.frames_in.load(Ordering::Relaxed),
+                branch.packets_out.load(Ordering::Relaxed)
+            );
+        }
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let Ok(Some(reply)) = reply else {
+                return;
+            };
+            for (_, value) in reply.iter() {
+                let Ok(stats) = value.get::<gst::Structure>() else {
+                    continue;
+                };
+                if stats.get::<gst_webrtc::WebRTCStatsType>("type")
+                    != Ok(gst_webrtc::WebRTCStatsType::OutboundRtp)
+                {
+                    continue;
+                }
+                let field = |name: &str| {
+                    stats
+                        .value(name)
+                        .ok()
+                        .and_then(|value| value.serialize().ok())
+                        .map_or_else(|| "?".to_string(), |value| value.to_string())
+                };
+                log::info!(
+                    "{viewer}: SSRC {} sent {} packets, {} bytes; {} PLIs, {} NACKs",
+                    field("ssrc"),
+                    field("packets-sent"),
+                    field("bytes-sent"),
+                    field("pli-count"),
+                    field("nack-count")
+                );
+            }
+        });
+        session
+            .webrtcbin
+            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
     }
 
     /// Starts a viewer's session for `cameras`, every one of which must have an encoder, and
@@ -223,9 +342,25 @@ impl Pipeline {
     ) -> anyhow::Result<Session> {
         let webrtcbin = element("webrtcbin")?;
         webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
+        // How each viewer's connection goes, for when video doesn't arrive.
+        webrtcbin.connect_notify(Some("connection-state"), |webrtcbin, _| {
+            let state =
+                webrtcbin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+            log::info!("{}: connection {state:?}", webrtcbin.name());
+        });
+        webrtcbin.connect_notify(Some("ice-connection-state"), |webrtcbin, _| {
+            let state =
+                webrtcbin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+            log::info!("{}: ICE {state:?}", webrtcbin.name());
+        });
         let ice: gst::glib::Object = webrtcbin.property("ice-agent");
         ice.set_property("min-rtp-port", self.settings.min_port);
         ice.set_property("max-rtp-port", self.settings.max_port);
+        for address in &self.settings.ice_addresses {
+            if !ice.emit_by_name::<bool>("add-local-ip-address", &[address]) {
+                log::warn!("ICE won't gather on {address}");
+            }
+        }
         let signalling = Arc::new(Mutex::new(Signalling::default()));
         {
             let to_browser = to_browser.clone();
@@ -259,7 +394,7 @@ impl Pipeline {
                     .encoders
                     .get(&camera)
                     .ok_or_else(|| anyhow!("Camera {camera} has no encoder yet"))?;
-                let branch = self.add_branch(encoder, &webrtcbin, index)?;
+                let branch = self.add_branch(camera, encoder, &webrtcbin, index)?;
                 session.branches.push(branch);
                 session.cameras.push(camera);
             }
@@ -285,6 +420,7 @@ impl Pipeline {
                     let webrtcbin = values[0]
                         .get::<gst::Element>()
                         .expect("on-negotiation-needed's webrtcbin");
+                    log::info!("{}: offering", webrtcbin.name());
                     create_offer(
                         &webrtcbin,
                         offer_cameras.clone(),
@@ -327,6 +463,7 @@ impl Pipeline {
     /// One camera's branch, from its encoder's tee into `webrtcbin` as its `index`th track.
     fn add_branch(
         &self,
+        camera: u32,
         encoder: &Encoder,
         webrtcbin: &gst::Element,
         index: usize,
@@ -339,25 +476,35 @@ impl Pipeline {
         queue.set_property("max-size-time", 200_000_000u64);
         // Each track its own payload type, so the browser never confuses them.
         let payload_type = 96 + index as u32;
-        let payloader = element("rtph264pay")?;
-        payloader.set_property("config-interval", -1i32);
+        let rtp_caps = gst::Caps::builder("application/x-rtp")
+            .field("media", "video")
+            .field("payload", payload_type as i32)
+            .field("clock-rate", 90000i32);
+        let (payloader, rtp_caps) = match self.settings.codec {
+            Codec::H264 => {
+                let payloader = element("rtph264pay")?;
+                payloader.set_property("config-interval", -1i32);
+                payloader.set_property_from_str("aggregate-mode", "zero-latency");
+                (
+                    payloader,
+                    rtp_caps
+                        .field("encoding-name", "H264")
+                        // Say what the encoder makes, Main at level 3.1, in the offer.  Without
+                        // it a browser assumes constrained baseline (RFC 6184), and may pick a
+                        // decoder that can't do CABAC.
+                        .field("profile-level-id", "4d001f")
+                        .field("packetization-mode", "1"),
+                )
+            }
+            Codec::Vp8 => {
+                let payloader = element("rtpvp8pay")?;
+                payloader.set_property_from_str("picture-id-mode", "15-bit");
+                (payloader, rtp_caps.field("encoding-name", "VP8"))
+            }
+        };
         payloader.set_property("pt", payload_type);
-        payloader.set_property_from_str("aggregate-mode", "zero-latency");
         let rtp = element("capsfilter")?;
-        rtp.set_property(
-            "caps",
-            gst::Caps::builder("application/x-rtp")
-                .field("media", "video")
-                .field("encoding-name", "H264")
-                .field("payload", payload_type as i32)
-                .field("clock-rate", 90000i32)
-                // Say what the encoder makes, Main at level 3.1, in the offer.  Without it a
-                // browser assumes constrained baseline (RFC 6184), and may pick a decoder that
-                // can't do CABAC.
-                .field("profile-level-id", "4d001f")
-                .field("packetization-mode", "1")
-                .build(),
-        );
+        rtp.set_property("caps", rtp_caps.build());
         let elements = vec![queue.clone(), payloader, rtp.clone()];
         self.pipeline.add_many(&elements)?;
         gst::Element::link_many(&elements)?;
@@ -375,11 +522,21 @@ impl Pipeline {
         for element in &elements {
             element.sync_state_with_parent()?;
         }
+        let frames_in = Arc::new(AtomicU64::new(0));
+        let packets_out = Arc::new(AtomicU64::new(0));
+        count_buffers(&tee_pad, &frames_in);
+        count_buffers(
+            &rtp.static_pad("src").expect("A capsfilter has a src pad"),
+            &packets_out,
+        );
         Ok(Branch {
+            camera,
             tee: encoder.tee.clone(),
             tee_pad,
             sink,
             elements,
+            frames_in,
+            packets_out,
         })
     }
 
@@ -389,6 +546,7 @@ impl Pipeline {
             .map_err(|_| anyhow!("Couldn't parse the answer's SDP"))?;
         let answer =
             gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, message);
+        log::info!("{}: answered", session.webrtcbin.name());
         let name = session.webrtcbin.name();
         let set = gst::Promise::with_change_func(move |reply| {
             if let Some(error) = description_error(reply) {

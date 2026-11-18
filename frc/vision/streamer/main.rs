@@ -2,10 +2,10 @@
 //!
 //! Watches each camera's decoded `/cameraN/gray` images, and streams those that someone is
 //! watching, with a box drawn on each AprilTag the detector found (`/cameraN/gray`
-//! `frc.vision.TargetMap`): H.264 from x264, one encoder per camera shared by every viewer.  Each
-//! viewer gets one WebRTC peer connection carrying every camera it watches.  Browsers set up their
-//! sessions over a websocket on localhost, which robot_server serves to them as
-//! `wss://<robot>/cameras/ws`.
+//! `frc.vision.TargetMap`): H.264 from x264 (or VP8, with `--codec=vp8`), one encoder per camera
+//! shared by every viewer.  Each viewer gets one WebRTC peer connection carrying every camera it
+//! watches.  Browsers set up their sessions over a websocket on localhost, which robot_server
+//! serves to them as `wss://<robot>/cameras/ws`.
 //!
 //! Runs tokio on its AOS event loop's thread (ADR 0008).
 
