@@ -1,5 +1,6 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("//tools/rust:defs.bzl", "rust_binary", "rust_library")
+load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
+load("//tools/rust:defs.bzl", "flatbuffer_rust_library", "rust_binary", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -9,13 +10,16 @@ rust_library(
     name = "robot_server_lib",
     srcs = [
         "api.rs",
+        "condition.rs",
         "lib.rs",
         "session.rs",
     ],
     crate_name = "robot_server",
-    test_data = glob(["testdata/*"]),
+    test_data = glob(["testdata/*"]) + [":condition_test_fbs_reflection_out"],
     test_deps = [
+        ":condition_test_rust_fbs",
         "//aos/testing:path_rs",
+        "@aos_flatbuffers//rust:flatbuffers",
         "@crate_index//:tower",
     ],
     deps = [
@@ -24,6 +28,7 @@ rust_library(
         "//aos:flatbuffers_rs",
         "//aos/events:event_loop_c_rs",
         "//aos/events:tokio_event_loop_rs",
+        "//aos/flatbuffers/reflection:reflection_rust_fbs",
         "@crate_index//:anyhow",
         "@crate_index//:axum",
         "@crate_index//:clap",
@@ -40,6 +45,17 @@ rust_library(
         "@crate_index//:tokio-tungstenite",
         "@crate_index//:tower-http",
     ],
+)
+
+# A message with one of everything, for condition.rs's tests.
+static_flatbuffer(
+    name = "condition_test_fbs",
+    srcs = ["condition_test.fbs"],
+)
+
+flatbuffer_rust_library(
+    name = "condition_test_rust_fbs",
+    srcs = ["condition_test.fbs"],
 )
 
 _BINARY_DEPS = [

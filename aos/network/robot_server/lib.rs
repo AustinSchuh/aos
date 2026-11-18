@@ -4,6 +4,7 @@
 //! the AOS event loop's thread.
 
 pub mod api;
+pub mod condition;
 pub mod session;
 
 use std::{

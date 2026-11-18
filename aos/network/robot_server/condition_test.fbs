@@ -1,0 +1,48 @@
+namespace aos.robot_server.testing;
+
+// What the robot's doing.
+enum State : byte {
+  IDLE,
+  INTAKING,
+  SHOOTING,
+}
+
+struct Vec2 {
+  x:double;
+  y:double;
+}
+
+struct Segment {
+  start:Vec2;
+  end:Vec2;
+  ids:[int:3];
+}
+
+table Wheel {
+  // The wheel's position, in meters.
+  position:double (id: 0);
+  velocity:float (id: 1);
+  name:string (id: 2);
+}
+
+// A message with one of everything a condition reads.
+table Status {
+  state:State = IDLE (id: 0);
+  zeroed:bool (id: 1);
+  count:int (id: 2);
+  big:ulong (id: 3);
+  heading:double (id: 4);
+  scale:double = 1.5 (id: 5);
+  maybe:int = null (id: 6);
+  label:string (id: 7);
+  left:Wheel (id: 8);
+  wheels:[Wheel] (id: 9);
+  values:[int] (id: 10);
+  points:[Vec2] (id: 11);
+  pose:Vec2 (id: 12);
+  states:[State] (id: 13);
+  names:[string] (id: 14);
+  segment:Segment (id: 15);
+}
+
+root_type Status;
