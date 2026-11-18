@@ -243,6 +243,12 @@ build:arm64 --@rules_cuda//cuda:archs=sm_87
 # old toolchains_llvm "cuda" feature did.
 build --@rules_cuda//cuda:copts=-Wno-unknown-cuda-version
 
+# libstdc++ 15 checks its assertions in unoptimized builds unless told not
+# to.  A failed one calls abort(), which device code doesn't have, so ptxas
+# fails on any kernel using std::array or friends in fastbuild ("Unresolved
+# extern function 'abort'").  Host code keeps them.
+build --@rules_cuda//cuda:copts=-D_GLIBCXX_NO_ASSERTIONS
+
 # Config for running in CI (e.g., Buildkite).
 # We want developers to have liberal access to packages during local development,
 # but CI is restricted to prebuilt packages resolved exclusively from our mirror.
