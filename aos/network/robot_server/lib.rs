@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod condition;
+pub mod mcp;
 pub mod session;
 
 use std::{
@@ -248,7 +249,8 @@ pub fn router(options: Options, api: mpsc::UnboundedSender<api::ApiRequest>) -> 
     let camera_streamer_ws = options.camera_streamer_ws.clone();
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(api::router(api))
+        .merge(api::router(api.clone()))
+        .merge(mcp::router(api))
         .route(
             "/ws",
             get(move |upgrade: WebSocketUpgrade| {

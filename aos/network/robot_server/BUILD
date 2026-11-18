@@ -12,6 +12,7 @@ rust_library(
         "api.rs",
         "condition.rs",
         "lib.rs",
+        "mcp.rs",
         "session.rs",
     ],
     crate_name = "robot_server",

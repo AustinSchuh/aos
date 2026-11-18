@@ -6,7 +6,8 @@ Accepted.
 
 - **Implemented outside this repository**, in meta-frc4646 `eb9e0a7` and `6752256`: the team CA (`make_team_ca.sh`, `install_team_ca.sh`), the server certificate and a robot's fallback CA (`make_tls_cert.sh`, `aos-tls.service`, run again by `change_hostname.sh`), and `trust_orin.py`.
 - **Implemented here**, in `aos/network/robot_server`: HTTPS on 443 with the certificate from `/etc/aos/tls`, reloaded when it changes; the `www` pages; `/ws` proxied to `web_proxy`; `/foxglove` proxied to the Foxglove server; the trust page on port 80; and `GET /api`, each channel's latest message as JSON. `aos/network/www/proxy.ts` connects over `wss://` from an https page.
-- **Not yet implemented:** MCP, `/logs`, and `wss://` in `frc/image_streamer`'s pages.
+- **Implemented here, in part:** MCP at `/mcp`, with `list_channels` and `get_latest`.
+- **Not yet implemented:** MCP's other tools, `/logs`, and `wss://` in `frc/image_streamer`'s pages.
 - **Deferred:** replacing `web_proxy`'s WebRTC (rawrtc) with Rust.
 
 ## Context
@@ -136,7 +137,11 @@ Channels whose messages can be over 256 KiB (images), or that are read by pinnin
 
 #### MCP
 
-Served at `/mcp` over streamable HTTP, with rmcp, the official Rust MCP SDK.
+Served at `/mcp` over streamable HTTP, by about 300 lines of axum and serde_json in `mcp.rs` rather than rmcp, the official Rust MCP SDK (see Tried, and why not). A server with only tools needs a small part of the protocol: `initialize`, `ping`, `tools/list` and `tools/call`, each a POST answered with one JSON response. There are no sessions and no server-to-client stream, which the transport allows. Like `/api`'s, its handlers ask the event loop's thread for what's on the channels.
+
+Requests carrying an `Origin` must come from the robot's own pages, so another site's page in a student's browser can't drive the tools.
+
+An assistant connects with `claude mcp add --transport http orin-1868-1 https://orin-1868-1.local/mcp`. Claude Code is Node, which doesn't read the stores `trust_orin.py` installs the CA into, so it also needs `NODE_EXTRA_CA_CERTS` pointing at the team CA. A replay serves `/mcp` on its plain-HTTP port.
 
 - **Read tools, always on:** `list_nodes`, `list_channels`, `list_applications`, `get_config`, `fetch_latest(channel)`, `watch(channel, count | seconds)`, `timing_report(application)`, `starter_status`.
 - **Write tools, off unless the config enables them:** `send(channel, json)` on an allow-list of channels; `start`, `stop` and `restart(application)` through starter.
@@ -203,6 +208,7 @@ What we built first and changed, or started and stopped:
 - **Looking channels up without a node.** In a configuration with nodes, that crashes. Lookups use the event loop's node.
 - **Fetching every channel.** Image channels are megabytes, and channels read by pinning count their readers, so a web fetcher could take a reader slot an application needs. Both are refused.
 - **Streaming everything over `web_proxy`'s data channels.** With no rate limit, a 60 Hz channel such as a camera's TargetMap costs about 0.5 Mbit/s a camera, too much of a robot link for a page that only shows a count. Such data is fetched with `/api` a few times a second instead. `web_proxy` now sends a new subscriber the latest message straight away, rather than waiting for the next.
+- **rmcp for MCP.** It would add about twenty crates to rehost, its handlers must be `Send` while the fetchers live on one thread, and its streamable-HTTP server keeps sessions this needs none of. The part of MCP a server of tools uses is small enough to write.
 - **aws-lc-rs**, rustls's default crypto, needs cmake and a large C build. rustls uses ring. ring's build script needed a patch to the `rules_rust` that WORKSPACE builds use.
 
 ## Verification

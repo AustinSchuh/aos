@@ -1,5 +1,4 @@
-//! GET requests for what is on the robot's channels, as JSON: the shape an MCP server's tools
-//! will want too.
+//! GET requests for what is on the robot's channels, as JSON, which MCP's tools ask for too.
 //!
 //! ```text
 //! GET /api/channels
@@ -63,6 +62,8 @@ pub struct ChannelInfo {
 pub struct Latest {
     pub monotonic_event_time_ns: i64,
     pub realtime_event_time_ns: i64,
+    /// How long ago it was sent, on the event loop's clock.
+    pub age_ns: i64,
     /// The message, as JSON.
     pub json: String,
 }
@@ -524,6 +525,7 @@ impl Fetchers {
         Ok(Latest {
             monotonic_event_time_ns: message.monotonic_event_time_ns(),
             realtime_event_time_ns: message.realtime_event_time_ns(),
+            age_ns: self.aos.monotonic_now_ns() - message.monotonic_event_time_ns(),
             json: channel
                 .message_to_json(data, max_vector_size)
                 .ok_or(LatestError::NotJson)?,
@@ -656,6 +658,7 @@ mod tests {
                             ("/constants", "frc.Constants") => Ok(Latest {
                                 monotonic_event_time_ns: 12,
                                 realtime_event_time_ns: 34,
+                                age_ns: 0,
                                 json: format!(
                                     "{{\"a\": 1, \"max_vector_size\": {max_vector_size}}}"
                                 ),
