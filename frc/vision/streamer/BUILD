@@ -28,9 +28,7 @@ rust_library(
 )
 
 # Streams the cameras to the browser over WebRTC; see lib.rs.  A real pipeline
-# needs the x264, webrtc and nice plugins, from the sysroot.  x86's links once
-# the amd64 sysroot has libbz2-dev (and runs once it has the plugins):
-# frc/amd64/build_rootfs.py.
+# needs the x264 (or vpx), webrtc and nice plugins.
 rust_library(
     name = "camera_streamer_lib",
     srcs = [
@@ -40,10 +38,7 @@ rust_library(
         "streamer.rs",
     ],
     crate_name = "camera_streamer",
-    target_compatible_with = [
-        "@platforms//cpu:arm64",
-        "@platforms//os:linux",
-    ],
+    target_compatible_with = ["@platforms//os:linux"],
     deps = [
         ":camera_streamer_core",
         "//aos:configuration_rust_fbs",
@@ -61,6 +56,7 @@ rust_library(
         "@crate_index//:gstreamer-sdp",
         "@crate_index//:gstreamer-video",
         "@crate_index//:gstreamer-webrtc",
+        "@crate_index//:libc",
         "@crate_index//:log",
         "@crate_index//:tokio",
         "@crate_index//:tokio-tungstenite",

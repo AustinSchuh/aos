@@ -12,6 +12,7 @@
 //   - calibration_server, started and stopped by robot_server through starter,
 //     as on the robot;
 //   - field_side_exposure_adjuster, with the exposure and gain the page sets;
+//   - camera_streamer, streaming the cameras to the page over WebRTC;
 //   - the vision constants, for --robot_name, from constants.json;
 // and in place of the hardware:
 //   - cameras: each of --cameras shows a ChArUco board (the calibration
@@ -20,8 +21,10 @@
 //   - starter: answers StarterRpc for calibration_server by running it, and
 //     for the other applications by saying so; sends starter's Status.
 //
-// camera_streamer joins it once the amd64 sysroot can run it (see
-// frc/amd64/build_rootfs.py); until then, nothing serves /cameras/ws.
+// camera_streamer's GStreamer plugins, and their libraries, are the sysroot's:
+// a machine without them runs it with, as the pages' end-to-end test does,
+//   LD_LIBRARY_PATH=<sysroot>/usr/lib/x86_64-linux-gnu
+//   GST_PLUGIN_SYSTEM_PATH_1_0=<sysroot>/usr/lib/x86_64-linux-gnu/gstreamer-1.0
 //
 // Prints "Serving <url>" once it is.
 
@@ -77,7 +80,12 @@ ABSL_FLAG(std::string, tls_dir, "",
 ABSL_FLAG(uint16_t, https_port, 8443, "robot_server's HTTPS port.");
 ABSL_FLAG(uint16_t, http_port, 8080, "robot_server's HTTP port.");
 ABSL_FLAG(uint16_t, camera_streamer_port, 1190,
-          "Where robot_server proxies /cameras/ws to.");
+          "camera_streamer's signalling port, which robot_server proxies "
+          "/cameras/ws to.");
+ABSL_FLAG(std::string, camera_streamer_codec, "vp8",
+          "camera_streamer's --codec: vp8, which every browser decodes, "
+          "Chromium without its proprietary codecs too, or h264, as the "
+          "robot streams.");
 ABSL_FLAG(std::string, cameras, "0,2", "The cameras that show a board.");
 ABSL_FLAG(double, pose_seconds, 1.0, "How long the board holds each pose.");
 ABSL_DECLARE_FLAG(int32_t, proxy_port);
@@ -85,6 +93,10 @@ ABSL_DECLARE_FLAG(int32_t, proxy_port);
 extern "C" {
 // From aos/network/robot_server/lib.rs.
 bool robot_server_add_to_simulation_with_flags(
+    aos_tokio_simulation_t *simulation, aos_event_loop_t *event_loop,
+    const uint8_t *config, size_t config_size, int argc, const char **argv);
+// From frc/vision/streamer/server.rs.
+bool camera_streamer_add_to_simulation_with_flags(
     aos_tokio_simulation_t *simulation, aos_event_loop_t *event_loop,
     const uint8_t *config, size_t config_size, int argc, const char **argv);
 }
@@ -288,6 +300,25 @@ std::vector<std::string> RobotServerArgs(const aos::Configuration *config) {
   return args;
 }
 
+// Runs `add`, one of the Rust applications' *_add_to_simulation_with_flags, on
+// `event_loop` with `args`, its command line.
+template <typename Add>
+void AddRustApplication(aos::TokioSimulation *simulation,
+                        aos::EventLoop *event_loop,
+                        const std::vector<std::string> &args, Add add) {
+  const aos::FlatbufferDetachedBuffer<aos::Configuration> config =
+      aos::CopyFlatBuffer(event_loop->configuration());
+  std::vector<const char *> argv;
+  for (const std::string &arg : args) {
+    argv.push_back(arg.c_str());
+  }
+  ABSL_LOG(INFO) << absl::StrJoin(args, " ");
+  ABSL_CHECK(add(simulation->get(), aos::TokioSimulation::ForRust(event_loop),
+                 config.span().data(), config.span().size(), argv.size(),
+                 argv.data()))
+      << ": " << args[0] << " couldn't start";
+}
+
 int Main() {
   ABSL_CHECK(!absl::GetFlag(FLAGS_data_dir).empty()) << "--data_dir is needed";
   ABSL_CHECK(!absl::GetFlag(FLAGS_state_dir).empty())
@@ -354,23 +385,24 @@ int Main() {
                                      aos::web_proxy::StoreHistory::kNo, -1);
   web_proxy.SetDataPath(data_dir.c_str());
 
+  aos::TokioSimulation simulation(&factory);
   std::unique_ptr<aos::EventLoop> server_loop =
       factory.MakeEventLoop("robot_server", node);
-  const aos::FlatbufferDetachedBuffer<aos::Configuration> server_config =
-      aos::CopyFlatBuffer(server_loop->configuration());
-  const std::vector<std::string> args = RobotServerArgs(&config.message());
-  std::vector<const char *> argv;
-  for (const std::string &arg : args) {
-    argv.push_back(arg.c_str());
-  }
-  ABSL_LOG(INFO) << "robot_server " << absl::StrJoin(args, " ");
-
-  aos::TokioSimulation simulation(&factory);
-  ABSL_CHECK(robot_server_add_to_simulation_with_flags(
-      simulation.get(), aos::TokioSimulation::ForRust(server_loop.get()),
-      server_config.span().data(), server_config.span().size(), argv.size(),
-      argv.data()))
-      << ": robot_server couldn't start";
+  AddRustApplication(&simulation, server_loop.get(),
+                     RobotServerArgs(&config.message()),
+                     robot_server_add_to_simulation_with_flags);
+  std::unique_ptr<aos::EventLoop> streamer_loop =
+      factory.MakeEventLoop("camera_streamer", node);
+  AddRustApplication(
+      &simulation, streamer_loop.get(),
+      {"camera_streamer",
+       absl::StrCat("--port=", absl::GetFlag(FLAGS_camera_streamer_port)),
+       absl::StrCat("--cameras=", absl::GetFlag(FLAGS_cameras)),
+       absl::StrCat("--node=", absl::GetFlag(FLAGS_node)),
+       absl::StrCat("--codec=", absl::GetFlag(FLAGS_camera_streamer_codec)),
+       // As web_proxy's, above.
+       "--ice-loopback"},
+      camera_streamer_add_to_simulation_with_flags);
   // Unbuffered, for whatever's waiting for it.
   std::cout << "Serving https://localhost:" << absl::GetFlag(FLAGS_https_port)
             << "/vision/" << std::endl;
