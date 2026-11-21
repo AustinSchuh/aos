@@ -43,6 +43,7 @@
     <camera-tile
       [camera]="status.camera"
       [stream]="stream(status.camera)"
+      [stoppedMs]="stoppedMs(status.camera)"
       [line]="status.corners + ' corners'"
     ></camera-tile>
     <p class="guidance" [class.ok]="status.verdict === 'CAPTURED'">

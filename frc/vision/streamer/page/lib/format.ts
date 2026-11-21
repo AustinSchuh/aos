@@ -157,3 +157,16 @@ export function exposureSlider(exposure100us: number): number {
 export function exposureMsText(exposure100us: number): string {
   return exposure100us <= 0 ? 'auto' : `${(exposure100us / 10).toFixed(1)} ms`;
 }
+
+/**
+ * How long without a new frame before a tile says so: several frames even at a slow camera's
+ * rate, and more than the 400 ms between the page's samples of them.
+ */
+export const STOPPED_MS = 1000;
+
+/** "No image for 3 s" once a camera's frames have stopped, or null while they come. */
+export function stoppedText(stoppedMs: number): string | null {
+  return stoppedMs < STOPPED_MS
+    ? null
+    : `No image for ${Math.floor(stoppedMs / 1000)} s`;
+}

@@ -336,6 +336,37 @@ test("the video stays connected while another tab shows", async () => {
   );
 });
 
+test("a camera whose frames stop says so, until they come again", async () => {
+  await page.waitFor(
+    `(() => {
+      const videos = [...document.querySelectorAll('video')];
+      return videos.length === 2 && videos.every((v) => v.currentTime > 0);
+    })()`,
+    {what: "both cameras' video", timeoutMs: 30000},
+  );
+  const labels = `[...document.querySelectorAll('.stopped-label')]
+    .map((e) => e.textContent.trim())`;
+  assert.deepEqual(await page.evaluate(labels), []);
+  // Stopping the whole robot stops its frames, as an unplugged camera does.
+  robot.kill("SIGSTOP");
+  try {
+    const stopped = await page.waitFor(
+      `(() => { const l = ${labels}; return l.length === 2 ? l : null; })()`,
+      {what: "both tiles to say their frames stopped"},
+    );
+    for (const label of stopped) {
+      assert.match(label, /^No image for \d+ s$/);
+    }
+    await screenshot("stopped");
+  } finally {
+    robot.kill("SIGCONT");
+  }
+  await page.waitFor(`${labels}.length === 0`, {
+    what: "the frames to come again",
+    timeoutMs: 15000,
+  });
+});
+
 test("the starter tab shows starter's applications, through web_proxy", async () => {
   await tab("Starter");
   const states = await page.waitFor(STARTER_STATES, {

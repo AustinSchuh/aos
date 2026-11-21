@@ -2,7 +2,7 @@
   <span class="tile-name">Camera {{ camera }}</span>
   <span class="tile-line">{{ line }}</span>
 </div>
-<div class="tile-view">
+<div class="tile-view" [class.stopped]="stopped !== null">
   <video
     #video
     autoplay
@@ -11,4 +11,7 @@
     (playing)="playing = true"
   ></video>
   <div class="no-signal" *ngIf="!stream || !playing">No signal</div>
+  <div class="stopped-label" *ngIf="stopped !== null">
+    <span>{{ stopped }}</span>
+  </div>
 </div>

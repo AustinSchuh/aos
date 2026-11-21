@@ -12,6 +12,7 @@ import {
   fixedWidth,
   gainText,
   sizeText,
+  stoppedText,
   streamSettings,
   streamSizeText,
   tileLine,
@@ -119,6 +120,13 @@ test('an exposure comes back from its slider position', () => {
   for (const exposure of [1, 2, 15, 60, 100, 333]) {
     assert.equal(sliderExposure(exposureSlider(exposure)), exposure);
   }
+});
+
+test("a camera's stopped frames say so after a second, in whole seconds", () => {
+  assert.equal(stoppedText(0), null);
+  assert.equal(stoppedText(800), null);
+  assert.equal(stoppedText(1000), 'No image for 1 s');
+  assert.equal(stoppedText(12_400), 'No image for 12 s');
 });
 
 test('an exposure is in ms, or auto for 0', () => {

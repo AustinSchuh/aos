@@ -65,6 +65,27 @@ export class RateWindow {
   }
 }
 
+/**
+ * How long a track's frames have stopped for, from its `framesDecoded` sampled now and then.
+ * When a camera is unplugged, or its camera_reader stops, camera_streamer has nothing to send,
+ * and the video keeps showing its last frame as though nothing happened.
+ */
+export class FrameWatch {
+  private decoded: number | null = null;
+  private lastFrameMs = 0;
+
+  /** Adds a sample, and gives how long, in ms, since the last new frame: 0 while they come. */
+  add(framesDecoded: number, timestampMs: number): number {
+    // Any change is a frame, or a new track whose counters started again.
+    if (framesDecoded !== this.decoded) {
+      this.decoded = framesDecoded;
+      this.lastFrameMs = timestampMs;
+      return 0;
+    }
+    return Math.max(0, timestampMs - this.lastFrameMs);
+  }
+}
+
 /** One `frc.vision.TurboJpegDecoderStatus`: the frames decoded since the last, and when. */
 export interface DecoderStatus {
   /** When it was sent, in seconds on the robot's monotonic clock. */

@@ -156,6 +156,30 @@ camera-tile {
   letter-spacing: 0.05em;
 }
 
+/* Frames stopped: the last one stays, dimmed, so it can't pass for live. */
+.tile-view.stopped video {
+  opacity: 0.35;
+  filter: grayscale(1);
+}
+
+.stopped-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.stopped-label span {
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 70%);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
 main.embed {
   flex: 1;
   min-height: 0;

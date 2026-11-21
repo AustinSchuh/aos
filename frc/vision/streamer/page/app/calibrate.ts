@@ -125,6 +125,10 @@ export class CalibratePanel {
     return this.streams.videoFor(camera).stream;
   }
 
+  stoppedMs(camera: number): number {
+    return this.streams.videoFor(camera).stoppedMs;
+  }
+
   /** The editor follows the session's board, unless it's being edited. */
   get board(): BoardForm | null {
     const board = this.session?.board ?? null;

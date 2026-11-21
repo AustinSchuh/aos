@@ -3,6 +3,7 @@ import {test} from 'node:test';
 
 import {
   detectionDelayMs,
+  FrameWatch,
   RateWindow,
   robotFps,
   streamRates,
@@ -55,6 +56,20 @@ test('a window gives the rates over its last second, however often it is sampled
   });
   // A new track starts again.
   assert.equal(window.add(sample(2000, 2, 1_000)), null);
+});
+
+test('a frame watch says how long since the last new frame', () => {
+  const watch = new FrameWatch();
+  assert.equal(watch.add(10, 0), 0);
+  assert.equal(watch.add(22, 400), 0);
+  // Stopped at 22.
+  assert.equal(watch.add(22, 800), 400);
+  assert.equal(watch.add(22, 3200), 2800);
+  // Coming again.
+  assert.equal(watch.add(23, 3600), 0);
+  // A new track's counters start again: that's frames too.
+  assert.equal(watch.add(2, 4000), 0);
+  assert.equal(watch.add(2, 5000), 1000);
 });
 
 test("the robot's frame rate is decodes over the time between statuses", () => {

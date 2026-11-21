@@ -7,7 +7,12 @@ import {
   rejectsEveryTrack,
   ToStreamer,
 } from '../lib/signalling.js';
-import {InboundSample, RateWindow, StreamRates} from '../lib/rates.js';
+import {
+  FrameWatch,
+  InboundSample,
+  RateWindow,
+  StreamRates,
+} from '../lib/rates.js';
 
 /** What the page knows of one camera's video. */
 export interface CameraVideo {
@@ -15,6 +20,8 @@ export interface CameraVideo {
   rates: StreamRates | null;
   width: number | null;
   height: number | null;
+  /** How long since its last new frame, in ms: 0 while they come. */
+  stoppedMs: number;
 }
 
 /**
@@ -40,6 +47,7 @@ export class CameraStreams implements OnDestroy {
   private offerCameras: number[] = [];
   private watching = true;
   private readonly windows = new Map<number, RateWindow>();
+  private readonly watches = new Map<number, FrameWatch>();
   private readonly statsTimer: ReturnType<typeof setInterval>;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
@@ -81,7 +89,13 @@ export class CameraStreams implements OnDestroy {
   videoFor(camera: number): CameraVideo {
     let video = this.video.get(camera);
     if (!video) {
-      video = {stream: null, rates: null, width: null, height: null};
+      video = {
+        stream: null,
+        rates: null,
+        width: null,
+        height: null,
+        stoppedMs: 0,
+      };
       this.video.set(camera, video);
     }
     return video;
@@ -156,9 +170,11 @@ export class CameraStreams implements OnDestroy {
     this.pc = null;
     this.offerCameras = [];
     this.windows.clear();
+    this.watches.clear();
     for (const video of this.video.values()) {
       video.stream = null;
       video.rates = null;
+      video.stoppedMs = 0;
     }
   }
 
@@ -229,7 +245,7 @@ export class CameraStreams implements OnDestroy {
       }
     });
     const report = await pc.getStats();
-    const updates: [number, InboundSample, StreamRates | null][] = [];
+    const updates: [number, InboundSample, StreamRates | null, number][] = [];
     report.forEach((stats: Record<string, unknown>) => {
       if (stats['type'] !== 'inbound-rtp' || stats['kind'] !== 'video') {
         return;
@@ -255,15 +271,26 @@ export class CameraStreams implements OnDestroy {
         window = new RateWindow();
         this.windows.set(camera, window);
       }
-      updates.push([camera, sample, window.add(sample)]);
+      let watch = this.watches.get(camera);
+      if (!watch) {
+        watch = new FrameWatch();
+        this.watches.set(camera, watch);
+      }
+      updates.push([
+        camera,
+        sample,
+        window.add(sample),
+        watch.add(sample.framesDecoded, sample.timestampMs),
+      ]);
     });
     if (pc !== this.pc) {
       return;
     }
     this.zone.run(() => {
-      for (const [camera, sample, rates] of updates) {
+      for (const [camera, sample, rates, stoppedMs] of updates) {
         const video = this.videoFor(camera);
         video.rates = rates;
+        video.stoppedMs = stoppedMs;
         video.width = sample.frameWidth;
         video.height = sample.frameHeight;
       }

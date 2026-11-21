@@ -56,6 +56,7 @@
     *ngFor="let camera of cameras"
     [camera]="camera"
     [stream]="streams.videoFor(camera).stream"
+    [stoppedMs]="streams.videoFor(camera).stoppedMs"
     [line]="line(camera)"
   ></camera-tile>
 </main>
