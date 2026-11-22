@@ -44,6 +44,35 @@ cc_library(
     ],
 )
 
+# Says which camera camera_reader has open, and what it's doing with it.
+cc_library(
+    name = "camera_status",
+    srcs = ["camera_status.cc"],
+    hdrs = ["camera_status.h"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":v4l2_reader",
+        "//aos/events:event_loop",
+        "//aos/util:file",
+        "//frc/vision:camera_status_fbs",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "camera_status_test",
+    srcs = ["camera_status_test.cc"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":camera_status",
+        "//aos/testing:googletest",
+        "//aos/testing:tmpdir",
+        "//aos/util:file",
+    ],
+)
+
 cc_library(
     name = "cuda_camera_image_callback",
     srcs = ["cuda_camera_image_callback.cc"],
@@ -387,6 +416,7 @@ cc_binary(
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
     deps = [
+        ":camera_status",
         ":v4l2_reader",
         "//aos:init",
         "//aos/events:shm_event_loop",

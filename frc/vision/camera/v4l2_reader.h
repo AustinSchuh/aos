@@ -1,7 +1,11 @@
 #ifndef FRC_VISION_CAMERA_V4L2_READER_H_
 #define FRC_VISION_CAMERA_V4L2_READER_H_
 
+#include <sys/types.h>
+
 #include <array>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #include "absl/log/absl_check.h"
@@ -65,6 +69,38 @@ class V4L2ReaderBase {
 
   // Switches from manual to auto exposure.
   void UseAutoExposure();
+
+  // One control's value and range, as the driver reports them.
+  struct Control {
+    int32_t value = 0;
+    int32_t minimum = 0;
+    int32_t maximum = 0;
+    int32_t step = 0;
+    int32_t default_value = 0;
+    // Ignored for now, like exposure while auto exposure is on.
+    bool inactive = false;
+  };
+
+  // Control `id` (a V4L2_CID_*), or nullopt if the camera doesn't have it.
+  std::optional<Control> GetControl(uint32_t id);
+
+  // The time per frame, numerator then denominator seconds, as VIDIOC_G_PARM
+  // reports it, or nullopt if it doesn't.
+  std::optional<std::pair<uint32_t, uint32_t>> FramePeriod();
+
+  // What VIDIOC_QUERYCAP said when the device was opened.
+  const std::string &driver() const { return driver_; }
+  const std::string &card() const { return card_; }
+  const std::string &bus_info() const { return bus_info_; }
+
+  // The open device's number, to find it in sysfs.
+  dev_t device_number();
+
+  int rows() const { return rows_; }
+  int cols() const { return cols_; }
+
+  // How many images have been sent since this was made.
+  uint64_t images_sent() const { return images_sent_; }
 
  protected:
   void StreamOff();
@@ -172,6 +208,12 @@ class V4L2ReaderBase {
   int cols_ = 0;
   // Image size reported by V4L2. This may not always be exactly rows * Cols.
   int image_size_ = 0;
+
+  std::string driver_;
+  std::string card_;
+  std::string bus_info_;
+
+  uint64_t images_sent_ = 0;
 
   aos::ScopedFD fd_;
 

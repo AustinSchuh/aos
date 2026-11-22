@@ -5,6 +5,7 @@
 #include "aos/events/shm_event_loop.h"
 #include "aos/init.h"
 #include "frc/constants/constants_sender_lib.h"
+#include "frc/vision/camera/camera_status.h"
 #include "frc/vision/camera/v4l2_reader.h"
 #include "frc/vision/camera_constants_generated.h"
 
@@ -56,6 +57,10 @@ void CameraReaderMain() {
       v4l2_reader.UseAutoExposure();
     }
   }
+
+  CameraStatusSender status_sender(&event_loop, &v4l2_reader,
+                                   absl::GetFlag(FLAGS_viddevice),
+                                   absl::GetFlag(FLAGS_channel));
 
   event_loop.MakeWatcher("/camera", [&v4l2_reader, &last_exposure, &last_gain](
                                         const CameraStreamSettings &settings) {

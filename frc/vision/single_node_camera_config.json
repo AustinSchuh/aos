@@ -122,6 +122,13 @@
       "frequency": 10
     },
     {
+      "name": "/camera0",
+      "type": "frc.vision.CameraStatus",
+      "source_node": "orin",
+      "max_size": 2048,
+      "frequency": 4
+    },
+    {
       "name": "/camera0/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
@@ -196,6 +203,13 @@
       "frequency": 10
     },
     {
+      "name": "/camera1",
+      "type": "frc.vision.CameraStatus",
+      "source_node": "orin",
+      "max_size": 2048,
+      "frequency": 4
+    },
+    {
       "name": "/camera1/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
@@ -249,6 +263,13 @@
       "frequency": 10
     },
     {
+      "name": "/camera2",
+      "type": "frc.vision.CameraStatus",
+      "source_node": "orin",
+      "max_size": 2048,
+      "frequency": 4
+    },
+    {
       "name": "/camera2/gray",
       "type": "frc.vision.CameraImage",
       "read_method": "PIN",
@@ -300,6 +321,13 @@
       "source_node": "orin",
       "max_size": 128,
       "frequency": 10
+    },
+    {
+      "name": "/camera3",
+      "type": "frc.vision.CameraStatus",
+      "source_node": "orin",
+      "max_size": 2048,
+      "frequency": 4
     },
     {
       "name": "/camera3/gray",

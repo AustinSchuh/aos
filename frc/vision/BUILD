@@ -93,6 +93,7 @@ aos_config(
         ":camera_settings_fbs",
         ":camera_constants_fbs",
         ":turbojpeg_decoder_status_fbs",
+        ":camera_status_fbs",
         "//aos/events:event_loop_fbs",
         "//aos/logging:log_message_fbs",
         "//aos/starter:starter_fbs",
@@ -192,6 +193,15 @@ flatbuffer_ts_library(
         "frc/vision/turbo-jpeg-decoder-status.ts",
     ],
     visibility = ["//visibility:public"],
+)
+
+static_flatbuffer(
+    name = "camera_status_fbs",
+    srcs = ["camera_status.fbs"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":camera_settings_fbs",
+    ],
 )
 
 static_flatbuffer(

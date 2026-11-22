@@ -1,0 +1,84 @@
+include "frc/vision/camera_settings.fbs";
+
+namespace frc.vision;
+
+// Which camera this is, as far as its USB IDs and name tell.  Matched the way
+// PhotonVision's QuirkyCamera does, so its notes on each apply.
+enum CameraModel : ubyte {
+  UNKNOWN = 0,
+  // ThriftyCam (1bcf:28c5).
+  THRIFTY_OV9281 = 1,
+  // An Arducam (0c45:6366) whose name doesn't say which sensor it has: every
+  // Arducam has the same USB IDs.
+  ARDUCAM_GENERIC = 2,
+  ARDUCAM_OV9281 = 3,
+  ARDUCAM_OV2311 = 4,
+  ARDUCAM_OV9782 = 5,
+  // Innomaker OV9281 (0c45:636d, "USB Camera").
+  INNOMAKER_OV9281 = 6,
+}
+
+// One V4L2 control: what the camera reports for it now (VIDIOC_G_CTRL), and
+// what it can take (VIDIOC_QUERYCTRL).  uvcvideo answers the value from what
+// was last set rather than asking the camera, so a value here says the camera
+// took the setting, not that the picture changed.
+table CameraControl {
+  value:int32 (id: 0);
+  minimum:int32 (id: 1);
+  maximum:int32 (id: 2);
+  step:int32 (id: 3);
+  default_value:int32 (id: 4);
+  // Whether the driver ignores the value for now, as it does exposure_absolute
+  // while auto exposure is on.
+  inactive:bool (id: 5);
+}
+
+// What camera_reader has open, and what it's doing with it: sent once a second
+// on the camera's channel, beside its CameraImages and the
+// CameraStreamSettings that ask for its exposure and gain.
+table CameraStatus {
+  // The device camera_reader opened, as it was given, like "/dev/videoa".
+  device:string (id: 0);
+
+  // From VIDIOC_QUERYCAP.  card is the USB product name, cut to 31 bytes.
+  driver:string (id: 1);
+  card:string (id: 2);
+  bus_info:string (id: 3);
+
+  // From the USB device in sysfs; not set for a camera that isn't on USB.
+  usb_vendor_id:uint16 (id: 4);
+  usb_product_id:uint16 (id: 5);
+  usb_manufacturer:string (id: 6);
+  usb_product:string (id: 7);
+  usb_serial:string (id: 8);
+  // The device's release number, bcdDevice: its firmware version, for UVC
+  // cameras.
+  usb_device_version:uint16 (id: 9);
+
+  model:CameraModel (id: 10);
+
+  // What it streams: VIDIOC_G_FMT and VIDIOC_G_PARM.
+  image_width:uint32 (id: 11);
+  image_height:uint32 (id: 12);
+  frame_period:TimePerFrame (id: 13);
+
+  // Each is left out if the camera doesn't have it.
+  // V4L2_CID_EXPOSURE_AUTO: 1 manual, 3 aperture priority (auto).
+  auto_exposure:CameraControl (id: 14);
+  // V4L2_CID_EXPOSURE_ABSOLUTE, in 100 us.
+  exposure_absolute:CameraControl (id: 15);
+  gain:CameraControl (id: 16);
+  // V4L2_CID_EXPOSURE_AUTO_PRIORITY: whether the camera may drop its frame
+  // rate to expose longer.
+  exposure_dynamic_framerate:CameraControl (id: 17);
+  // V4L2_CID_POWER_LINE_FREQUENCY: 0 off, 1 50 Hz, 2 60 Hz.
+  power_line_frequency:CameraControl (id: 18);
+
+  // The images sent since the status before this one, and how long that
+  // covers, in nanoseconds.  camera_reader's first status, sent as it starts,
+  // covers nothing.
+  frames:uint32 (id: 19);
+  period_ns:int64 (id: 20);
+}
+
+root_type CameraStatus;

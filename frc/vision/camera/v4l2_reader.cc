@@ -7,6 +7,7 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
@@ -51,10 +52,19 @@ V4L2ReaderBase::V4L2ReaderBase(aos::EventLoop *event_loop,
     memset(&capability, 0, sizeof(capability));
     ABSL_PCHECK(Ioctl(VIDIOC_QUERYCAP, &capability) == 0);
 
+    // Each is NUL-terminated, but bound them anyway.
+    const auto field = [](const __u8 *data, size_t size) {
+      const char *chars = reinterpret_cast<const char *>(data);
+      return std::string(chars, strnlen(chars, size));
+    };
+    driver_ = field(capability.driver, sizeof(capability.driver));
+    card_ = field(capability.card, sizeof(capability.card));
+    bus_info_ = field(capability.bus_info, sizeof(capability.bus_info));
+
     ABSL_LOG(INFO) << "Opening " << device_name;
-    ABSL_LOG(INFO) << "  driver " << capability.driver;
-    ABSL_LOG(INFO) << "  card " << capability.card;
-    ABSL_LOG(INFO) << "  bus_info " << capability.bus_info;
+    ABSL_LOG(INFO) << "  driver " << driver_;
+    ABSL_LOG(INFO) << "  card " << card_;
+    ABSL_LOG(INFO) << "  bus_info " << bus_info_;
     if (capability.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
       ABSL_LOG(INFO) << "  Multi-planar";
       multiplanar_ = true;
@@ -202,6 +212,7 @@ bool V4L2ReaderBase::ReadLatestImage() {
 
 void V4L2ReaderBase::SendLatestImage() {
   buffers_[saved_buffer_.index].Send();
+  ++images_sent_;
 
   MarkBufferToBeEnqueued(saved_buffer_.index);
   saved_buffer_.Clear();
@@ -312,6 +323,49 @@ int V4L2ReaderBase::ClampToControl(uint32_t id, int value) {
                       << clamped;
   }
   return clamped;
+}
+
+std::optional<V4L2ReaderBase::Control> V4L2ReaderBase::GetControl(uint32_t id) {
+  v4l2_queryctrl query;
+  memset(&query, 0, sizeof(query));
+  query.id = id;
+  if (Ioctl(VIDIOC_QUERYCTRL, &query) != 0 ||
+      (query.flags & V4L2_CTRL_FLAG_DISABLED)) {
+    return std::nullopt;
+  }
+  v4l2_control control;
+  memset(&control, 0, sizeof(control));
+  control.id = id;
+  if (Ioctl(VIDIOC_G_CTRL, &control) != 0) {
+    return std::nullopt;
+  }
+  return Control{
+      .value = control.value,
+      .minimum = query.minimum,
+      .maximum = query.maximum,
+      .step = query.step,
+      .default_value = query.default_value,
+      .inactive = (query.flags & V4L2_CTRL_FLAG_INACTIVE) != 0,
+  };
+}
+
+std::optional<std::pair<uint32_t, uint32_t>> V4L2ReaderBase::FramePeriod() {
+  v4l2_streamparm parm;
+  memset(&parm, 0, sizeof(parm));
+  parm.type = multiplanar() ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+                            : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (Ioctl(VIDIOC_G_PARM, &parm) != 0 ||
+      !(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
+    return std::nullopt;
+  }
+  return std::make_pair(parm.parm.capture.timeperframe.numerator,
+                        parm.parm.capture.timeperframe.denominator);
+}
+
+dev_t V4L2ReaderBase::device_number() {
+  struct stat st;
+  ABSL_PCHECK(fstat(fd_.get(), &st) == 0);
+  return st.st_rdev;
 }
 
 V4L2ReaderBase::BufferInfo V4L2ReaderBase::DequeueBuffer() {
