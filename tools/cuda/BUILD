@@ -37,12 +37,16 @@ cuda_toolkit_info(
     nvlink = "@cuda//:nvlink",
     path = "",
     ptxas = "@cuda//:ptxas",
+    # NVIDIA ships these tools for Linux only.
+    target_compatible_with = ["@platforms//:incompatible"] if _HOST_IS_DARWIN else [],
     version = "13.2",
 )
 
 cuda_toolchain_config_clang(
     name = "linux_clang_config",
     cuda_toolkit = ":linux_toolkit_info",
+    # NVIDIA ships these tools for Linux only.
+    target_compatible_with = ["@platforms//:incompatible"] if _HOST_IS_DARWIN else [],
     toolchain_identifier = "clang",
 )
 
@@ -53,6 +57,8 @@ cuda_toolchain(
         "@cuda//:nvvm_all_files",
     ],
     compiler_use_cc_toolchain = True,
+    # NVIDIA ships these tools for Linux only.
+    target_compatible_with = ["@platforms//:incompatible"] if _HOST_IS_DARWIN else [],
     toolchain_config = ":linux_clang_config",
 )
 

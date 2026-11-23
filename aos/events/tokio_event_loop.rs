@@ -1122,7 +1122,9 @@ mod tests {
     /// Tokio sockets and AOS work together on one thread, and a message wakes a task watching for
     /// it. One event loop reads a TCP connection and sends what it got on an AOS channel; the
     /// other connects, writes, and watches the channel. Two event loops on two threads, since one
-    /// event loop can't both send on a channel and watch it.
+    /// event loop can't both send on a channel and watch it.  This uses Pong because
+    /// latest_skips_to_the_newest runs in parallel on Ping, and this watcher would see its
+    /// messages.
     #[test]
     fn socket_to_channel_to_watch() {
         init();
@@ -1134,7 +1136,7 @@ mod tests {
             scope.spawn(move || {
                 let event_loop = TokioShmEventLoop::new(config);
                 event_loop.run(|aos| {
-                    let mut sender = aos.make_sender("/test", "aos.examples.Ping");
+                    let mut sender = aos.make_sender("/test", "aos.examples.Pong");
                     async move {
                         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                         address_tx.send(listener.local_addr().unwrap()).unwrap();
@@ -1148,7 +1150,7 @@ mod tests {
             });
             let event_loop = TokioShmEventLoop::new(config);
             let result = event_loop.run(|aos| {
-                let mut watch = aos.make_watch("/test", "aos.examples.Ping");
+                let mut watch = aos.make_watch("/test", "aos.examples.Pong");
                 async move {
                     let address = address_rx.recv().unwrap();
                     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();

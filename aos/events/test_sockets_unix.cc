@@ -46,6 +46,15 @@ TcpPair::TcpPair() {
   server_ = accept(listener, nullptr, nullptr);
   ABSL_PCHECK(server_ >= 0);
   ABSL_PCHECK(close(listener) == 0);
+  // macOS loses about half of the out-of-band bytes sent as the very first
+  // data on a connection: the byte is acked, but never shows up as urgent
+  // data or in-band.  One ordinary byte passed and read first avoids that,
+  // and leaves the connection with nothing unread, as the tests expect.
+  const char warmup = 'w';
+  ABSL_PCHECK(send(client_, &warmup, 1, 0) == 1);
+  char received;
+  ABSL_PCHECK(recv(server_, &received, 1, MSG_WAITALL) == 1);
+  ABSL_CHECK_EQ(received, warmup);
   SetUp(client_);
   SetUp(server_);
 }

@@ -493,15 +493,16 @@ pub fn drop_privileges(user: &str) -> io::Result<()> {
     // Groups first: only root may set them.
     // SAFETY: plain syscalls on values, and `name` is a valid C string.
     unsafe {
-        if libc::initgroups(name.as_ptr(), gid) != 0 {
+        // OSX takes the group as an int here.
+        if libc::initgroups(name.as_ptr(), gid as _) != 0 {
             return Err(last_error(format!("Failed to set {user}'s groups")));
         }
-        if libc::setresgid(gid, gid, gid) != 0 {
+        if set_all_gids(gid) != 0 {
             return Err(last_error(format!(
                 "Failed to change the group ID to {gid}"
             )));
         }
-        if libc::setresuid(uid, uid, uid) != 0 {
+        if set_all_uids(uid) != 0 {
             return Err(last_error(format!("Failed to change the user ID to {uid}")));
         }
         if uid != 0 && libc::setuid(0) == 0 {
@@ -511,6 +512,32 @@ pub fn drop_privileges(user: &str) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Sets the real, effective, and saved group IDs to `gid`.
+#[cfg(target_os = "linux")]
+unsafe fn set_all_gids(gid: libc::gid_t) -> libc::c_int {
+    unsafe { libc::setresgid(gid, gid, gid) }
+}
+
+/// Sets the real, effective, and saved group IDs to `gid`.  OSX has no
+/// setresgid, but setgid sets all three when run as root.
+#[cfg(not(target_os = "linux"))]
+unsafe fn set_all_gids(gid: libc::gid_t) -> libc::c_int {
+    unsafe { libc::setgid(gid) }
+}
+
+/// Sets the real, effective, and saved user IDs to `uid`.
+#[cfg(target_os = "linux")]
+unsafe fn set_all_uids(uid: libc::uid_t) -> libc::c_int {
+    unsafe { libc::setresuid(uid, uid, uid) }
+}
+
+/// Sets the real, effective, and saved user IDs to `uid`.  OSX has no
+/// setresuid, but setuid sets all three when run as root.
+#[cfg(not(target_os = "linux"))]
+unsafe fn set_all_uids(uid: libc::uid_t) -> libc::c_int {
+    unsafe { libc::setuid(uid) }
 }
 
 /// Serves `router` over TLS on `listener`, until the future is dropped.

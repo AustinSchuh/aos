@@ -11,6 +11,7 @@ load("//aos:config.bzl", "aos_config")
 load("//aos:flatbuffers.bzl", "cc_static_flatbuffer")
 load("//aos/flatbuffers:generate.bzl", "static_flatbuffer")
 load("//aos/seasocks:gen_embedded.bzl", "gen_embedded")
+load("//tools/platforms:host_platform.bzl", "host_compatible_with")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -550,7 +551,9 @@ cc_library(
     hdrs = [
         "message_bridge_auth_server_lib.h",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
+    # gRPC's grpc_xds_client fails its layering check when built from an OSX
+    # host, so only Linux hosts build gRPC.
+    target_compatible_with = ["@platforms//os:linux"] + host_compatible_with(["@platforms//os:linux"]),
     deps = [
         ":message_bridge_auth_proto_cc",
         ":message_bridge_auth_proto_grpc_cc",
@@ -571,7 +574,9 @@ cc_library(
     hdrs = [
         "message_bridge_auth_client_lib.h",
     ],
-    target_compatible_with = ["@platforms//os:linux"],
+    # gRPC's grpc_xds_client fails its layering check when built from an OSX
+    # host, so only Linux hosts build gRPC.
+    target_compatible_with = ["@platforms//os:linux"] + host_compatible_with(["@platforms//os:linux"]),
     deps = [
         ":message_bridge_auth_proto_grpc_cc",
         ":message_bridge_client_fbs",
