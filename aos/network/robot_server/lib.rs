@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod condition;
+pub mod logs;
 pub mod mcp;
 pub mod session;
 pub mod triggers;
@@ -202,9 +203,46 @@ pub struct Flags {
     pub session_start_actions: Vec<String>,
     #[arg(long, value_delimiter = ',', default_value = "FINISH,CANCEL")]
     pub session_end_actions: Vec<String>,
+    /// Where the logger writes its fbs_log-* folders, for `/logs`.  Without it, no `/logs`.
+    #[arg(long)]
+    pub logs_dir: Option<PathBuf>,
+    /// Where `/logs` keeps its MCAPs and summaries.  `logs_server/` in --logs-dir by default.
+    #[arg(long)]
+    pub logs_output_dir: Option<PathBuf>,
+    /// `frc/logs:log_manager`, which reads inside logs.  Relative to robot_server's own folder.
+    #[arg(long, default_value = "log_manager")]
+    pub log_manager: PathBuf,
+    /// The robot's channel presets, for converting logs to MCAP.  The generic ones without it.
+    #[arg(long)]
+    pub logs_presets: Option<PathBuf>,
+    /// The most bytes a second one download of a log may take, so downloads can't starve the
+    /// logger.  0 for no limit.
+    #[arg(long, default_value_t = 20_000_000)]
+    pub logs_max_download_rate: u64,
 }
 
 impl Flags {
+    /// What `/logs` serves, if anything.  Its JoystickState comes from `/api`, in `start`.
+    pub fn logs_options(&self) -> Option<logs::LogsOptions> {
+        let logs_dir = self.logs_dir.clone()?;
+        let log_manager = if self.log_manager.is_relative() {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join(&self.log_manager)))
+                .unwrap_or_else(|| self.log_manager.clone())
+        } else {
+            self.log_manager.clone()
+        };
+        let mut options =
+            logs::LogsOptions::new(logs_dir, log_manager, logs::Mode::Robot { api: None });
+        if let Some(output_dir) = &self.logs_output_dir {
+            options.output_dir = output_dir.clone();
+        }
+        options.presets = self.logs_presets.clone();
+        options.max_download_rate = self.logs_max_download_rate;
+        Some(options)
+    }
+
     /// What `/api` may send on, and the app it starts and stops.
     pub fn api_options(&self) -> api::ApiOptions {
         use crate::session::{parse_channel, SessionApp};
@@ -240,11 +278,37 @@ pub struct Options {
     pub foxglove_ws: String,
     /// camera_streamer's websocket, which carries its WebRTC signalling (`ws://127.0.0.1:1190`).
     pub camera_streamer_ws: String,
+    /// The robot's logs, for `/logs`; None for none.
+    pub logs: Option<logs::LogsOptions>,
 }
 
 /// The HTTPS side: the pages, the channels' latest messages, which it asks `api` for, and the
-/// websocket proxies.
+/// websocket proxies.  `/logs` is left out: see [`router_with_logs`].
 pub fn router(options: Options, api: mpsc::UnboundedSender<api::ApiRequest>) -> Router {
+    router_with_logs(options, api).0
+}
+
+/// [`router`], with `/logs` when `options` has logs.  Run [`logs::run_jobs`] on what it returns
+/// for conversions to happen.
+pub fn router_with_logs(
+    options: Options,
+    api: mpsc::UnboundedSender<api::ApiRequest>,
+) -> (Router, Option<Arc<logs::Logs>>) {
+    let logs = options.logs.clone().map(|mut logs_options| {
+        // Conversions only run while the robot is disabled, which /api's JoystickState says.
+        logs_options.mode = logs::Mode::Robot {
+            api: Some(api.clone()),
+        };
+        logs::Logs::new(logs_options)
+    });
+    let mut router = Router::new();
+    if let Some(logs) = &logs {
+        router = router.merge(logs::router(logs.clone()));
+    }
+    (router.merge(base_router(options, api)), logs)
+}
+
+fn base_router(options: Options, api: mpsc::UnboundedSender<api::ApiRequest>) -> Router {
     let web_proxy_ws = options.web_proxy_ws.clone();
     let foxglove_ws = options.foxglove_ws.clone();
     let camera_streamer_ws = options.camera_streamer_ws.clone();
@@ -621,9 +685,12 @@ pub fn start(
 ) -> impl std::future::Future<Output = ()> + 'static {
     let fetchers = api::Fetchers::new(aos, config, api_options);
     let (api_requests, api_incoming) = mpsc::unbounded_channel();
-    let router = router(options, api_requests);
+    let (router, logs) = router_with_logs(options, api_requests);
     async move {
         tokio::task::spawn_local(api::serve(fetchers, api_incoming));
+        if let Some(logs) = logs {
+            tokio::spawn(logs::run_jobs(logs));
+        }
         let tokio_listener = |listener: std::net::TcpListener| {
             listener
                 .set_nonblocking(true)
@@ -698,6 +765,7 @@ pub unsafe extern "C" fn robot_server_add_to_simulation(
             web_proxy_ws: format!("ws://127.0.0.1:{web_proxy_port}/ws"),
             foxglove_ws: "ws://127.0.0.1:8765".to_string(),
             camera_streamer_ws: "ws://127.0.0.1:1190".to_string(),
+            logs: None,
         },
         api::ApiOptions::default(),
         Listen::Plain { http },
@@ -794,6 +862,7 @@ pub unsafe extern "C" fn robot_server_add_to_simulation_with_flags(
             web_proxy_ws: format!("ws://127.0.0.1:{}/ws", flags.web_proxy_port),
             foxglove_ws: format!("ws://127.0.0.1:{}", flags.foxglove_port),
             camera_streamer_ws: format!("ws://127.0.0.1:{}", flags.camera_streamer_port),
+            logs: flags.logs_options(),
         },
         flags.api_options(),
         Listen::Tls {
@@ -900,6 +969,7 @@ mod tests {
             web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
             foxglove_ws: "ws://127.0.0.1:1".to_string(),
             camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
+            logs: None,
         }
     }
 
@@ -1023,6 +1093,7 @@ mod tests {
                 web_proxy_ws: "ws://127.0.0.1:1/ws".to_string(),
                 foxglove_ws: format!("ws://{upstream_address}"),
                 camera_streamer_ws: "ws://127.0.0.1:1".to_string(),
+                logs: None,
             },
         )
         .await;
@@ -1117,6 +1188,30 @@ mod tests {
         let response = fetch_trust_page(443, "/").await;
         assert!(response.contains("`https://${host}`"), "{response}");
         assert!(!response.contains(":443"), "{response}");
+    }
+
+    /// /logs is off unless told where the logs are, and then reads them with log_manager
+    /// beside robot_server.
+    #[test]
+    fn logs_flags() {
+        use clap::Parser;
+        let flags = Flags::try_parse_from(["robot_server"]).unwrap();
+        assert!(flags.logs_options().is_none());
+
+        let flags =
+            Flags::try_parse_from(["robot_server", "--logs-dir=logs", "--logs-presets=p.json"])
+                .unwrap();
+        let options = flags.logs_options().unwrap();
+        assert_eq!(options.log_dir, PathBuf::from("logs"));
+        assert_eq!(options.output_dir, PathBuf::from("logs/logs_server"));
+        assert_eq!(options.presets, Some(PathBuf::from("p.json")));
+        assert_eq!(options.max_download_rate, 20_000_000);
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(options.log_manager, exe_dir.join("log_manager"));
     }
 
     /// Dropping to a user that doesn't exist fails, naming it, instead of carrying on as root.

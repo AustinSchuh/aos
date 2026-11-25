@@ -145,6 +145,7 @@ robot_downloader(
         "//aos/events:aos_timing_report_streamer",
         "//aos/network:web_proxy_main",
         "//aos/network/robot_server",
+        "//frc/logs:log_manager",
         "//aos/starter:irq_affinity",
         "//aos/events/logging:log_cat",
         "//aos/util:filesystem_monitor",
@@ -170,6 +171,7 @@ robot_downloader(
         ":base_intrinsics_files",
         "//frc/vision/field_map/www:www_files",
         "//frc/vision/streamer/page:www_files",
+        "//frc/logs:www_files",
     ],
     target_compatible_with = [
         "@platforms//cpu:arm64",

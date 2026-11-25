@@ -6,7 +6,7 @@ import {CalibrationSession} from './calibration';
 import {NODE, Robot} from './robot';
 import {CameraStreams} from './streams';
 
-type Tab = 'feeds' | 'calibrate' | 'settings' | 'field' | 'starter';
+type Tab = 'feeds' | 'calibrate' | 'settings' | 'field' | 'starter' | 'logs';
 
 /**
  * The vision page: the cameras' feeds, and their settings and calibrations; and, embedded, the

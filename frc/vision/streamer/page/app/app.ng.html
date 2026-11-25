@@ -36,6 +36,13 @@
     >
       Starter
     </button>
+    <button
+      type="button"
+      [class.active]="tab === 'logs'"
+      (click)="show('logs')"
+    >
+      Logs
+    </button>
   </nav>
   <span class="status" [class.ok]="connected">
     <span class="dot"></span>
@@ -100,4 +107,8 @@
 
 <main class="embed" *ngIf="tab === 'starter'">
   <iframe src="/starter.html" title="Starter status"></iframe>
+</main>
+
+<main class="embed" *ngIf="tab === 'logs'">
+  <iframe src="/logs.html" title="Robot logs"></iframe>
 </main>

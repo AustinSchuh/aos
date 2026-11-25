@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Robot logs</title>
+    <link rel="stylesheet" href="logs.css" />
+  </head>
+  <body>
+    <!--
+  The robot's logs.  The same page runs on the robot (robot_server, and the vision page's
+  Logs tab) and on a laptop (logs_server); /logs/info says which, and the page shows what
+  makes sense there.  See frc/logs/README.md.
+-->
+    <header>
+      <h1 id="title">Robot logs</h1>
+      <span id="status" class="status">
+        <span class="dot"></span>
+        <span id="status-text">Loading&hellip;</span>
+      </span>
+      <span id="free" class="muted"></span>
+      <a id="live" class="button" hidden>Live in Foxglove</a>
+    </header>
+
+    <p id="error" class="error" hidden></p>
+
+    <section id="robot-section" hidden>
+      <div class="section-head">
+        <h2>On the robot</h2>
+        <button type="button" id="pull-selected" disabled>
+          Download selected
+        </button>
+      </div>
+      <p class="muted">
+        Tick the logs to bring to this laptop. Each one is converted for
+        Foxglove once it's here, and stays here with the robot off.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Log</th>
+            <th>Matches</th>
+            <th>Size</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="robot-logs"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2 id="local-heading">Logs</h2>
+      </div>
+      <p id="no-logs" class="muted" hidden>No logs yet.</p>
+      <div id="logs"></div>
+    </section>
+
+    <dialog id="channels-dialog">
+      <form method="dialog">
+        <h2>Pick channels</h2>
+        <p class="muted">
+          The battery, the match and the robot's text errors are always
+          included.
+        </p>
+        <input
+          type="search"
+          id="channel-filter"
+          placeholder="Filter channels"
+        />
+        <div id="channel-list"></div>
+        <menu>
+          <button value="cancel" formnovalidate>Cancel</button>
+          <button id="channels-convert" value="convert">Convert</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <script src="logs.js"></script>
+  </body>
+</html>

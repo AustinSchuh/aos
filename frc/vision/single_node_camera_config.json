@@ -652,7 +652,8 @@
         "--session-commands=/calibration:frc.vision.calibration.Command",
         "--session-app=calibration_server",
         "--session-stops=apriltag_detector0,apriltag_detector1,apriltag_detector2,apriltag_detector3",
-        "--session-ready=/calibration:frc.vision.calibration.Status"
+        "--session-ready=/calibration:frc.vision.calibration.Status",
+        "--logs-dir=logs"
       ],
       "nodes": ["orin"]
     },

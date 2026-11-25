@@ -1,0 +1,8 @@
+namespace frc.logs.testing;
+
+// A subsystem's Status, as robot code logs one.
+table Status {
+  estopped:bool (id: 0);
+}
+
+root_type Status;
