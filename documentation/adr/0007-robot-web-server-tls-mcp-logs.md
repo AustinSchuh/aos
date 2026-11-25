@@ -7,7 +7,8 @@ Accepted.
 - **Implemented outside this repository**, in meta-frc4646 `eb9e0a7` and `6752256`: the team CA (`make_team_ca.sh`, `install_team_ca.sh`), the server certificate and a robot's fallback CA (`make_tls_cert.sh`, `aos-tls.service`, run again by `change_hostname.sh`), and `trust_orin.py`.
 - **Implemented here**, in `aos/network/robot_server`: HTTPS on 443 with the certificate from `/etc/aos/tls`, reloaded when it changes; the `www` pages; `/ws` proxied to `web_proxy`; `/foxglove` proxied to the Foxglove server; the trust page on port 80; and `GET /api`, each channel's latest message as JSON. `aos/network/www/proxy.ts` connects over `wss://` from an https page.
 - **Implemented here, in part:** MCP at `/mcp`, with `list_channels`, `get_latest` and `wait_for`.
-- **Not yet implemented:** MCP's other tools, `/logs`, and `wss://` in `frc/image_streamer`'s pages.
+- **Implemented here:** `/logs` (`aos/network/robot_server/logs.rs`), with `frc/logs:log_manager` reading inside logs, the log page (`frc/logs/www`, the vision page's Logs tab), and `logs_server`, the same routes on a laptop. See `frc/logs/README.md`.
+- **Not yet implemented:** MCP's other tools, MCP tools over logs, and `wss://` in `frc/image_streamer`'s pages.
 - **Deferred:** replacing `web_proxy`'s WebRTC (rawrtc) with Rust.
 
 ## Context
@@ -153,7 +154,12 @@ An assistant connects with `claude mcp add --transport http orin-1868-1 https://
 
 #### Logs
 
-Under `/logs`: list logs with sizes, times and disk usage; download as stored, or as MCAP through `log_to_mcap`; delete, and copy elsewhere; later, MCP tools that query a log in simulation. Log serving runs at idle I/O priority and rate-limits downloads, so it can't stall the logger.
+Under `/logs`: list logs with sizes, times, disk usage and the matches in them; download as stored (a file at a time with Range, or a whole log as a tar), or as MCAP through `log_to_mcap`; delete; later, MCP tools that query a log in simulation. Raw downloads are rate-limited so they can't stall the logger. See `frc/logs/README.md` for the routes.
+
+- **Reading inside a log is C++**, `frc/logs:log_manager`, run as a child process: AOS stops the process on a corrupt log, which mustn't be robot_server, and a child can be stopped. It finds the matches (JoystickState), summarizes faults and text errors, and converts to MCAP. It runs at the lowest CPU and idle I/O priority.
+- **Converting on the robot only runs while it's disabled**, read from JoystickState through the same fetchers as `/api`, and stops if the robot is enabled.
+- **Copying elsewhere is a laptop's job.** `logs_server` is the same routes on a laptop, over the logs it has downloaded, with two more: the robot's list, and downloading one the user picked. It converts each as it arrives, so logs can be looked at in Foxglove with the robot off. Laptops download over HTTPS, trusting the team CA.
+- **One page** serves both, asking `/logs/info` which it's on. It opens MCAPs in the Foxglove desktop app (`foxglove://open`), which reads them with Range requests, so `/logs/mcap` answers CORS.
 
 #### Foxglove
 
@@ -162,7 +168,7 @@ Under `/logs`: list logs with sizes, times and disk usage; download as stored, o
 ### Phases
 
 1. **TLS front door:** the certificates, the pages, `/ws`, `/foxglove`, the trust page, and `/api`. Done.
-2. **Read-only MCP** and `/logs`.
+2. **Read-only MCP** and `/logs`. `/logs` done.
 3. **MCP writes**, behind the config switch, and log queries.
 4. **Deferred:** WebRTC in Rust.
 

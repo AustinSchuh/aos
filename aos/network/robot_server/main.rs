@@ -60,6 +60,7 @@ fn main() {
         web_proxy_ws: format!("ws://127.0.0.1:{}/ws", app.web_proxy_port),
         foxglove_ws: format!("ws://127.0.0.1:{}", app.foxglove_port),
         camera_streamer_ws: format!("ws://127.0.0.1:{}", app.camera_streamer_port),
+        logs: app.logs_options(),
     };
     log::info!(
         "Serving HTTPS on {} and HTTP on {} as {}",

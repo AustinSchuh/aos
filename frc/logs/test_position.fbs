@@ -1,0 +1,10 @@
+include "frc/control_loops/can_talonfx.fbs";
+
+namespace frc.logs.testing;
+
+// A subsystem's Position, as robot code logs one: a motor's CANTalonFX.
+table Position {
+  motor:frc.control_loops.CANTalonFX (id: 0);
+}
+
+root_type Position;

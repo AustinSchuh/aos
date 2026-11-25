@@ -1,0 +1,109 @@
+{
+  "configById": {
+    "Tab!power": {
+      "activeTabIdx": 0,
+      "tabs": [
+        {
+          "title": "Power",
+          "layout": {
+            "direction": "column",
+            "first": "Plot!battery",
+            "second": "Plot!brownout",
+            "splitPercentage": 70
+          }
+        },
+        {
+          "title": "Match",
+          "layout": "Plot!match"
+        },
+        {
+          "title": "Errors",
+          "layout": {
+            "direction": "row",
+            "first": "RawMessages!log",
+            "second": "RawMessages!starter",
+            "splitPercentage": 60
+          }
+        }
+      ]
+    },
+    "Plot!battery": {
+      "title": "Battery voltage",
+      "paths": [
+        {
+          "value": "\"/frc frc.RobotState\".voltage_battery",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "Battery (V)"
+        }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!brownout": {
+      "title": "Brownouts",
+      "paths": [
+        {
+          "value": "\"/frc frc.RobotState\".browned_out",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "Browned out"
+        }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "Plot!match": {
+      "title": "Enabled, auto and match time",
+      "paths": [
+        {
+          "value": "\"/frc frc.JoystickState\".enabled",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "Enabled"
+        },
+        {
+          "value": "\"/frc frc.JoystickState\".autonomous",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "Auto"
+        }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "RawMessages!log": {
+      "topicPath": "\"/aos aos.logging.LogMessageFbs\"",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "RawMessages!starter": {
+      "topicPath": "\"/aos aos.starter.Status\"",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": "Tab!power"
+}

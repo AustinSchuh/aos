@@ -284,6 +284,7 @@ test("every tab shows its own view", async () => {
     Settings: "main.settings",
     Field: 'main.embed iframe[src="/field.html"]',
     Starter: 'main.embed iframe[src="/starter.html"]',
+    Logs: 'main.embed iframe[src="/logs.html"]',
   };
   for (const [label, selector] of Object.entries(views)) {
     await tab(label);

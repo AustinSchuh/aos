@@ -12,6 +12,7 @@ rust_library(
         "api.rs",
         "condition.rs",
         "lib.rs",
+        "logs.rs",
         "mcp.rs",
         "session.rs",
         "triggers.rs",
@@ -86,6 +87,23 @@ rust_binary(
     crate_name = "robot_server_main",
     rustc_flags = ["-Cstrip=symbols"],
     deps = _BINARY_DEPS,
+)
+
+# The robot's logs on a laptop: the log page and /logs, over the logs it has
+# downloaded from a robot.  See frc/logs/README.md.
+rust_binary(
+    name = "logs_server",
+    srcs = ["logs_server_main.rs"],
+    data = [
+        "//frc/logs:log_manager",
+        "//frc/logs:www",
+    ],
+    deps = [
+        ":robot_server_lib",
+        "@crate_index//:clap",
+        "@crate_index//:log",
+        "@crate_index//:tokio",
+    ],
 )
 
 # A log replay with robot_server and web_proxy in it, to use the robot's pages

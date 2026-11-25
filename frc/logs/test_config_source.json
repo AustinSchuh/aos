@@ -1,0 +1,17 @@
+{
+  "channels": [
+    {
+      "name": "/test",
+      "type": "frc.logs.testing.Position",
+      "frequency": 200
+    },
+    {
+      "name": "/test",
+      "type": "frc.logs.testing.Status",
+      "frequency": 200
+    }
+  ],
+  "imports": [
+    "../input/robot_state_config.json"
+  ]
+}
